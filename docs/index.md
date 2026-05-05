@@ -10,6 +10,8 @@ The catalog of every page in the wiki.
 
 ## Concepts
 
+- [Rocky — architecture](concepts/rocky-architecture.md) — block diagram, threads of control, layer dependencies.
+- [Sidecar convention](concepts/sidecar-convention.md) — wire protocol, manifest, lifecycle.
 - [Architecture](concepts/architecture.md) — daemon/SDK split, where code runs, REST + WebRTC transports.
 - [Motion philosophy](concepts/motion-philosophy.md) — `goto_target` for gestures, `set_target` in a control loop.
 - [Coordinate frames](concepts/coordinate-frames.md) — head frame, world frame, units (mm, deg, rad).
@@ -44,7 +46,9 @@ The catalog of every page in the wiki.
 
 ## Decisions
 
-- [0001 — Target platform](decisions/0001-target-platform.md) — Wireless on-robot Python is the default.
+- [0001 — Target platform](decisions/0001-target-platform.md) — Wireless on-robot Python is the default for upstream Pollen apps.
+- [0002 — Rocky as a macOS-native nervous system](decisions/0002-rocky-app.md) — explains why Rocky is a Swift app, not a Python app on the CM4.
+- [0003 — Sidecar convention for external processes](decisions/0003-sidecar-convention.md) — JSON manifests, line-delimited JSON wire format, supervisor with restart policy + circuit breaker.
 
 ## Rocky implementation
 

@@ -184,5 +184,11 @@
     }
   },
   "active": "b88e92f19fc0e6be",
-  "lastOpenFiles": []
+  "lastOpenFiles": [
+    "decisions/0003-sidecar-convention.md",
+    "decisions/0002-rocky-app.md",
+    "concepts/sidecar-convention.md",
+    "concepts/rocky-architecture.md",
+    "sources/daemon-openapi-1.7.1.md"
+  ]
 }
