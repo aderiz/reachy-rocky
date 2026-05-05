@@ -72,8 +72,55 @@ final class AppServices {
     var brainBusy: Bool = false
     var brainErrorMessage: String?
 
+    /// Set whenever a TTS utterance starts; cleared when its expected
+    /// duration has elapsed. Drives the "speaking" state in the UI.
+    var ttsBusyUntil: Date?
+
+    /// Manual UI mutes (separate from sidecar/permission errors).
+    var ttsMuted: Bool = false
+
     enum Reachability: Sendable, Equatable {
         case unknown, online, offline(reason: String)
+    }
+
+    /// Coarse, glanceable state Rocky communicates from the menu bar and
+    /// hero card. Computed from sub-states so the UI is honest.
+    enum RockyState: Sendable, Equatable {
+        case idle
+        case listening
+        case thinking
+        case speaking
+        case error(String)
+    }
+
+    var rockyState: RockyState {
+        // Errors take precedence so the user notices them.
+        if case .offline(let reason) = daemonReachability {
+            return .error("robot offline · \(reason)")
+        }
+        if case .offline(let reason) = llmStatus {
+            // LM Studio off is yellow-but-not-red elsewhere; surface as error
+            // here only so the user sees something is wrong.
+            _ = reason
+        }
+        if let voiceError = voiceErrorMessage, !voiceError.isEmpty {
+            return .error(voiceError)
+        }
+
+        if let until = ttsBusyUntil, Date() < until {
+            return .speaking
+        }
+        if brainBusy {
+            return .thinking
+        }
+        if let until = conversationOpenUntil, Date() > until.addingTimeInterval(-60) {
+            // Window-open OR mic-on count as listening.
+            if Date() < until { return .listening }
+        }
+        if micEnabled {
+            return .listening
+        }
+        return .idle
     }
 
     init(endpoint: RobotEndpoint = RobotEndpoint()) {
@@ -395,6 +442,47 @@ final class AppServices {
         }
     }
 
+    /// Toggle TTS playback. When muted, `say` tool calls return immediately
+    /// without going through the sidecar.
+    func toggleTTSMute() async {
+        ttsMuted.toggle()
+        if ttsMuted {
+            try? await robotTTS.cancel()
+            ttsBusyUntil = nil
+        }
+    }
+
+    /// Stop face tracking from pushing target events into the streamer.
+    func setFaceTrackingEnabled(_ enabled: Bool) async {
+        do {
+            try await faceTracker.setEnabled(enabled)
+        } catch {
+            await logBus.publish(.error(
+                scope: "app/face-tracker",
+                message: "setEnabled: \(error)",
+                recoverable: true
+            ))
+        }
+    }
+
+    func wakeRobot() async {
+        do { try await robotLink.wakeUp() }
+        catch {
+            await logBus.publish(.error(
+                scope: "app/wake", message: "\(error)", recoverable: true
+            ))
+        }
+    }
+
+    func sleepRobot() async {
+        do { try await robotLink.goToSleep() }
+        catch {
+            await logBus.publish(.error(
+                scope: "app/sleep", message: "\(error)", recoverable: true
+            ))
+        }
+    }
+
     private func probeLMStudio() async {
         do {
             let models = try await llm.listModels()
@@ -501,13 +589,22 @@ final class AppServices {
                 ]),
                 "required": .array([.string("text")]),
             ]),
-            handler: { args in
+            handler: { [weak self] args in
                 let text = args.asObject?["text"]?.asString ?? ""
                 guard !text.isEmpty else {
                     return .object(["ok": .bool(false),
                                     "error": .string("empty text")])
                 }
+                if await MainActor.run(body: { self?.ttsMuted ?? false }) {
+                    return .object(["ok": .bool(false), "error": .string("tts muted")])
+                }
                 let stats = try await tts.speak(text)
+                // Drive the "speaking" hero state: report busy through the
+                // duration of the synthesized clip + a small tail.
+                if let self {
+                    let until = Date().addingTimeInterval(stats.durationS + 0.2)
+                    await MainActor.run { self.ttsBusyUntil = until }
+                }
                 return .object([
                     "ok": .bool(true),
                     "synth_ms": .number(stats.synthMs),

@@ -190,6 +190,39 @@ Logs view added — closes the "is anything happening" gap when running the app:
 
 47/47 tests still green (one flake on echo-sidecar restart timing observed; passes on retry).
 
+## [2026-05-05] code | UX polish — RockyState + animated Hero + MenuBar
+
+Promoted Rocky's status from a static placeholder to a real state machine driving cohesive UI from one source of truth.
+
+`AppServices.RockyState` (computed):
+
+- `.idle` / `.listening` / `.thinking` / `.speaking` / `.error(reason)`
+- Errors take priority (robot offline, voice/STT error). Speaking wins if `ttsBusyUntil > now`. Thinking wins on `brainBusy`. Listening wins when mic is on or conversation window is active. Idle otherwise.
+- Synthesized from existing sub-states; no new flag plumbing beyond `ttsBusyUntil` (set after `RobotTTS.speak` returns; cleared by elapsed duration).
+
+`HeroCard` rebuilt:
+
+- Animated 72×72 icon: idle slow-breathe, listening concentric pulse, thinking circular spinner, speaking 4-stagger bars, error red-ring + bang.
+- Color-coded "Idle/Listening/Thinking/Speaking/Error" label.
+- Latency pills (LLM TTFT, STT ms, TTS first-chunk) shown when known.
+- Quick action chips (Mute mic / Mute voice).
+- Heartbeat ticker keeps countdowns / state-driven decisions live.
+
+`MenuBarExtra`:
+
+- Dynamic symbol (`circle.fill` / `ear` / `circle.dotted` / `waveform` / `exclamationmark.circle.fill`) reflects state at a glance.
+- Popup mirrors the same state badge, plus quick-actions: Listen / Mute mic, Mute voice, Pause/Resume tracking, Wake robot, Sleep robot, Quit.
+
+`AppServices` actions:
+
+- `toggleTTSMute()` — cancels in-flight playback and gates future `say` tool calls with a structured "tts muted" error so the LLM sees the mute.
+- `setFaceTrackingEnabled(_)` — forwards to the FaceTrackerService sidecar.
+- `wakeRobot()` / `sleepRobot()` — trigger recorded moves via REST.
+- `say` tool sets `ttsBusyUntil = now + duration_s + 0.2 s`.
+- `ttsMuted` bool short-circuits `say` cleanly.
+
+The menu bar now communicates calm-tech style — a single glanceable symbol, color-coded popup, no busy/spinning unless something's actually happening.
+
 ## [2026-05-05] init | Wiki bootstrapped from doc pass
 
 Documentation pass on Reachy Mini Wireless. Wiki structure created in `docs/`; project-root `CLAUDE.md` points here.
