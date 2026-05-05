@@ -18,7 +18,7 @@ public actor RobotTTS {
         public let durationS: Double
     }
 
-    private let sidecar: any Sidecar
+    public nonisolated let sidecar: any Sidecar
     private let media: MediaClient
     private let logBus: LogBus
     private var voiceRefId: String?

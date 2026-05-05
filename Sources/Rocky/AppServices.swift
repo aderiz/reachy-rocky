@@ -79,6 +79,11 @@ final class AppServices {
     /// Manual UI mutes (separate from sidecar/permission errors).
     var ttsMuted: Bool = false
 
+    /// Sidecar lifecycle mirrors so the Status panel can render real states
+    /// without poking actors on every redraw.
+    var faceTrackerSidecarState: SidecarState = .stopped
+    var ttsSidecarState: SidecarState = .stopped
+
     enum Reachability: Sendable, Equatable {
         case unknown, online, offline(reason: String)
     }
@@ -198,6 +203,24 @@ final class AppServices {
                 await logBus.publish(.error(
                     scope: "app/mlx-tts", message: "\(error)", recoverable: true
                 ))
+            }
+        }
+
+        // Mirror sidecar state into Observable so the Status panel can read it.
+        let ftEvents = faceTracker.sidecar.events
+        Task { [weak self] in
+            for await event in ftEvents {
+                if case .state(let s) = event {
+                    await MainActor.run { self?.faceTrackerSidecarState = s }
+                }
+            }
+        }
+        let ttsEvents = robotTTS.sidecar.events
+        Task { [weak self] in
+            for await event in ttsEvents {
+                if case .state(let s) = event {
+                    await MainActor.run { self?.ttsSidecarState = s }
+                }
             }
         }
 
@@ -494,6 +517,10 @@ final class AppServices {
             }
         }
     }
+
+    /// Public entry points so the Status panel can re-run probes.
+    func probeRobotPublic() async { await probeRobot() }
+    func probeLMStudioPublic() async { await probeLMStudio() }
 
     // MARK: - Tools
 

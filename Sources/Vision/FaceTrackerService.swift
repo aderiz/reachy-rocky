@@ -27,7 +27,7 @@ public actor FaceTrackerService {
 
     // MARK: - Public
 
-    public let sidecar: any Sidecar
+    public nonisolated let sidecar: any Sidecar
     public nonisolated let detections: AsyncStream<Detection>
     public nonisolated let targets: AsyncStream<Target>
 

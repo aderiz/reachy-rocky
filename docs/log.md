@@ -223,6 +223,27 @@ Promoted Rocky's status from a static placeholder to a real state machine drivin
 
 The menu bar now communicates calm-tech style — a single glanceable symbol, color-coded popup, no busy/spinning unless something's actually happening.
 
+## [2026-05-05] code | StatusView — single-glance health panel
+
+Added a Status sidebar destination that lists every dependency Rocky needs and what's wrong (if anything). Doubles as the "onboarding checklist" without forcing a modal flow — same checks, same actions, but always available.
+
+Six rows, each with a status dot + detail + action button:
+
+- **Robot daemon** — host:port + frame count when online; reason when offline. "Probe" button.
+- **LM Studio** — loaded model name when online; error reason when offline. "Probe" button.
+- **Microphone** — live RMS when listening; "not listening" otherwise. Toggle button.
+- **Speech recognition** — Apple Speech / unauthorized / unavailable. "Authorize" button.
+- **Face tracker (sidecar)** — target / detection counts when ready; failure reason; circuit-open countdown. State mirrored from `SidecarRuntime.events`.
+- **TTS (sidecar)** — same lifecycle states.
+
+Mechanical changes to make this real:
+
+- `FaceTrackerService.sidecar` and `RobotTTS.sidecar` are now `nonisolated let` so the main actor can subscribe to their `events` streams without hopping isolation.
+- `AppServices` mirrors `SidecarState` for both sidecars into Observable properties via background pumps.
+- Public `probeRobotPublic()` / `probeLMStudioPublic()` so the StatusView's buttons re-run checks.
+
+Calm-tech: when everything is green, the panel is just six green dots — no nagging.
+
 ## [2026-05-05] init | Wiki bootstrapped from doc pass
 
 Documentation pass on Reachy Mini Wireless. Wiki structure created in `docs/`; project-root `CLAUDE.md` points here.
