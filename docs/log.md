@@ -102,6 +102,40 @@ Tests (13 new, 37/37 total):
 
 WhisperKit (real STT) lands next as a follow-up commit.
 
+## [2026-05-05] code | Rocky M6 base — Cognition (LM Studio + tools)
+
+Cognition package + dashboard wiring. Pure URLSession SSE; no SDK lock-in.
+
+- `Cognition/JSONValue` — round-trippable JSON value type for tool args/schemas without modeling JSON-Schema in Swift.
+- `Cognition/SSEParser` — minimal `data: ...\n\n` parser; tested.
+- `Cognition/LMStudioClient` actor — `listModels()` + `chatStream(messages:tools:)`. OpenAI-compatible. Default `http://localhost:1234/v1`. No auth (overridable). Streams `ChatChunk(contentDelta, toolCallDeltas, finishReason)` from SSE; correlates `tool_call_deltas[i].function.arguments` across deltas.
+- `Cognition/ToolRegistry` actor — schema + handler pairs; `invoke(name:argumentsJSON:llmMessageId:)` returns a `ToolResult` with full args/result/latency/ok and emits `toolInvocation` telemetry.
+- `Cognition/CognitionEngine` actor — runs a turn against the LLM, dispatches tool calls (capped at `maxToolRounds = 4`), feeds results back as `tool` messages, surfaces a typed `Output` stream (`assistantDelta`, `assistantFinal`, `toolCallDispatched`, `toolCallResult`).
+
+Initial tools wired into `AppServices.registerInitialTools()`:
+- `look_at(yaw_deg, pitch_deg, duration_s?)` → `RobotLink.goto(headPose:duration:)` with RPY pose
+- `set_motor_mode(mode)`
+- `wake_up`, `go_to_sleep`, `stop_motion`
+- `say(text)` — stub that emits `tts_request` telemetry (real TTS lands in M5)
+- `get_state` — fetches `/api/state/full` and returns degree-friendly snapshot
+
+Dashboard `BrainCard`:
+- Status pill: green = model name, red = "brain offline", gray = checking
+- Scrolling chat-style transcript with `you` / `rocky` / `tool` badges
+- Tool calls render as expandable disclosure rows showing args/result JSON
+- Latency pills on assistant messages: TTFT (first chunk) and total
+- Inline text input + Send button (Return submits)
+- Reset button to clear conversation
+
+`AppServices`:
+- Probes `/v1/models` on launch; flips `llmStatus` to `online(model)` or `offline(reason)` honestly.
+- `sendUserText(_)` runs a turn, mirrors deltas live into `brainTurns` so SwiftUI redraws as the assistant streams.
+- Voice→Brain wired: dispatched final transcripts auto-route into `sendUserText`.
+
+10 new tests (47/47 total): SSE record boundaries + partial buffering; `JSONValue` round-trip + parsing; `ToolRegistry` happy path, unknown tool, malformed args, schemas surface.
+
+LM Studio not running locally — confirmed graceful degradation: `BrainCard` shows "brain offline", manual sends echo a polite "(brain offline · …)" reply.
+
 ## [2026-05-05] init | Wiki bootstrapped from doc pass
 
 Documentation pass on Reachy Mini Wireless. Wiki structure created in `docs/`; project-root `CLAUDE.md` points here.

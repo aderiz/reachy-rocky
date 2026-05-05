@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import Cognition
 import RobotLink
 import RockyKit
 import SidecarHost
@@ -24,6 +25,11 @@ final class AppServices {
     let voice: VoiceCoordinator
     let echoSTT: EchoSTT          // placeholder until WhisperKit lands
 
+    // Cognition
+    let llm: LMStudioClient
+    let toolRegistry: ToolRegistry
+    let cognition: CognitionEngine
+
     /// Most recent reachability check for the daemon.
     var daemonReachability: Reachability = .unknown
     var lastDaemonStatus: RobotLinkClient.DaemonStatus?
@@ -43,6 +49,25 @@ final class AppServices {
     var lastDispatched: String?
     var conversationOpenUntil: Date?
     var voiceErrorMessage: String?
+
+    // Brain state
+    enum LLMStatus: Sendable, Equatable {
+        case unknown
+        case online(model: String)
+        case offline(reason: String)
+    }
+    struct BrainTurn: Sendable, Identifiable, Equatable {
+        let id = UUID()
+        var role: String           // "user" | "assistant" | "tool"
+        var content: String
+        var detail: String?        // for tool calls: args/result
+        var firstChunkMs: Double?
+        var totalMs: Double?
+    }
+    var llmStatus: LLMStatus = .unknown
+    var brainTurns: [BrainTurn] = []
+    var brainBusy: Bool = false
+    var brainErrorMessage: String?
 
     enum Reachability: Sendable, Equatable {
         case unknown, online, offline(reason: String)
@@ -76,6 +101,13 @@ final class AppServices {
         let micSource = MicFrameSource(mic: self.mic)
         self.voice = VoiceCoordinator(
             source: micSource, stt: self.echoSTT, wake: self.wakeFilter, logBus: bus
+        )
+
+        // Cognition: LM Studio client + tool registry.
+        self.llm = LMStudioClient(logBus: bus)
+        self.toolRegistry = ToolRegistry(logBus: bus)
+        self.cognition = CognitionEngine(
+            llm: self.llm, registry: self.toolRegistry, logBus: bus
         )
     }
 
@@ -133,6 +165,10 @@ final class AppServices {
                 }
             }
         }
+
+        // Tool registry + LM Studio probe.
+        await registerInitialTools()
+        Task { [weak self] in await self?.probeLMStudio() }
     }
 
     func stop() async {
@@ -189,11 +225,255 @@ final class AppServices {
                 self.lastTranscript = text
                 if dispatched { self.lastDispatched = text }
             }
+            if dispatched {
+                await sendUserText(text)
+            }
         case .windowOpened(let until):
             await MainActor.run { self.conversationOpenUntil = until }
         case .windowClosed:
             await MainActor.run { self.conversationOpenUntil = nil }
         }
+    }
+
+    // MARK: - Brain
+
+    func sendUserText(_ text: String) async {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        // Probe LM Studio if we don't yet know it's online.
+        if case .unknown = llmStatus { await probeLMStudio() }
+        if case .offline(let reason) = llmStatus {
+            await MainActor.run {
+                self.brainTurns.append(.init(role: "user", content: trimmed))
+                self.brainTurns.append(.init(
+                    role: "assistant",
+                    content: "(brain offline · \(reason)) — start LM Studio to talk to Rocky."
+                ))
+            }
+            return
+        }
+
+        await MainActor.run {
+            self.brainTurns.append(.init(role: "user", content: trimmed))
+            self.brainBusy = true
+        }
+        let started = Date()
+        var assistantBuffer = ""
+        var firstChunkMs: Double?
+        var assistantTurnId: UUID?
+
+        let stream = await cognition.send(userText: trimmed)
+        do {
+            for try await output in stream {
+                switch output {
+                case .assistantDelta(let delta):
+                    if firstChunkMs == nil {
+                        firstChunkMs = Date().timeIntervalSince(started) * 1000
+                    }
+                    assistantBuffer += delta
+                    let snapshot = assistantBuffer
+                    let f = firstChunkMs
+                    await MainActor.run {
+                        if let id = assistantTurnId,
+                           let idx = self.brainTurns.firstIndex(where: { $0.id == id }) {
+                            self.brainTurns[idx].content = snapshot
+                        } else {
+                            var turn = BrainTurn(role: "assistant", content: snapshot)
+                            turn.firstChunkMs = f
+                            self.brainTurns.append(turn)
+                            assistantTurnId = turn.id
+                        }
+                    }
+                case .assistantFinal(_, let totalMs, let firstMs):
+                    let id = assistantTurnId
+                    let buf = assistantBuffer
+                    await MainActor.run {
+                        if let id, let idx = self.brainTurns.firstIndex(where: { $0.id == id }) {
+                            self.brainTurns[idx].content = buf
+                            self.brainTurns[idx].totalMs = totalMs
+                            self.brainTurns[idx].firstChunkMs = firstMs
+                        } else if !buf.isEmpty {
+                            var t = BrainTurn(role: "assistant", content: buf)
+                            t.totalMs = totalMs
+                            t.firstChunkMs = firstMs
+                            self.brainTurns.append(t)
+                        }
+                    }
+                case .toolCallDispatched(let name, let argumentsJSON, _):
+                    let detail = argumentsJSON
+                    await MainActor.run {
+                        self.brainTurns.append(.init(
+                            role: "tool", content: "→ \(name)", detail: detail
+                        ))
+                    }
+                case .toolCallResult(let result):
+                    let summary = result.ok ? "ok" : "error"
+                    let detail = result.resultJSON
+                    let name = result.name
+                    let ms = result.latencyMs
+                    await MainActor.run {
+                        self.brainTurns.append(.init(
+                            role: "tool",
+                            content: "← \(name) (\(summary), \(Int(ms))ms)",
+                            detail: detail
+                        ))
+                    }
+                case .error(let msg):
+                    await MainActor.run {
+                        self.brainErrorMessage = msg
+                    }
+                }
+            }
+        } catch {
+            await MainActor.run {
+                self.brainErrorMessage = "\(error)"
+                self.llmStatus = .offline(reason: "\(error)")
+            }
+        }
+        await MainActor.run { self.brainBusy = false }
+    }
+
+    func resetBrain() async {
+        await cognition.resetConversation()
+        await MainActor.run {
+            self.brainTurns.removeAll()
+            self.brainErrorMessage = nil
+        }
+    }
+
+    private func probeLMStudio() async {
+        do {
+            let models = try await llm.listModels()
+            let model = models.first ?? "(no models loaded)"
+            await MainActor.run { self.llmStatus = .online(model: model) }
+        } catch {
+            await MainActor.run {
+                self.llmStatus = .offline(reason: "\(error)")
+            }
+        }
+    }
+
+    // MARK: - Tools
+
+    private func registerInitialTools() async {
+        let robot = robotLink
+        let bus = logBus
+
+        await toolRegistry.register(
+            name: "look_at",
+            description: "Make Rocky orient his head toward a yaw/pitch in degrees. Yaw: -180..180 (positive = left). Pitch: -40..40 (positive = down). Smooth.",
+            parameters: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "yaw_deg":    .object(["type": .string("number")]),
+                    "pitch_deg":  .object(["type": .string("number")]),
+                    "duration_s": .object(["type": .string("number")]),
+                ]),
+                "required": .array([.string("yaw_deg")]),
+            ]),
+            handler: { args in
+                let yaw = (args.asObject?["yaw_deg"]?.asNumber ?? 0) * .pi / 180
+                let pitch = (args.asObject?["pitch_deg"]?.asNumber ?? 0) * .pi / 180
+                let duration = args.asObject?["duration_s"]?.asNumber ?? 0.6
+                let pose = RPYPose(roll: 0, pitch: pitch, yaw: yaw)
+                try await robot.goto(headPose: pose, durationS: duration)
+                await bus.publish(.motorCommand(
+                    source: .tool,
+                    target: MotionTarget(headPose: pose)
+                ))
+                return .object([
+                    "ok": .bool(true),
+                    "yaw_rad": .number(yaw),
+                    "pitch_rad": .number(pitch),
+                ])
+            }
+        )
+
+        await toolRegistry.register(
+            name: "set_motor_mode",
+            description: "Set the robot's motor mode. Choices: enabled, disabled, gravity_compensation.",
+            parameters: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "mode": .object(["type": .string("string")]),
+                ]),
+                "required": .array([.string("mode")]),
+            ]),
+            handler: { args in
+                guard let raw = args.asObject?["mode"]?.asString,
+                      let mode = MotorMode(rawValue: raw) else {
+                    return .object(["ok": .bool(false), "error": .string("invalid mode")])
+                }
+                try await robot.setMotorMode(mode)
+                return .object(["ok": .bool(true), "mode": .string(mode.rawValue)])
+            }
+        )
+
+        await toolRegistry.register(
+            name: "wake_up",
+            description: "Wake Rocky up (enable motors and play the wake-up move).",
+            handler: { _ in
+                try await robot.wakeUp()
+                return .object(["ok": .bool(true)])
+            }
+        )
+
+        await toolRegistry.register(
+            name: "go_to_sleep",
+            description: "Send Rocky to sleep (disable motors after a goodbye gesture).",
+            handler: { _ in
+                try await robot.goToSleep()
+                return .object(["ok": .bool(true)])
+            }
+        )
+
+        await toolRegistry.register(
+            name: "stop_motion",
+            description: "Stop any in-flight recorded move immediately.",
+            handler: { _ in
+                try await robot.stopMove()
+                return .object(["ok": .bool(true)])
+            }
+        )
+
+        // `say` is a stub until M5 wires the TTS sidecar. It echoes the text
+        // back so the dashboard's Brain card can render the assistant's
+        // intent even before voice-out is real.
+        await toolRegistry.register(
+            name: "say",
+            description: "Speak the given text aloud through Rocky's speaker.",
+            parameters: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "text": .object(["type": .string("string")]),
+                ]),
+                "required": .array([.string("text")]),
+            ]),
+            handler: { args in
+                let text = args.asObject?["text"]?.asString ?? ""
+                await bus.publish(.ttsRequest(text: text, voiceRefId: "(stub)", firstChunkMs: nil))
+                return .object(["ok": .bool(true), "queued": .bool(true)])
+            }
+        )
+
+        await toolRegistry.register(
+            name: "get_state",
+            description: "Return Rocky's current head pose, antennas, and body yaw.",
+            handler: { [weak self] _ in
+                guard let self else { return .null }
+                let state = try await self.robotLink.fullState()
+                return .object([
+                    "control_mode": .string(state.controlMode.rawValue),
+                    "head_yaw_deg":   .number(state.headPose.yaw   * 180 / .pi),
+                    "head_pitch_deg": .number(state.headPose.pitch * 180 / .pi),
+                    "head_roll_deg":  .number(state.headPose.roll  * 180 / .pi),
+                    "body_yaw_deg":   .number(state.bodyYaw        * 180 / .pi),
+                    "antenna_right_rad": .number(state.antennasPosition.right),
+                    "antenna_left_rad":  .number(state.antennasPosition.left),
+                ])
+            }
+        )
     }
 
     private func probeRobot() async {
