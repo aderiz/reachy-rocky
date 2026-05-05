@@ -262,6 +262,24 @@ Settings (new sidebar destination):
 
 `SettingsStore` (`@Observable @MainActor`) is the single source of truth, persisted via UserDefaults. `AppServices.applySettings()` swaps live LM Studio + Cognition config without restarting.
 
+## [2026-05-05] code | scripts/build-app.sh — proper .app bundle for TCC
+
+`swift run` launches a raw executable; macOS TCC ties permission prompts and decisions to a code signature, which means mic / speech / camera prompts don't fire reliably without a real .app bundle.
+
+`scripts/build-app.sh`:
+- `swift build -c release --product Rocky`.
+- Assembles `build/Rocky.app/Contents/{MacOS,Resources}/`.
+- Writes `Info.plist` with `NSMicrophoneUsageDescription`, `NSSpeechRecognitionUsageDescription`, `NSCameraUsageDescription`, and `NSAppTransportSecurity.NSAllowsLocalNetworking=true` (so REST traffic to `reachy-mini.local` and `localhost:1234` works without exceptions).
+- Ad-hoc codesigns with hardened runtime — enough for personal dev / TCC stability without a Developer ID Application certificate.
+
+`scripts/run.sh` is a thin wrapper that builds + `open`s. Smoke-tested on this machine: arm64 Mach-O thin binary, plist parses, ad-hoc + runtime signature, all three permission descriptions present.
+
+`build/` added to `.gitignore`. Distribution path forward (M7 follow-up): swap ad-hoc for a real Developer ID + notarization step in CI, ship via DMG.
+
+## [2026-05-05] init | Wiki bootstrap
+
+(Earliest entry retained for chronology — see top of file.)
+
 ## [2026-05-05] init | Wiki bootstrapped from doc pass
 
 Documentation pass on Reachy Mini Wireless. Wiki structure created in `docs/`; project-root `CLAUDE.md` points here.
