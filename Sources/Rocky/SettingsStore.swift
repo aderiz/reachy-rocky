@@ -16,6 +16,7 @@ final class SettingsStore {
     var lmStudioApiKey: String { didSet { save() } }
     var persona: String   { didSet { save() } }
     var ttsBackend: String { didSet { save() } }     // "say" | "chatterbox"
+    var micSource: String  { didSet { save() } }     // "mac" | "robot"
 
     init() {
         let d = UserDefaults.standard
@@ -26,6 +27,19 @@ final class SettingsStore {
         self.lmStudioApiKey = d.string(forKey: Keys.lmApiKey) ?? ""
         self.persona = d.string(forKey: Keys.persona) ?? Self.defaultPersona
         self.ttsBackend = d.string(forKey: Keys.ttsBackend) ?? Self.detectDefaultTTSBackend()
+        self.micSource = d.string(forKey: Keys.micSource) ?? Self.detectDefaultMicSource()
+    }
+
+    /// Pick robot if the robot-mic sidecar venv has been built; otherwise mac.
+    private static func detectDefaultMicSource() -> String {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let venvPython = support
+            .appendingPathComponent("Rocky")
+            .appendingPathComponent("sidecars")
+            .appendingPathComponent("robot-mic")
+            .appendingPathComponent(".venv/bin/python")
+        return FileManager.default.fileExists(atPath: venvPython.path)
+            ? "robot" : "mac"
     }
 
     /// Pick chatterbox if the venv has been built (i.e. the user ran
@@ -50,6 +64,7 @@ final class SettingsStore {
         d.set(lmStudioApiKey, forKey: Keys.lmApiKey)
         d.set(persona, forKey: Keys.persona)
         d.set(ttsBackend, forKey: Keys.ttsBackend)
+        d.set(micSource, forKey: Keys.micSource)
     }
 
     func robotEndpoint() -> RobotEndpoint {
@@ -85,5 +100,6 @@ final class SettingsStore {
         static let lmApiKey = "rocky.lmstudio.apikey"
         static let persona = "rocky.persona"
         static let ttsBackend = "rocky.tts.backend"
+        static let micSource = "rocky.mic.source"
     }
 }

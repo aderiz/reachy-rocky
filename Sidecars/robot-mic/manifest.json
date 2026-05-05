@@ -1,0 +1,19 @@
+{
+  "name": "robot-mic",
+  "version": "0.1.0",
+  "binary": "{venv}/bin/python",
+  "args": ["-u", "-m", "rocky_robot_mic.runner"],
+  "working_dir": "{sidecar_dir}",
+  "env": {
+    "ROCKY_ROBOT_HOST": "reachy-mini.local",
+    "ROCKY_ROBOT_PORT": "8000"
+  },
+  "ready_event": "ready",
+  "ready_timeout_s": 30,
+  "shutdown_grace_s": 3,
+  "restart_policy": "on_failure",
+  "restart_max_per_minute": 3,
+  "timeouts": {
+    "*": 5
+  }
+}

@@ -21,7 +21,9 @@ final class AppServices {
     let stateSubscriber: StateSubscriber
 
     // Voice
+    let audioBuffer: AudioRingBuffer
     let mic: MicService
+    let robotMic: RobotMicService
     let wakeFilter: WakeFilter
     let voice: VoiceCoordinator
     let appleSTT: AppleSpeechSTT
@@ -153,12 +155,31 @@ final class AppServices {
         let runtime = SidecarRuntime(manifest: manifest, resolver: resolver, logBus: bus)
         self.faceTracker = FaceTrackerService(sidecar: runtime, logBus: bus)
 
-        // Voice pipeline. AppleSpeechSTT is on by default; swap to WhisperKit
-        // (or any other STTEngine conformer) via AppServices.replaceSTT.
-        self.mic = MicService(logBus: bus)
+        // Voice pipeline. Mac mic + robot mic both write into a SHARED
+        // AudioRingBuffer; VoiceCoordinator pulls from it without caring
+        // which source produced the bytes.
+        let buf = AudioRingBuffer(capacity: 6 * 16_000)
+        self.audioBuffer = buf
+        self.mic = MicService(buffer: buf, logBus: bus)
         self.wakeFilter = WakeFilter()
         self.appleSTT = AppleSpeechSTT()
-        let micSource = MicFrameSource(mic: self.mic)
+
+        // Robot-mic sidecar. Runs the reachy-mini SDK in webrtc mode.
+        let robotMicManifest = Self.devRobotMicManifest()
+        let robotMicDir = Self.locateSidecarDir(named: "robot-mic")
+            ?? URL(fileURLWithPath: "/")
+        let robotMicResolver = ManifestPathResolver(
+            sidecarDir: robotMicDir,
+            venvDir: SidecarSupervisor.defaultVenvDir(for: "robot-mic")
+        )
+        let robotMicRuntime = SidecarRuntime(
+            manifest: robotMicManifest, resolver: robotMicResolver, logBus: bus
+        )
+        self.robotMic = RobotMicService(
+            buffer: buf, sidecar: robotMicRuntime, logBus: bus
+        )
+
+        let micSource = SharedBufferAudioSource(buffer: buf)
         self.voice = VoiceCoordinator(
             source: micSource, stt: self.appleSTT, wake: self.wakeFilter, logBus: bus
         )
@@ -325,12 +346,21 @@ final class AppServices {
 
     func toggleMic() async {
         if micEnabled {
+            // Stop whichever source is running.
             mic.stop()
+            await robotMic.stop()
             await voice.stop()
             micEnabled = false
         } else {
             do {
-                try mic.start()
+                let useRobot = settings.micSource == "robot"
+                if useRobot {
+                    try await robotMic.start()
+                    sttBackendName = "Apple Speech ← robot mic"
+                } else {
+                    try mic.start()
+                    sttBackendName = "Apple Speech ← Mac mic"
+                }
                 await voice.start()
                 micEnabled = true
                 voiceErrorMessage = nil
@@ -338,7 +368,9 @@ final class AppServices {
                 // bouncing through the audio thread on every frame.
                 Task { [weak self] in
                     while let self, await MainActor.run(body: { self.micEnabled }) {
-                        let rms = self.mic.lastRMS
+                        let rms: Float = useRobot
+                            ? await self.robotMic.lastRMS
+                            : self.mic.lastRMS
                         await MainActor.run {
                             self.lastMicRMS = rms
                         }
@@ -838,15 +870,38 @@ final class AppServices {
         )
     }
 
-    /// Adapter that turns `MicService.buffer` into a `VoiceCoordinator.AudioFrameSource`.
-    private struct MicFrameSource: VoiceCoordinator.AudioFrameSource {
-        let mic: MicService
+    /// Reads from a shared AudioRingBuffer no matter which producer wrote
+    /// (Mac mic or robot mic).
+    private struct SharedBufferAudioSource: VoiceCoordinator.AudioFrameSource {
+        let buffer: AudioRingBuffer
 
         func nextFrame(maxSamples: Int) async -> [Float] {
             var out: [Float] = []
-            _ = mic.buffer.read(into: &out, max: maxSamples)
+            _ = buffer.read(into: &out, max: maxSamples)
             return out
         }
+    }
+
+    private nonisolated static func devRobotMicManifest() -> SidecarManifest {
+        let venvPython = SidecarSupervisor.defaultVenvDir(for: "robot-mic")
+            .appendingPathComponent("bin/python")
+        let dir = locateSidecarDir(named: "robot-mic")?
+            .path(percentEncoded: false) ?? "."
+        return SidecarManifest(
+            name: "robot-mic",
+            version: "0.1.0-dev",
+            binary: venvPython.path,
+            args: ["-u", "-m", "rocky_robot_mic.runner"],
+            workingDir: dir,
+            env: [
+                "PYTHONPATH": dir,
+                "ROCKY_ROBOT_HOST": "reachy-mini.local",
+                "ROCKY_ROBOT_PORT": "8000",
+            ],
+            readyTimeoutS: 30,
+            shutdownGraceS: 3,
+            timeouts: ["*": 10]
+        )
     }
 
     /// Walk up from this source file until we find `Sidecars/<name>/`. Works

@@ -2,6 +2,10 @@ import Foundation
 import AVFoundation
 import Telemetry
 
+#if canImport(AppKit)
+import AppKit
+#endif
+
 /// Captures the system's default input device into a 16 kHz mono float32
 /// `AudioRingBuffer`. Caller polls/drains the buffer.
 ///
@@ -23,10 +27,17 @@ public final class MicService: @unchecked Sendable {
     /// Latest RMS over the most recently delivered frame. Useful for VU meters.
     public private(set) var lastRMS: Float = 0
 
-    public init(logBus: LogBus, ringBufferSeconds: Double = 6) {
+    /// Construct with a caller-supplied shared buffer (Mac mic + robot mic
+    /// write into the same buffer so `VoiceCoordinator` reads one source).
+    public init(buffer: AudioRingBuffer, logBus: LogBus) {
+        self.buffer = buffer
         self.logBus = logBus
+    }
+
+    /// Convenience: own the buffer.
+    public convenience init(logBus: LogBus, ringBufferSeconds: Double = 6) {
         let cap = Int(ringBufferSeconds * 16_000)
-        self.buffer = AudioRingBuffer(capacity: cap)
+        self.init(buffer: AudioRingBuffer(capacity: cap), logBus: logBus)
     }
 
     public func start() throws {

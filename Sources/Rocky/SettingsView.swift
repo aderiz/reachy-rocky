@@ -10,6 +10,7 @@ struct SettingsView: View {
     @State private var lmApiKeyDraft: String = ""
     @State private var personaDraft: String = ""
     @State private var ttsBackendDraft: String = "say"
+    @State private var micSourceDraft: String = "mac"
     @State private var savedAt: Date?
 
     var body: some View {
@@ -48,6 +49,15 @@ struct SettingsView: View {
                             .textFieldStyle(.roundedBorder)
                             .frame(maxWidth: 280)
                     }
+                }
+
+                section(title: "Microphone",
+                        footer: "Robot mic uses Reachy Mini's 4-mic ReSpeaker array via WebRTC (run ./Sidecars/robot-mic/setup.sh once to install). Source change takes effect on the next Listen toggle.") {
+                    Picker("Source", selection: $micSourceDraft) {
+                        Text("Robot mic (Reachy 4-mic array)").tag("robot")
+                        Text("Mac mic (built-in / system default)").tag("mac")
+                    }
+                    .pickerStyle(.radioGroup)
                 }
 
                 section(title: "Voice (TTS)",
@@ -131,6 +141,7 @@ struct SettingsView: View {
             || lmApiKeyDraft != services.settings.lmStudioApiKey
             || personaDraft != services.settings.persona
             || ttsBackendDraft != services.settings.ttsBackend
+            || micSourceDraft != services.settings.micSource
     }
 
     private func syncFromStore() {
@@ -141,6 +152,7 @@ struct SettingsView: View {
         lmApiKeyDraft = services.settings.lmStudioApiKey
         personaDraft = services.settings.persona
         ttsBackendDraft = services.settings.ttsBackend
+        micSourceDraft = services.settings.micSource
     }
 
     private func apply() async {
@@ -154,6 +166,7 @@ struct SettingsView: View {
         store.lmStudioApiKey = lmApiKeyDraft
         store.persona = personaDraft
         store.ttsBackend = ttsBackendDraft
+        store.micSource = micSourceDraft
         await services.applySettings()
         savedAt = Date()
     }
