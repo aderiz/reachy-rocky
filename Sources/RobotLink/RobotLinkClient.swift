@@ -114,6 +114,24 @@ public actor RobotLinkClient {
         try ensureOK(status: status, body: data)
     }
 
+    /// `POST /api/move/play/recorded-move-dataset/{dataset}/{move}` — play
+    /// a recorded move (an "emotion") from a Hugging Face dataset such as
+    /// `pollen-robotics/reachy-mini-emotions-library`.
+    public func playRecordedMove(dataset: String, move: String) async throws {
+        let path = "/api/move/play/recorded-move-dataset/\(dataset)/\(move)"
+        let (data, status) = try await post(path: path, body: Data())
+        try ensureOK(status: status, body: data)
+    }
+
+    /// `GET /api/move/recorded-move-datasets/list/{dataset}` — list moves
+    /// available in a dataset.
+    public func listRecordedMoves(dataset: String) async throws -> [String] {
+        let path = "/api/move/recorded-move-datasets/list/\(dataset)"
+        let (data, status) = try await get(path: path)
+        try ensureOK(status: status, body: data)
+        return (try? JSONDecoder().decode([String].self, from: data)) ?? []
+    }
+
     // MARK: - Motors
 
     /// `POST /api/motors/set_mode/{mode}`

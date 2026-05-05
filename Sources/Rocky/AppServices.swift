@@ -605,6 +605,77 @@ final class AppServices {
             }
         )
 
+        // Curated subset of the Pollen emotions library; full list pulled
+        // live by Status if needed. Keeping the schema enum here keeps the
+        // LLM honest about what's actually available.
+        let emotions: [String] = [
+            "amazed1", "anxiety1", "attentive1", "boredom1", "calming1",
+            "cheerful1", "come1", "confused1", "contempt1", "curious1",
+            "dance1", "dance2", "dance3",
+            "disgusted1", "displeased1", "downcast1",
+            "enthusiastic1", "exhausted1", "fear1", "frustrated1", "furious1",
+            "go_away1", "grateful1", "helpful1", "impatient1",
+            "indifferent1", "inquiring1", "irritated1",
+            "laughing1", "lonely1", "lost1", "loving1",
+            "no1", "no_excited1", "no_sad1", "oops1",
+            "proud1", "rage1", "relief1", "reprimand1",
+            "resigned1", "sad1", "scared1", "serenity1", "shy1",
+            "sleep1", "success1", "surprised1", "thoughtful1",
+            "tired1", "uncertain1", "uncomfortable1",
+            "understanding1", "welcoming1", "yes1", "yes_sad1",
+        ]
+
+        await toolRegistry.register(
+            name: "play_emotion",
+            description: """
+            Play a recorded emotion from the Pollen Robotics library on the robot's body.
+            Use sparingly — these are full-body gestures (~1-3s) that take over the head and antennas.
+            """,
+            parameters: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "name": .object([
+                        "type": .string("string"),
+                        "enum": .array(emotions.map { .string($0) }),
+                        "description": .string("Emotion to play"),
+                    ]),
+                ]),
+                "required": .array([.string("name")]),
+            ]),
+            handler: { args in
+                guard let name = args.asObject?["name"]?.asString,
+                      emotions.contains(name) else {
+                    return .object([
+                        "ok": .bool(false),
+                        "error": .string("unknown emotion"),
+                    ])
+                }
+                try await robot.playRecordedMove(
+                    dataset: "pollen-robotics/reachy-mini-emotions-library",
+                    move: name
+                )
+                return .object(["ok": .bool(true), "emotion": .string(name)])
+            }
+        )
+
+        let visionService = faceTracker
+        await toolRegistry.register(
+            name: "pause_face_tracking",
+            description: "Stop the face-tracker sidecar from steering the head. Use before a recorded emotion.",
+            handler: { _ in
+                try await visionService.setEnabled(false)
+                return .object(["ok": .bool(true)])
+            }
+        )
+        await toolRegistry.register(
+            name: "resume_face_tracking",
+            description: "Resume the face-tracker sidecar.",
+            handler: { _ in
+                try await visionService.setEnabled(true)
+                return .object(["ok": .bool(true)])
+            }
+        )
+
         let tts = robotTTS
         await toolRegistry.register(
             name: "say",
