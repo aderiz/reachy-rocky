@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 import RockyKit
 
 /// Closed taxonomy of every event Rocky publishes, per plan §4.6.

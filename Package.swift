@@ -10,11 +10,12 @@ let package = Package(
         .library(name: "Telemetry", targets: ["Telemetry"]),
         .library(name: "SidecarHost", targets: ["SidecarHost"]),
         .library(name: "RobotLink", targets: ["RobotLink"]),
+        .library(name: "Vision", targets: ["Vision"]),
     ],
     targets: [
         .executableTarget(
             name: "Rocky",
-            dependencies: ["RockyKit", "Telemetry", "SidecarHost", "RobotLink"],
+            dependencies: ["RockyKit", "Telemetry", "SidecarHost", "RobotLink", "Vision"],
             path: "Sources/Rocky"
         ),
         .target(
@@ -36,6 +37,11 @@ let package = Package(
             dependencies: ["RockyKit", "Telemetry"],
             path: "Sources/RobotLink"
         ),
+        .target(
+            name: "Vision",
+            dependencies: ["RockyKit", "Telemetry", "SidecarHost", "RobotLink"],
+            path: "Sources/Vision"
+        ),
         .testTarget(
             name: "RockyKitTests",
             dependencies: ["RockyKit"],
@@ -50,6 +56,11 @@ let package = Package(
             name: "SidecarHostTests",
             dependencies: ["SidecarHost"],
             path: "Tests/SidecarHostTests"
+        ),
+        .testTarget(
+            name: "VisionTests",
+            dependencies: ["Vision", "SidecarHost", "Telemetry", "RockyKit"],
+            path: "Tests/VisionTests"
         ),
     ],
     swiftLanguageModes: [.v6]

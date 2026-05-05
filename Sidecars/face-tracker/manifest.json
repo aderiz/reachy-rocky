@@ -1,0 +1,26 @@
+{
+  "name": "face-tracker",
+  "version": "0.1.0",
+  "binary": "{venv}/bin/python",
+  "args": ["-u", "-m", "rocky_face_tracker.runner"],
+  "working_dir": "{sidecar_dir}",
+  "env": {
+    "ROCKY_FT_MODE": "synthetic",
+    "ROCKY_FT_HFOV_DEG": "65",
+    "ROCKY_FT_VFOV_DEG": "39",
+    "ROCKY_FT_DAMPER_OMEGA": "3.0",
+    "ROCKY_FT_EMA_ALPHA": "0.5",
+    "ROCKY_FT_IDLE_TIMEOUT_S": "1.5",
+    "ROCKY_FT_PROMPT": "a brunette male with a beard"
+  },
+  "ready_event": "ready",
+  "ready_timeout_s": 30,
+  "shutdown_grace_s": 3,
+  "restart_policy": "on_failure",
+  "restart_max_per_minute": 3,
+  "timeouts": {
+    "*": 5,
+    "set_enabled": 2,
+    "set_prompt": 2
+  }
+}

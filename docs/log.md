@@ -32,6 +32,31 @@ The Sidecar contract is now real and reusable. Subsequent sidecars (face-tracker
 
 Tried `curl http://reachy-mini.local:8000/openapi.json` — robot not reachable (mDNS timeout). Live REST validation deferred until robot is on. Continuing with M3 in the meantime.
 
+## [2026-05-05] code | Rocky M3a — face tracker (Python sidecar + Vision adapter, synthetic mode)
+
+The validated face-tracker design (memory: `project_face_tracker_design.md`) reborn under the Sidecar contract. State-driven, world-frame target, decoupled detection rate from motion smoothness — **no regression to per-frame P-control**.
+
+Python (`Sidecars/face-tracker/`):
+
+- `geometry.py` — `CameraIntrinsics(hfov=65, vfov=39)`; `normalized_bbox_center` + `angle_from_pixel`. Sign convention preserved: face on the LEFT (un<0) → +yaw (head turns LEFT), face on BOTTOM (vn>0) → +pitch (head DOWN).
+- `filters.py` — `EMA(alpha=0.5)` and `CriticalDamper(omega=3 rad/s)` second-order semi-implicit Euler.
+- `controller.py` — `FaceTrackerController` ingests `Detection` events, EMA-smooths the world-frame target (current commanded yaw/pitch + camera-frame offset), 50 Hz tick advances dampers; idle decay toward (0,0) after 1.5 s of no detections.
+- `detector_synthetic.py` — Lissajous-traced "face" with periodic dropout windows so we exercise decay-to-home offline.
+- `runner.py` — JSON-line entry point. Two threads: detector ~10 Hz emits `detection` events, command 50 Hz emits `target` events. Methods: `set_enabled`, `set_prompt`, `update_commanded_pose`, `health`, `shutdown`. Real SAM 3.1 mode (M3b) is stubbed to synthetic for now.
+- Sanity-checked the Python math directly: damper converges to 0.98 of target after 2 s, controller emits +yaw for face-on-left, sign conventions hold.
+
+Swift (`Sources/Vision/`):
+
+- `FaceTrackerService` actor — owns the sidecar, parses `target` and `detection` events, exposes `AsyncStream<Target>` and `AsyncStream<Detection>`. Forwards `setEnabled`/`setPrompt`/`updateCommandedPose` to the sidecar.
+- `FaceTargetBridge` actor — turns `Target` (yaw/pitch radians) into `MotionTarget(head: HeadPose)` and pushes into `TargetStreamer`. Pre-clamps to safety limits. Has a `setSuppressed(_)` knob so primary recorded moves win.
+
+Tests (5 new, 23/23 total):
+
+- `FaceTrackerSidecarIntegrationTests` (3): ready+targets at 50 Hz, `set_enabled false` round-trip, `health` round-trip.
+- `VisionTests/FaceTrackerServiceTests` (2): the typed adapter bridges both streams; control methods succeed.
+
+M3b (real SAM 3.1 + Reachy SDK camera) opens when the user is at the robot.
+
 ## [2026-05-05] init | Wiki bootstrapped from doc pass
 
 Documentation pass on Reachy Mini Wireless. Wiki structure created in `docs/`; project-root `CLAUDE.md` points here.
