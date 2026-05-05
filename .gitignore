@@ -14,6 +14,9 @@ Package.resolved
 *.xcodeproj
 *.xcworkspace
 
+# Bundled .app artifacts (built fresh by scripts/build-app.sh)
+build/
+
 # Xcode user data
 **/xcuserdata/
 **/*.xcscmblueprint
