@@ -81,6 +81,27 @@ Live smoke test: posted `target_head_pose: {yaw: 0.0873}` (5°) → daemon retur
 
 Tests: 24/24 green (added `MotionTargetCodingTests` covering the `target_*` key encoding; rewrote `RobotState` decode test against a live capture).
 
+## [2026-05-05] code | Rocky M4 — Voice pipeline base (no STT model yet)
+
+Voice package landed with all the deterministic plumbing. STT is abstract; `EchoSTT` placeholder ships now, WhisperKit conformer follows.
+
+- `Voice/AudioRingBuffer` — lock-protected SP/SC float32 ring; drops oldest under backpressure with a counter.
+- `Voice/MicService` — AVAudioEngine input tap → 16 kHz mono float32 via `AVAudioConverter` → ring buffer. Tracks RMS for the VU meter.
+- `Voice/EnergyVAD` — RMS-thresholded VAD with sliding minSpeechFrames / minSilenceFrames hysteresis. Trade-off documented vs. Silero.
+- `Voice/STTEngine` protocol + `EchoSTT` test conformer.
+- `Voice/WakeFilter` actor — **address-pattern** wake match (transcript must START with "rocky" after stripping leading "hey"/"ok"/punctuation/whitespace; "the rocky road" no longer matches). 60s rolling conversation window with auto-extend on each turn; stop phrases close it; `openWindow`/`closeWindow` for manual control.
+- `Voice/VoiceCoordinator` actor — orchestrates frame source → VAD → STT → WakeFilter; emits `Output` events (partial, finalText with dispatched flag, windowOpened/Closed).
+- `Rocky/VoiceCard` — VU meter, conversation pill (countdown when open, "waiting for wake word" when closed), last transcript, dispatched indicator, mic toggle button.
+- `AppServices.toggleMic()` starts mic + voice coordinator and pumps outputs into Observable mirrors.
+
+Tests (13 new, 37/37 total):
+- `AudioRingBufferTests` (3): round-trip, overflow drops oldest, partial reads advance tail.
+- `EnergyVADTests` (3): speechStart latches after enough loud frames; speechEnd after enough silent; intermittent loud frames don't latch.
+- `WakeFilterTests` (6): "the rocky road" ignored; "Rocky, ..." routed; follow-up within window without wake; window expires; stop phrase closes; manual openWindow/closeWindow.
+- `VoiceCoordinatorTests` (1): scripted-frame end-to-end — VAD start, segment, end → STT fires → wake match dispatches.
+
+WhisperKit (real STT) lands next as a follow-up commit.
+
 ## [2026-05-05] init | Wiki bootstrapped from doc pass
 
 Documentation pass on Reachy Mini Wireless. Wiki structure created in `docs/`; project-root `CLAUDE.md` points here.
