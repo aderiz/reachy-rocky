@@ -44,6 +44,7 @@ private struct DashboardView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 HeroCard()
+                MotionCard()
                 VisionCard()
             }
             .padding(20)

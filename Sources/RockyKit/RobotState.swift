@@ -1,95 +1,127 @@
 import Foundation
 
-/// Snapshot of the robot's current state, mirroring the daemon's `/api/state/full`
-/// shape. Field names use Swift conventions; `CodingKeys` map to the wire format.
+/// Snapshot of the robot's current state, mirroring the daemon's
+/// `/api/state/full` response (verified live, daemon v1.7.1).
 public struct RobotState: Sendable, Equatable, Hashable, Codable {
-    public var head: HeadPose
-    public var antennas: Antennas
+    public var controlMode: MotorMode
+    public var headPose: RPYPose
+    public var headJoints: [Double]?
     public var bodyYaw: Double
-    public var motorMode: MotorMode
-    public var isMoveRunning: Bool
+    public var antennasPosition: Antennas
+    public var passiveJoints: [Double]?
+    public var doa: DoA?
+    public var timestamp: String?
+
+    public struct DoA: Sendable, Equatable, Hashable, Codable {
+        public let angleRad: Double?
+        public let isSpeechDetected: Bool?
+
+        enum CodingKeys: String, CodingKey {
+            case angleRad = "angle_rad"
+            case isSpeechDetected = "is_speech_detected"
+        }
+    }
 
     public init(
-        head: HeadPose = .identity,
-        antennas: Antennas = .zero,
+        controlMode: MotorMode = .enabled,
+        headPose: RPYPose = .zero,
+        headJoints: [Double]? = nil,
         bodyYaw: Double = 0,
-        motorMode: MotorMode = .enabled,
-        isMoveRunning: Bool = false
+        antennasPosition: Antennas = .zero,
+        passiveJoints: [Double]? = nil,
+        doa: DoA? = nil,
+        timestamp: String? = nil
     ) {
-        self.head = head
-        self.antennas = antennas
+        self.controlMode = controlMode
+        self.headPose = headPose
+        self.headJoints = headJoints
         self.bodyYaw = bodyYaw
-        self.motorMode = motorMode
-        self.isMoveRunning = isMoveRunning
+        self.antennasPosition = antennasPosition
+        self.passiveJoints = passiveJoints
+        self.doa = doa
+        self.timestamp = timestamp
     }
 
     enum CodingKeys: String, CodingKey {
-        case head
-        case antennas
+        case controlMode = "control_mode"
+        case headPose = "head_pose"
+        case headJoints = "head_joints"
         case bodyYaw = "body_yaw"
-        case motorMode = "motor_mode"
-        case isMoveRunning = "is_move_running"
+        case antennasPosition = "antennas_position"
+        case passiveJoints = "passive_joints"
+        case doa
+        case timestamp
     }
 
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        // The daemon emits `head` as a flat 16-element array.
-        let matrix = try c.decode([Double].self, forKey: .head)
-        self.head = HeadPose(matrix: matrix)
-        // `antennas` arrives as `[right, left]` in radians.
-        let pair = try c.decode([Double].self, forKey: .antennas)
+        self.controlMode = try c.decode(MotorMode.self, forKey: .controlMode)
+        self.headPose = try c.decode(RPYPose.self, forKey: .headPose)
+        self.headJoints = try c.decodeIfPresent([Double].self, forKey: .headJoints)
+        self.bodyYaw = try c.decode(Double.self, forKey: .bodyYaw)
+        let pair = try c.decode([Double].self, forKey: .antennasPosition)
         guard pair.count == 2 else {
             throw DecodingError.dataCorruptedError(
-                forKey: .antennas, in: c,
-                debugDescription: "Expected antennas to be [right_rad, left_rad]"
+                forKey: .antennasPosition, in: c,
+                debugDescription: "expected antennas_position to be [right_rad, left_rad]"
             )
         }
-        self.antennas = Antennas(rightRad: pair[0], leftRad: pair[1])
-        self.bodyYaw = try c.decode(Double.self, forKey: .bodyYaw)
-        self.motorMode = try c.decode(MotorMode.self, forKey: .motorMode)
-        self.isMoveRunning = try c.decode(Bool.self, forKey: .isMoveRunning)
+        self.antennasPosition = Antennas(rightRad: pair[0], leftRad: pair[1])
+        self.passiveJoints = try c.decodeIfPresent([Double].self, forKey: .passiveJoints)
+        self.doa = try c.decodeIfPresent(DoA.self, forKey: .doa)
+        self.timestamp = try c.decodeIfPresent(String.self, forKey: .timestamp)
     }
 
     public func encode(to encoder: any Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(head.matrix, forKey: .head)
-        try c.encode([antennas.right, antennas.left], forKey: .antennas)
+        try c.encode(controlMode, forKey: .controlMode)
+        try c.encode(headPose, forKey: .headPose)
+        try c.encodeIfPresent(headJoints, forKey: .headJoints)
         try c.encode(bodyYaw, forKey: .bodyYaw)
-        try c.encode(motorMode, forKey: .motorMode)
-        try c.encode(isMoveRunning, forKey: .isMoveRunning)
+        try c.encode([antennasPosition.right, antennasPosition.left], forKey: .antennasPosition)
+        try c.encodeIfPresent(passiveJoints, forKey: .passiveJoints)
+        try c.encodeIfPresent(doa, forKey: .doa)
+        try c.encodeIfPresent(timestamp, forKey: .timestamp)
     }
 }
 
-/// A target packet streamed to the daemon at 50 Hz by `RobotLink.TargetStreamer`.
+/// What we send to `POST /api/move/set_target`. Wire schema: `FullBodyTarget`.
+///
+/// Field names use the `target_` prefix on the wire; this differs from
+/// `GotoModelRequest` which uses bare `head_pose` / `antennas` / `body_yaw`.
 public struct MotionTarget: Sendable, Equatable, Hashable, Codable {
-    public var head: HeadPose?
+    public var headPose: RPYPose?
     public var antennas: Antennas?
     public var bodyYaw: Double?
+    public var timestamp: String?
 
-    public init(head: HeadPose? = nil, antennas: Antennas? = nil, bodyYaw: Double? = nil) {
-        self.head = head
+    public init(
+        headPose: RPYPose? = nil,
+        antennas: Antennas? = nil,
+        bodyYaw: Double? = nil,
+        timestamp: String? = nil
+    ) {
+        self.headPose = headPose
         self.antennas = antennas
         self.bodyYaw = bodyYaw
+        self.timestamp = timestamp
     }
 
     enum CodingKeys: String, CodingKey {
-        case head
-        case antennas
-        case bodyYaw = "body_yaw"
+        case headPose = "target_head_pose"
+        case antennas = "target_antennas"
+        case bodyYaw = "target_body_yaw"
+        case timestamp
     }
 
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        if let m = try c.decodeIfPresent([Double].self, forKey: .head) {
-            self.head = HeadPose(matrix: m)
-        } else {
-            self.head = nil
-        }
+        self.headPose = try c.decodeIfPresent(RPYPose.self, forKey: .headPose)
         if let pair = try c.decodeIfPresent([Double].self, forKey: .antennas) {
             guard pair.count == 2 else {
                 throw DecodingError.dataCorruptedError(
                     forKey: .antennas, in: c,
-                    debugDescription: "Expected antennas to be [right_rad, left_rad]"
+                    debugDescription: "expected target_antennas to be [right_rad, left_rad]"
                 )
             }
             self.antennas = Antennas(rightRad: pair[0], leftRad: pair[1])
@@ -97,14 +129,16 @@ public struct MotionTarget: Sendable, Equatable, Hashable, Codable {
             self.antennas = nil
         }
         self.bodyYaw = try c.decodeIfPresent(Double.self, forKey: .bodyYaw)
+        self.timestamp = try c.decodeIfPresent(String.self, forKey: .timestamp)
     }
 
     public func encode(to encoder: any Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encodeIfPresent(head?.matrix, forKey: .head)
+        try c.encodeIfPresent(headPose, forKey: .headPose)
         if let a = antennas {
             try c.encode([a.right, a.left], forKey: .antennas)
         }
         try c.encodeIfPresent(bodyYaw, forKey: .bodyYaw)
+        try c.encodeIfPresent(timestamp, forKey: .timestamp)
     }
 }

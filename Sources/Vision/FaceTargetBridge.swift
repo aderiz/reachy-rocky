@@ -44,10 +44,9 @@ public actor FaceTargetBridge {
 
     private func forward(_ target: FaceTrackerService.Target) async {
         guard !suppressed else { return }
-        // Clamp yaw/pitch into safety limits before composing the pose.
         let yaw = SafetyLimits.clamp(target.yawRad, to: SafetyLimits.headYawMax)
         let pitch = SafetyLimits.clamp(target.pitchRad, to: SafetyLimits.headPitchMax)
-        let pose = HeadPose.rpy(pitch: .radians(pitch), yaw: .radians(yaw))
-        await streamer.update(.init(head: pose), source: .face)
+        let pose = RPYPose(roll: 0, pitch: pitch, yaw: yaw)
+        await streamer.update(.init(headPose: pose), source: .face)
     }
 }

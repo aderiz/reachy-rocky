@@ -40,6 +40,7 @@ The catalog of every page in the wiki.
 
 - [AGENTS.md](sources/agents-md.md) — canonical AI-agent guide for the Reachy Mini repo.
 - [HF Docs map](sources/hf-docs.md) — pages we've ingested from huggingface.co/docs/reachy_mini.
+- [Daemon OpenAPI v1.7.1](sources/daemon-openapi-1.7.1.md) — live wire shapes captured from the running daemon, including `set_target` / `goto` / `state/full` corrections and newly discovered media endpoints.
 
 ## Decisions
 

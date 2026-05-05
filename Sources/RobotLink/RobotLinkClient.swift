@@ -53,8 +53,9 @@ public actor RobotLinkClient {
 
     // MARK: - Motion
 
-    /// `POST /api/move/set_target` — instant target update; intended for streaming
-    /// at ~50 Hz from `TargetStreamer`. Pre-clamps to safety limits.
+    /// `POST /api/move/set_target` — instant target update (wire schema:
+    /// `FullBodyTarget`). Intended for streaming at ~50 Hz from `TargetStreamer`.
+    /// Pre-clamps to safety limits.
     public func setTarget(_ target: MotionTarget) async throws {
         let clamped = SafetyLimits.clamp(target)
         let body = try JSONEncoder().encode(clamped)
@@ -62,29 +63,36 @@ public actor RobotLinkClient {
         try ensureOK(status: status, body: data)
     }
 
-    /// `POST /api/move/goto` — smooth interpolated motion. Use for gestures ≥0.5 s,
-    /// not for streaming control.
-    public func goto(_ target: MotionTarget, durationS: Double, method: GotoMethod = .minjerk) async throws {
+    /// `POST /api/move/goto` — smooth interpolated motion (wire schema:
+    /// `GotoModelRequest`). Use for gestures ≥0.5 s, not for streaming control.
+    public func goto(
+        headPose: RPYPose? = nil,
+        antennas: Antennas? = nil,
+        bodyYaw: Double? = nil,
+        durationS: Double,
+        interpolation: Interpolation = .minjerk
+    ) async throws {
         struct Body: Encodable {
-            let head: [Double]?
+            let head_pose: RPYPose?
             let antennas: [Double]?
             let body_yaw: Double?
             let duration: Double
-            let method: String
+            let interpolation: String
         }
         let payload = Body(
-            head: target.head?.matrix,
-            antennas: target.antennas.map { [$0.right, $0.left] },
-            body_yaw: target.bodyYaw,
+            head_pose: headPose,
+            antennas: antennas.map { [$0.right, $0.left] },
+            body_yaw: bodyYaw,
             duration: durationS,
-            method: method.rawValue
+            interpolation: interpolation.rawValue
         )
         let body = try JSONEncoder().encode(payload)
         let (data, status) = try await post(path: "/api/move/goto", body: body)
         try ensureOK(status: status, body: data)
     }
 
-    public enum GotoMethod: String, Sendable {
+    /// Maps to the daemon's `InterpolationTechnique` enum.
+    public enum Interpolation: String, Sendable {
         case linear, minjerk, easeInOut = "ease_in_out", cartoon
     }
 
@@ -179,15 +187,16 @@ public actor RobotLinkClient {
 }
 
 extension SafetyLimits {
-    /// Pre-clamp every component of a motion target to its valid range. The daemon
-    /// also clamps internally — this just keeps the dashboard honest about what
-    /// was requested vs. what was sent.
+    /// Pre-clamp every component of a motion target to its valid range. The
+    /// daemon also clamps internally; this keeps the dashboard honest about
+    /// what was requested vs. what was sent.
     public static func clamp(_ target: MotionTarget) -> MotionTarget {
         var t = target
-        if let pose = target.head {
-            // We don't decompose the matrix here; clamping at the matrix level is
-            // a no-op. RPY clamping happens upstream where we synthesize the pose.
-            t.head = pose
+        if var pose = target.headPose {
+            pose.roll = clamp(pose.roll, to: headRollMax)
+            pose.pitch = clamp(pose.pitch, to: headPitchMax)
+            pose.yaw = clamp(pose.yaw, to: headYawMax)
+            t.headPose = pose
         }
         if let body = target.bodyYaw {
             t.bodyYaw = clamp(body, to: bodyYawMax)

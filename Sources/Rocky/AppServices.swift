@@ -15,11 +15,13 @@ final class AppServices {
     let robotLink: RobotLinkClient
     let supervisor: SidecarSupervisor
     let faceTracker: FaceTrackerService
+    let stateSubscriber: StateSubscriber
 
     /// Most recent reachability check for the daemon.
     var daemonReachability: Reachability = .unknown
     var lastDaemonStatus: RobotLinkClient.DaemonStatus?
     var lastRobotState: RobotState?
+    var stateUpdateCount: Int = 0
 
     /// Live mirror of the latest face-tracker target so the Vision card can render it.
     var lastFaceTarget: FaceTrackerService.Target?
@@ -37,6 +39,7 @@ final class AppServices {
         self.robotEndpoint = endpoint
         self.robotLink = RobotLinkClient(endpoint: endpoint, logBus: bus)
         self.supervisor = SidecarSupervisor(logBus: bus)
+        self.stateSubscriber = StateSubscriber(endpoint: endpoint, logBus: bus)
 
         // Build the face-tracker sidecar in dev mode (synthetic detector,
         // /usr/bin/python3, no venv). Real-robot mode swaps the manifest
@@ -90,9 +93,26 @@ final class AppServices {
             guard let self else { return }
             await self.probeRobot()
         }
+
+        // Subscribe to live state. Reconnects with backoff on transport errors.
+        await stateSubscriber.start()
+        let states = stateSubscriber.states
+        Task { [weak self] in
+            for await state in states {
+                guard let self else { return }
+                await MainActor.run {
+                    self.lastRobotState = state
+                    self.stateUpdateCount &+= 1
+                    if self.daemonReachability != .online {
+                        self.daemonReachability = .online
+                    }
+                }
+            }
+        }
     }
 
     func stop() async {
+        await stateSubscriber.stop()
         await faceTracker.stop()
     }
 

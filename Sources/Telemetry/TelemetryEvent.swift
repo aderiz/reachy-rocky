@@ -9,6 +9,7 @@ public enum TelemetryEvent: Sendable {
     // Robot motion
     case motorCommand(source: MotionSource, target: MotionTarget)
     case motorState(RobotState)
+    case stateStream(transition: String)
     case daemonStatus(periodMs: Double, readDtMs: Double, writeDtMs: Double)
     case robotLink(endpoint: String, status: Int, latencyMs: Double)
 

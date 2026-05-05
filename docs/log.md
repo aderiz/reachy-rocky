@@ -57,6 +57,30 @@ Tests (5 new, 23/23 total):
 
 M3b (real SAM 3.1 + Reachy SDK camera) opens when the user is at the robot.
 
+## [2026-05-05] code | Live daemon validation + wire-shape refactor
+
+Robot online at 192.168.1.173 (mDNS resolves now). Captured the live OpenAPI schema (79 endpoints, daemon v1.7.1, control loop 49.6 Hz / 20ms period). Created `sources/daemon-openapi-1.7.1.md` documenting deltas vs. our model. Major corrections:
+
+- `/api/move/set_target` body uses `FullBodyTarget` with `target_` **prefixed** keys (`target_head_pose`, `target_antennas`, `target_body_yaw`). Head pose is XYZ+RPY by default, not a flat 16-element matrix. Matrix form is `{"m": [16 numbers]}` if used.
+- `/api/move/goto` keys are **bare** (`head_pose`, `antennas`, `body_yaw`, `duration`, `interpolation`).
+- `/api/state/full` returns `control_mode` (not `motor_mode`), `head_pose` (RPY object), `antennas_position` (not `antennas`), no `is_move_running` — derive from `/api/move/running` being non-empty.
+- `WS /api/state/ws/full` exists and emits ~10 Hz; not advertised in OpenAPI.
+
+Refactored to match the live wire:
+
+- `RockyKit/RPYPose` added.
+- `RockyKit/RobotState` switched to live shape (RPY pose, `control_mode`, `antennas_position`, optional `head_joints`/`passive_joints`/`doa`/`timestamp`).
+- `RockyKit/MotionTarget` now serializes as `FullBodyTarget` with `target_*` keys.
+- `RobotLink/RobotLinkClient.goto` rewritten with explicit `head_pose: RPYPose?`/`antennas`/`body_yaw`/`duration`/`interpolation`.
+- `RobotLink/StateSubscriber` actor: WebSocket `/api/state/ws/full` with backoff reconnect; emits `RobotState` AsyncStream and publishes `motorState` telemetry events.
+- `Vision/FaceTargetBridge` now produces `RPYPose` targets (was `HeadPose` matrix).
+- `Rocky/MotionCard` added: live RPY bars (yaw/pitch/roll vs safety limits), antennas R/L, body yaw arc, motor-mode pill, frame-count pill.
+- `AppServices` starts the StateSubscriber on launch and mirrors `lastRobotState` + `stateUpdateCount` on the main actor for SwiftUI consumption.
+
+Live smoke test: posted `target_head_pose: {yaw: 0.0873}` (5°) → daemon returned `{"status":"ok"}` and the head moved (yaw climbed from baseline ~0.012 toward +0.041 in 700 ms before returning to 0). Wire format end-to-end confirmed.
+
+Tests: 24/24 green (added `MotionTargetCodingTests` covering the `target_*` key encoding; rewrote `RobotState` decode test against a live capture).
+
 ## [2026-05-05] init | Wiki bootstrapped from doc pass
 
 Documentation pass on Reachy Mini Wireless. Wiki structure created in `docs/`; project-root `CLAUDE.md` points here.
