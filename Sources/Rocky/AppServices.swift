@@ -12,6 +12,7 @@ import Voice
 @Observable
 @MainActor
 final class AppServices {
+    let settings: SettingsStore
     let logBus: LogBus
     let robotEndpoint: RobotEndpoint
     let robotLink: RobotLinkClient
@@ -128,7 +129,10 @@ final class AppServices {
         return .idle
     }
 
-    init(endpoint: RobotEndpoint = RobotEndpoint()) {
+    init() {
+        let settings = SettingsStore()
+        self.settings = settings
+        let endpoint = settings.robotEndpoint()
         let bus = LogBus()
         self.logBus = bus
         self.robotEndpoint = endpoint
@@ -175,10 +179,13 @@ final class AppServices {
         self.robotTTS = RobotTTS(sidecar: ttsRuntime, media: self.mediaClient, logBus: bus)
 
         // Cognition: LM Studio client + tool registry.
-        self.llm = LMStudioClient(logBus: bus)
+        self.llm = LMStudioClient(config: settings.lmStudioConfig(), logBus: bus)
         self.toolRegistry = ToolRegistry(logBus: bus)
         self.cognition = CognitionEngine(
-            llm: self.llm, registry: self.toolRegistry, logBus: bus
+            llm: self.llm,
+            registry: self.toolRegistry,
+            logBus: bus,
+            config: .init(systemPrompt: settings.persona)
         )
     }
 
@@ -521,6 +528,15 @@ final class AppServices {
     /// Public entry points so the Status panel can re-run probes.
     func probeRobotPublic() async { await probeRobot() }
     func probeLMStudioPublic() async { await probeLMStudio() }
+
+    /// Apply the latest values from the SettingsStore. The endpoint can't be
+    /// changed at runtime without a relaunch (URLSession sockets, sidecars,
+    /// etc. all hold the original); we update what's safe (LM Studio + persona).
+    func applySettings() async {
+        await llm.setConfig(settings.lmStudioConfig())
+        await cognition.setConfig(.init(systemPrompt: settings.persona))
+        await probeLMStudio()
+    }
 
     // MARK: - Tools
 

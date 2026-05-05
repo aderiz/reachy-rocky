@@ -6,13 +6,14 @@ struct RootView: View {
     @State private var selection: SidebarItem = .dashboard
 
     enum SidebarItem: Hashable, CaseIterable, Identifiable {
-        case dashboard, status, logs
+        case dashboard, status, logs, settings
         var id: Self { self }
         var label: String {
             switch self {
             case .dashboard: "Dashboard"
             case .status:    "Status"
             case .logs:      "Logs"
+            case .settings:  "Settings"
             }
         }
         var icon: String {
@@ -20,6 +21,7 @@ struct RootView: View {
             case .dashboard: "rectangle.3.group"
             case .status:    "checkmark.shield"
             case .logs:      "doc.plaintext"
+            case .settings:  "gear"
             }
         }
     }
@@ -33,6 +35,7 @@ struct RootView: View {
             case .dashboard: DashboardView()
             case .status:    StatusView()
             case .logs:      LogsView()
+            case .settings:  SettingsView()
             }
         }
         .navigationTitle("Rocky")

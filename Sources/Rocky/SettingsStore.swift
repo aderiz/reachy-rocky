@@ -1,0 +1,72 @@
+import Foundation
+import Observation
+import RobotLink
+import Cognition
+
+/// User-tunable settings persisted in `UserDefaults`. Read once at
+/// `AppServices.init`, persisted whenever fields change. SwiftData / a real
+/// preferences pane comes with a packaged build (M7 follow-up).
+@Observable
+@MainActor
+final class SettingsStore {
+    var robotHost: String { didSet { save() } }
+    var robotPort: Int    { didSet { save() } }
+    var lmStudioURL: String { didSet { save() } }
+    var lmStudioModel: String { didSet { save() } }
+    var lmStudioApiKey: String { didSet { save() } }
+    var persona: String   { didSet { save() } }
+
+    init() {
+        let d = UserDefaults.standard
+        self.robotHost = d.string(forKey: Keys.robotHost) ?? "reachy-mini.local"
+        self.robotPort = d.object(forKey: Keys.robotPort) as? Int ?? 8000
+        self.lmStudioURL = d.string(forKey: Keys.lmURL) ?? "http://localhost:1234/v1"
+        self.lmStudioModel = d.string(forKey: Keys.lmModel) ?? "qwen2.5-7b-instruct"
+        self.lmStudioApiKey = d.string(forKey: Keys.lmApiKey) ?? ""
+        self.persona = d.string(forKey: Keys.persona) ?? Self.defaultPersona
+    }
+
+    private func save() {
+        let d = UserDefaults.standard
+        d.set(robotHost, forKey: Keys.robotHost)
+        d.set(robotPort, forKey: Keys.robotPort)
+        d.set(lmStudioURL, forKey: Keys.lmURL)
+        d.set(lmStudioModel, forKey: Keys.lmModel)
+        d.set(lmStudioApiKey, forKey: Keys.lmApiKey)
+        d.set(persona, forKey: Keys.persona)
+    }
+
+    func robotEndpoint() -> RobotEndpoint {
+        RobotEndpoint(host: robotHost, port: robotPort)
+    }
+
+    func lmStudioConfig() -> LMStudioConfig {
+        LMStudioConfig(
+            baseURL: URL(string: lmStudioURL) ?? URL(string: "http://localhost:1234/v1")!,
+            model: lmStudioModel,
+            apiKey: lmStudioApiKey.isEmpty ? nil : lmStudioApiKey
+        )
+    }
+
+    static let defaultPersona = """
+    You are Rocky, a small embodied robot sitting on a desk next to the user.
+    You have a head you can turn, antennas you can wiggle, and a voice. You can
+    play short recorded emotions to add personality. Keep replies short and
+    natural — you can move while you talk. Use the provided tools to actually
+    move and act; don't pretend.
+
+    Style:
+    - One or two sentences unless asked for more.
+    - When you act, narrate briefly (e.g., "looking over there").
+    - Be honest if a tool fails or the network is flaky.
+    """
+
+    private enum Keys {
+        static let robotHost = "rocky.robot.host"
+        static let robotPort = "rocky.robot.port"
+        static let lmURL = "rocky.lmstudio.url"
+        static let lmModel = "rocky.lmstudio.model"
+        static let lmApiKey = "rocky.lmstudio.apikey"
+        static let persona = "rocky.persona"
+    }
+}

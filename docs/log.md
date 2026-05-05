@@ -244,6 +244,24 @@ Mechanical changes to make this real:
 
 Calm-tech: when everything is green, the panel is just six green dots — no nagging.
 
+## [2026-05-05] code | Tools + Settings + Persona editor
+
+Added two more tool handlers and a Settings tab:
+
+Tools:
+- `play_emotion(name)` — invokes `POST /api/move/play/recorded-move-dataset/pollen-robotics/reachy-mini-emotions-library/{name}`. Schema enum constrains the LLM to 54 known emotions (amazed1, cheerful1, dance1/2/3, fear1, grateful1, laughing1, proud1, sad1, sleep1, success1, welcoming1, yes1, ...). Live-validated.
+- `pause_face_tracking` / `resume_face_tracking` — forward to the FaceTrackerService sidecar's `setEnabled`. Use before a recorded emotion takes over the head.
+- `RobotLink.playRecordedMove(dataset:move:)` and `listRecordedMoves(dataset:)` added.
+
+Settings (new sidebar destination):
+
+- Robot host + port (relaunch required to apply).
+- LM Studio base URL + model + optional API key (hot-reloads via `LMStudioClient.setConfig`).
+- Persona editor — full system-prompt `TextEditor` with "Reset to default" button. Default persona: short, embodied, action-oriented, latency-honest.
+- Apply button (⌘S) commits to UserDefaults and re-probes LM Studio.
+
+`SettingsStore` (`@Observable @MainActor`) is the single source of truth, persisted via UserDefaults. `AppServices.applySettings()` swaps live LM Studio + Cognition config without restarting.
+
 ## [2026-05-05] init | Wiki bootstrapped from doc pass
 
 Documentation pass on Reachy Mini Wireless. Wiki structure created in `docs/`; project-root `CLAUDE.md` points here.
