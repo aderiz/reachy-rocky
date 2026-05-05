@@ -45,6 +45,18 @@ The catalog of every page in the wiki.
 
 - [0001 — Target platform](decisions/0001-target-platform.md) — Wireless on-robot Python is the default.
 
+## Rocky implementation
+
+The Rocky macOS app lives in `Sources/`, `Tests/`, `Sidecars/`. Plan: `~/.claude/plans/i-d-like-this-to-swirling-octopus.md`.
+
+Foundational packages landed in M1 first-pass scaffold (see `log.md`):
+
+- `RockyKit` — types: `HeadPose`, `Antennas`, `MotorMode`, `SafetyLimits`, `RobotState`, `MotionTarget`, units.
+- `Telemetry` — `LogBus`, `TelemetryEvent` taxonomy.
+- `SidecarHost` — `Sidecar` protocol, `SidecarManifest`, `JSONLineCodec`. Runtime/supervisor M2.
+- `RobotLink` — `RobotLinkClient`, `TargetStreamer`. Endpoints verified live in M1.
+- `Rocky` — app shell (`WindowGroup` + `MenuBarExtra`); dashboard fills in M3+.
+
 ## Open gaps
 
 Items we know about but haven't ingested yet. See `log.md` for the latest status.

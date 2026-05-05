@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+
+# Per-user CLI state (Claude Code permission grants etc.)
+.claude/
+
+# Obsidian (per-user editor config; not project state)
+docs/.obsidian/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+*.xcodeproj
+*.xcworkspace
+
+# Xcode user data
+**/xcuserdata/
+**/*.xcscmblueprint
+
+# Sidecars: Python venvs and caches (per-user, large)
+Sidecars/**/.venv/
+Sidecars/**/__pycache__/
+Sidecars/**/*.egg-info/
+
+# Rocky local app support (created at runtime)
+.rocky/
