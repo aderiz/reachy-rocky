@@ -23,7 +23,7 @@ final class AppServices {
     let mic: MicService
     let wakeFilter: WakeFilter
     let voice: VoiceCoordinator
-    let echoSTT: EchoSTT          // placeholder until WhisperKit lands
+    let appleSTT: AppleSpeechSTT
     let mediaClient: MediaClient
     let robotTTS: RobotTTS
 
@@ -51,6 +51,7 @@ final class AppServices {
     var lastDispatched: String?
     var conversationOpenUntil: Date?
     var voiceErrorMessage: String?
+    var sttBackendName: String = "Apple Speech"
 
     // Brain state
     enum LLMStatus: Sendable, Equatable {
@@ -96,13 +97,14 @@ final class AppServices {
         let runtime = SidecarRuntime(manifest: manifest, resolver: resolver, logBus: bus)
         self.faceTracker = FaceTrackerService(sidecar: runtime, logBus: bus)
 
-        // Voice pipeline. EchoSTT is a placeholder; WhisperKit replaces it.
+        // Voice pipeline. AppleSpeechSTT is on by default; swap to WhisperKit
+        // (or any other STTEngine conformer) via AppServices.replaceSTT.
         self.mic = MicService(logBus: bus)
         self.wakeFilter = WakeFilter()
-        self.echoSTT = EchoSTT()
+        self.appleSTT = AppleSpeechSTT()
         let micSource = MicFrameSource(mic: self.mic)
         self.voice = VoiceCoordinator(
-            source: micSource, stt: self.echoSTT, wake: self.wakeFilter, logBus: bus
+            source: micSource, stt: self.appleSTT, wake: self.wakeFilter, logBus: bus
         )
 
         // Voice out (TTS): mlx-tts sidecar (say backend by default, real
@@ -199,6 +201,27 @@ final class AppServices {
         // Tool registry + LM Studio probe.
         await registerInitialTools()
         Task { [weak self] in await self?.probeLMStudio() }
+
+        // Speech recognition authorization.
+        Task { [weak self] in await self?.warmUpSTT() }
+    }
+
+    private func warmUpSTT() async {
+        let resolved = await appleSTT.requestAuthorization()
+        switch resolved {
+        case .ready:
+            await MainActor.run { self.sttBackendName = "Apple Speech" }
+        case .unavailable:
+            await MainActor.run {
+                self.voiceErrorMessage = "Speech recognition unavailable for the current locale."
+                self.sttBackendName = "unavailable"
+            }
+        case .unauthorized(let status):
+            await MainActor.run {
+                self.voiceErrorMessage = "Speech recognition not authorized (\(status.rawValue))."
+                self.sttBackendName = "unauthorized"
+            }
+        }
     }
 
     func stop() async {

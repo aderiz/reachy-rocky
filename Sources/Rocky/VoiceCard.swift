@@ -9,6 +9,9 @@ struct VoiceCard: View {
                 Label("Voice", systemImage: "waveform")
                     .font(.headline)
                 Spacer()
+                Text("STT: \(services.sttBackendName)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 conversationPill
                 Button {
                     Task { await services.toggleMic() }

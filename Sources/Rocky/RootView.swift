@@ -3,13 +3,34 @@ import RockyKit
 
 struct RootView: View {
     @Environment(AppServices.self) private var services
+    @State private var selection: SidebarItem = .dashboard
+
+    enum SidebarItem: Hashable, CaseIterable, Identifiable {
+        case dashboard, logs
+        var id: Self { self }
+        var label: String {
+            switch self {
+            case .dashboard: "Dashboard"
+            case .logs:      "Logs"
+            }
+        }
+        var icon: String {
+            switch self {
+            case .dashboard: "rectangle.3.group"
+            case .logs:      "doc.plaintext"
+            }
+        }
+    }
 
     var body: some View {
         NavigationSplitView {
-            SidebarView()
+            SidebarView(selection: $selection)
                 .navigationSplitViewColumnWidth(min: 200, ideal: 220)
         } detail: {
-            DashboardView()
+            switch selection {
+            case .dashboard: DashboardView()
+            case .logs:      LogsView()
+            }
         }
         .navigationTitle("Rocky")
         .toolbar {
@@ -21,18 +42,12 @@ struct RootView: View {
 }
 
 private struct SidebarView: View {
+    @Binding var selection: RootView.SidebarItem
+
     var body: some View {
-        List {
-            Section("Status") {
-                Label("Connection", systemImage: "antenna.radiowaves.left.and.right")
-                Label("Brain",      systemImage: "brain")
-                Label("Voice",      systemImage: "waveform")
-                Label("Body",       systemImage: "figure.stand")
-                Label("Vision",     systemImage: "eye")
-            }
-            Section("Diagnostics") {
-                Label("Sidecars",   systemImage: "shippingbox")
-                Label("Logs",       systemImage: "doc.plaintext")
+        List(RootView.SidebarItem.allCases, selection: $selection) { item in
+            NavigationLink(value: item) {
+                Label(item.label, systemImage: item.icon)
             }
         }
         .listStyle(.sidebar)

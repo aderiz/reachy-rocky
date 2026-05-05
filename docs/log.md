@@ -171,6 +171,25 @@ Live wire confirmed: posted `say` output → upload (200 OK, path `/tmp/reachy_m
 
 The vertical slice "voice → brain → robot" is now real end-to-end (modulo STT — WhisperKit lands as a follow-up). Once LM Studio and the user's voice reference are in place, Rocky can hear, think, and talk.
 
+## [2026-05-05] code | M4 follow-up — Apple Speech STT + Logs view
+
+`AppleSpeechSTT` (`SFSpeechRecognizer`-backed `STTEngine`) replaces `EchoSTT` as the runtime default. Pros: built-in, on-device when supported, no model download, no SwiftPM dep. Cons: quality lags Whisper for hard cases; we can swap in WhisperKit later via the same protocol.
+
+- `AppleSpeechSTT.requestAuthorization()` flips the engine into `.ready` once the user grants speech-recognition permission. macOS shows the system prompt the first time when run from a packaged app; `swift run` may inherit a previous decision.
+- AppServices warms it up on launch and surfaces the resolved status on the dashboard.
+- `VoiceCard` shows the active STT backend.
+
+Logs view added — closes the "is anything happening" gap when running the app:
+
+- New sidebar: Dashboard / Logs (NavigationSplitView selection-driven).
+- `LogsView` subscribes to `LogBus`, classifies events into seven categories (motor / vision / voice / brain / sidecar / link / error), tails the last 500 events.
+- Filters: per-category toggles + free-text search box.
+- Pause/resume button (freeze tail without dropping events) and Clear button.
+- Auto-scrolls to bottom while live; pinned when paused.
+- Compact monospaced rows with HH:mm:ss.SSS timestamp + colored category pill + summary line + secondary detail.
+
+47/47 tests still green (one flake on echo-sidecar restart timing observed; passes on retry).
+
 ## [2026-05-05] init | Wiki bootstrapped from doc pass
 
 Documentation pass on Reachy Mini Wireless. Wiki structure created in `docs/`; project-root `CLAUDE.md` points here.
