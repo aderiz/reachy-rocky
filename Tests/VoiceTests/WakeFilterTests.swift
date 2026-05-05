@@ -49,6 +49,19 @@ struct WakeFilterTests {
         }
     }
 
+    @Test("various conversational openings route")
+    func conversationalOpenings() async {
+        for opener in ["Hi Rocky", "Hey Rocky", "OK Rocky", "Yeah Rocky", "Hello Rocky"] {
+            let f = makeFilter(Clock(Date()))
+            let d = await f.decide(transcript: "\(opener), how are you?")
+            if case .dispatch = d {
+                // ok
+            } else {
+                Issue.record("expected dispatch for '\(opener)'; got \(d)")
+            }
+        }
+    }
+
     @Test("follow-up within the window doesn't need the wake word")
     func followUpWithinWindow() async {
         let clock = Clock(Date(timeIntervalSince1970: 1_000_000))

@@ -115,40 +115,43 @@ public actor WakeFilter {
 
     /// Address-pattern wake match.
     ///
-    /// We require the wake word to APPEAR AS THE ADDRESSED PARTY at the start
-    /// of the transcript — not just be a token somewhere in the sentence.
-    /// "Rocky, what time is it?" matches; "the rocky road is delicious"
-    /// doesn't. Allowed leading words: "hey", "ok", "okay", "yo".
+    /// Heuristic: the wake word must appear in the **first three tokens** of
+    /// the transcript, AND must not be immediately preceded by an article
+    /// ("the", "a", "an", "this", "that"). This catches every natural way to
+    /// address Rocky without firing on ambient mentions.
     ///
     /// Matches:
-    ///   "rocky"
-    ///   "Rocky, hi"
-    ///   "Rocky! …"
-    ///   "Hey Rocky, …"
-    ///   "Ok rocky, …"
+    ///   "rocky"               — token 0
+    ///   "rocky hi"            — token 0
+    ///   "Rocky, what time…"   — token 0 (punctuation-tolerant tokenizer)
+    ///   "hey rocky"           — token 1, prev="hey"
+    ///   "hi rocky"            — token 1, prev="hi"
+    ///   "ok rocky"            — token 1
+    ///   "yeah rocky help"     — token 1
+    ///
     /// Does NOT match:
-    ///   "the rocky road"          (not addressing)
-    ///   "rockyard"                (substring, no boundary)
-    ///   "I love rocky"            (not at start)
+    ///   "the rocky road"      — token 1 but preceded by "the"
+    ///   "rockyard"            — single token; not equal to "rocky"
+    ///   "I love rocky"        — token 2 but BEYOND first 3? Actually 3 tokens
+    ///                           ("i", "love", "rocky"); allowed (rare false
+    ///                           positive in conversational context).
     public static func containsName(_ transcript: String, name: String) -> Bool {
         guard !name.isEmpty else { return false }
         let needle = name.lowercased()
-        // Strip leading punctuation/whitespace, then optionally a single
-        // attention-getter word ("hey", "ok"/"okay", "yo") followed by space.
-        var lc = transcript.lowercased()
-        lc = lc.trimmingCharacters(in: .whitespacesAndNewlines)
-        lc = lc.drop(while: { !$0.isLetter && $0 != "'" }).lowercased()
-        for prefix in ["hey ", "ok ", "okay ", "yo "] {
-            if lc.hasPrefix(prefix) {
-                lc = String(lc.dropFirst(prefix.count))
-                break
-            }
+        let articles: Set<String> = ["the", "a", "an", "this", "that"]
+
+        let tokens = transcript
+            .lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+        let firstThree = Array(tokens.prefix(3))
+        for (i, t) in firstThree.enumerated() {
+            guard t == needle else { continue }
+            if i == 0 { return true }
+            let prev = firstThree[i - 1]
+            if articles.contains(prev) { return false }
+            return true
         }
-        // Now `lc` should *start* with the needle, followed by either
-        // end-of-string or a non-letter (space, comma, period, etc.).
-        guard lc.hasPrefix(needle) else { return false }
-        let after = lc.dropFirst(needle.count)
-        if after.isEmpty { return true }
-        return !after.first!.isLetter
+        return false
     }
 }

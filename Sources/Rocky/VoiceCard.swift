@@ -38,15 +38,23 @@ struct VoiceCard: View {
                     }
                     Text("Last transcript")
                         .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                    Text(services.lastTranscript.isEmpty ? "—" : services.lastTranscript)
+                    Text(services.lastTranscript.isEmpty
+                         ? "—"
+                         : "\u{201C}\(services.lastTranscript)\u{201D}")
                         .font(.body)
+                        .textSelection(.enabled)
                         .lineLimit(2)
 
-                    if let dispatched = services.lastDispatched {
-                        Text("→ dispatched: \(dispatched)")
-                            .font(.caption.monospaced())
-                            .foregroundStyle(.green)
-                            .lineLimit(1)
+                    if !services.lastTranscript.isEmpty {
+                        if services.lastDispatched == services.lastTranscript {
+                            Text("→ dispatched to brain")
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.green)
+                        } else {
+                            Text("(no wake word \u{2014} say \u{201C}Rocky, \u{2026}\u{201D})")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
                 Spacer()

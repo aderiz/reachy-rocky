@@ -30,9 +30,9 @@ public struct EnergyVAD: VAD {
         public var minSilenceFrames: Int
 
         public init(
-            rmsThreshold: Float = 0.012,
-            minSpeechFrames: Int = 4,
-            minSilenceFrames: Int = 12
+            rmsThreshold: Float = 0.008,
+            minSpeechFrames: Int = 3,
+            minSilenceFrames: Int = 14
         ) {
             self.rmsThreshold = rmsThreshold
             self.minSpeechFrames = minSpeechFrames
