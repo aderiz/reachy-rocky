@@ -13,6 +13,7 @@ struct RockyApp: App {
             RootView()
                 .environment(services)
                 .frame(minWidth: 920, minHeight: 600)
+                .task { await services.start() }
         }
         .windowResizability(.contentMinSize)
 

@@ -44,9 +44,7 @@ private struct DashboardView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 HeroCard()
-                Text("Dashboard cards will land in M1+ as each service wires up.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                VisionCard()
             }
             .padding(20)
         }
