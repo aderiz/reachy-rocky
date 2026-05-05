@@ -163,10 +163,12 @@ final class AppServices {
             source: micSource, stt: self.appleSTT, wake: self.wakeFilter, logBus: bus
         )
 
-        // Voice out (TTS): mlx-tts sidecar (say backend by default, real
-        // F5-TTS-MLX engine when the optional extras are installed).
+        // Voice out (TTS): mlx-tts sidecar. `say` backend uses /usr/bin/python3
+        // and zero deps; `chatterbox` requires the [mlx] venv built via
+        // `FT_EXTRAS=mlx ./Sidecars/mlx-tts/setup.sh` and runs Chatterbox
+        // Turbo FP16 with the user's voice reference.
         self.mediaClient = MediaClient(endpoint: endpoint, logBus: bus)
-        let ttsManifest = Self.devTTSManifest()
+        let ttsManifest = Self.devTTSManifest(backend: settings.ttsBackend)
         let ttsDir = Self.locateSidecarDir(named: "mlx-tts")
             ?? URL(fileURLWithPath: "/")
         let ttsResolver = ManifestPathResolver(
@@ -794,24 +796,34 @@ final class AppServices {
         )
     }
 
-    private nonisolated static func devTTSManifest() -> SidecarManifest {
-        SidecarManifest(
+    private nonisolated static func devTTSManifest(backend: String) -> SidecarManifest {
+        let venvPython = SidecarSupervisor.defaultVenvDir(for: "mlx-tts")
+            .appendingPathComponent("bin/python")
+        let isChatterbox = backend == "chatterbox"
+        let useVenv = isChatterbox && FileManager.default.fileExists(atPath: venvPython.path)
+        let binary = useVenv ? venvPython.path : "/usr/bin/python3"
+        let resolvedBackend = useVenv ? "chatterbox" : "say"
+        let sidecarDir = locateSidecarDir(named: "mlx-tts")?
+            .path(percentEncoded: false) ?? "."
+        var env: [String: String] = [
+            "PYTHONPATH": sidecarDir,
+            "ROCKY_TTS_BACKEND": resolvedBackend,
+        ]
+        if resolvedBackend == "say" {
+            env["ROCKY_TTS_VOICE"] = "Samantha"
+            env["ROCKY_TTS_RATE"] = "180"
+        }
+        return SidecarManifest(
             name: "mlx-tts",
             version: "0.1.0-dev",
-            binary: "/usr/bin/python3",
+            binary: binary,
             args: ["-u", "-m", "rocky_tts.runner"],
-            workingDir: locateSidecarDir(named: "mlx-tts")?
-                .path(percentEncoded: false) ?? ".",
-            env: [
-                "PYTHONPATH": locateSidecarDir(named: "mlx-tts")?
-                    .path(percentEncoded: false) ?? ".",
-                "ROCKY_TTS_BACKEND": "say",
-                "ROCKY_TTS_VOICE": "Samantha",
-                "ROCKY_TTS_RATE": "180",
-            ],
-            readyTimeoutS: 15,
+            workingDir: sidecarDir,
+            env: env,
+            readyTimeoutS: 30,
             shutdownGraceS: 3,
-            timeouts: ["*": 5, "synthesize": 30]
+            // Chatterbox first synth includes a model load; bump the timeout.
+            timeouts: ["*": 5, "synthesize": isChatterbox ? 60 : 30]
         )
     }
 

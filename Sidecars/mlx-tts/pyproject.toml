@@ -9,9 +9,12 @@ dependencies = []  # `say` placeholder needs no Python deps
 # a voice reference, the `say` backend uses macOS's bundled TTS so the wire
 # protocol can be exercised end-to-end.
 [project.optional-dependencies]
+# Chatterbox-Turbo FP16 via mlx-audio. The model
+# `mlx-community/chatterbox-turbo-fp16` (~3 GB) downloads on first
+# `synthesize` call and caches under ~/.cache/huggingface/.
 mlx = [
     "mlx>=0.18",
-    "f5-tts-mlx>=0.2",
+    "mlx-audio>=0.4",
     "soundfile>=0.12",
     "numpy>=1.26",
 ]

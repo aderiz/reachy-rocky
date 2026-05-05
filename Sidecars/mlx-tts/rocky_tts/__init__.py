@@ -2,11 +2,13 @@
 
 Two pluggable backends share one wire protocol:
 
-  * `say`        — macOS's bundled TTS via subprocess. Placeholder for
-                   wiring + smoke testing. No Python deps.
-  * `f5-tts-mlx` — F5-TTS-MLX voice cloning (iOS 26 / Apple Silicon).
+  * `say`        — macOS's bundled TTS via subprocess. No Python deps.
+                   Default; useful for smoke-testing the wire path.
+  * `chatterbox` — Chatterbox-Turbo FP16 via mlx-audio (voice cloning).
                    Activated when the user installs the `mlx` extras and
-                   sets ROCKY_TTS_BACKEND=f5-tts-mlx.
+                   sets ROCKY_TTS_BACKEND=chatterbox. Reference WAV +
+                   optional transcript live in
+                   ~/Library/Application Support/Rocky/voice/.
 
 `runner.py` exposes:
 

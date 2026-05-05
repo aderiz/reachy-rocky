@@ -9,6 +9,7 @@ struct SettingsView: View {
     @State private var lmModelDraft: String = ""
     @State private var lmApiKeyDraft: String = ""
     @State private var personaDraft: String = ""
+    @State private var ttsBackendDraft: String = "say"
     @State private var savedAt: Date?
 
     var body: some View {
@@ -47,6 +48,15 @@ struct SettingsView: View {
                             .textFieldStyle(.roundedBorder)
                             .frame(maxWidth: 280)
                     }
+                }
+
+                section(title: "Voice (TTS)",
+                        footer: "Chatterbox uses your cloned voice from ~/Library/Application Support/Rocky/voice/. Engine change takes effect on next launch.") {
+                    Picker("Engine", selection: $ttsBackendDraft) {
+                        Text("System voice (say)").tag("say")
+                        Text("Chatterbox FP16 (cloned)").tag("chatterbox")
+                    }
+                    .pickerStyle(.radioGroup)
                 }
 
                 section(title: "Persona",
@@ -120,6 +130,7 @@ struct SettingsView: View {
             || lmModelDraft != services.settings.lmStudioModel
             || lmApiKeyDraft != services.settings.lmStudioApiKey
             || personaDraft != services.settings.persona
+            || ttsBackendDraft != services.settings.ttsBackend
     }
 
     private func syncFromStore() {
@@ -129,6 +140,7 @@ struct SettingsView: View {
         lmModelDraft = services.settings.lmStudioModel
         lmApiKeyDraft = services.settings.lmStudioApiKey
         personaDraft = services.settings.persona
+        ttsBackendDraft = services.settings.ttsBackend
     }
 
     private func apply() async {
@@ -141,6 +153,7 @@ struct SettingsView: View {
         store.lmStudioModel = lmModelDraft.trimmingCharacters(in: .whitespaces)
         store.lmStudioApiKey = lmApiKeyDraft
         store.persona = personaDraft
+        store.ttsBackend = ttsBackendDraft
         await services.applySettings()
         savedAt = Date()
     }

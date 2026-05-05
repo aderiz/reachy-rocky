@@ -15,6 +15,7 @@ final class SettingsStore {
     var lmStudioModel: String { didSet { save() } }
     var lmStudioApiKey: String { didSet { save() } }
     var persona: String   { didSet { save() } }
+    var ttsBackend: String { didSet { save() } }     // "say" | "chatterbox"
 
     init() {
         let d = UserDefaults.standard
@@ -24,6 +25,20 @@ final class SettingsStore {
         self.lmStudioModel = d.string(forKey: Keys.lmModel) ?? "qwen2.5-7b-instruct"
         self.lmStudioApiKey = d.string(forKey: Keys.lmApiKey) ?? ""
         self.persona = d.string(forKey: Keys.persona) ?? Self.defaultPersona
+        self.ttsBackend = d.string(forKey: Keys.ttsBackend) ?? Self.detectDefaultTTSBackend()
+    }
+
+    /// Pick chatterbox if the venv has been built (i.e. the user ran
+    /// `FT_EXTRAS=mlx ./Sidecars/mlx-tts/setup.sh`), otherwise `say`.
+    private static func detectDefaultTTSBackend() -> String {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let venvPython = support
+            .appendingPathComponent("Rocky")
+            .appendingPathComponent("sidecars")
+            .appendingPathComponent("mlx-tts")
+            .appendingPathComponent(".venv/bin/python")
+        return FileManager.default.fileExists(atPath: venvPython.path)
+            ? "chatterbox" : "say"
     }
 
     private func save() {
@@ -34,6 +49,7 @@ final class SettingsStore {
         d.set(lmStudioModel, forKey: Keys.lmModel)
         d.set(lmStudioApiKey, forKey: Keys.lmApiKey)
         d.set(persona, forKey: Keys.persona)
+        d.set(ttsBackend, forKey: Keys.ttsBackend)
     }
 
     func robotEndpoint() -> RobotEndpoint {
@@ -68,5 +84,6 @@ final class SettingsStore {
         static let lmModel = "rocky.lmstudio.model"
         static let lmApiKey = "rocky.lmstudio.apikey"
         static let persona = "rocky.persona"
+        static let ttsBackend = "rocky.tts.backend"
     }
 }

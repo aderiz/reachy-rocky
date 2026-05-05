@@ -88,16 +88,23 @@ def _estimate_wav_duration(data: bytes) -> float:
 
 
 def make_backend() -> Backend:
-    """Pick the backend per ROCKY_TTS_BACKEND env var."""
+    """Pick the backend per ROCKY_TTS_BACKEND env var.
+
+    Names:
+      `say`        — macOS bundled TTS (default; no Python deps).
+      `chatterbox` — Chatterbox-Turbo FP16 via mlx-audio (voice cloning).
+    """
     name = os.environ.get("ROCKY_TTS_BACKEND", "say").lower()
     if name == "say":
         return SayBackend()
-    if name in {"f5-tts-mlx", "f5_tts_mlx", "mlx"}:
+    if name in {"chatterbox", "chatterbox-turbo", "chatterbox-fp16",
+                "chatterbox-turbo-fp16", "mlx"}:
         try:
-            from .f5_backend import F5Backend  # type: ignore
-            return F5Backend()
+            from .chatterbox_backend import ChatterboxBackend
+            return ChatterboxBackend()
         except ImportError as exc:
             raise RuntimeError(
-                f"F5-TTS-MLX backend requested but not installed: {exc}"
+                f"Chatterbox backend requested but mlx-audio is not installed "
+                f"(install with `FT_EXTRAS=mlx ./Sidecars/mlx-tts/setup.sh`): {exc}"
             )
     raise ValueError(f"unknown backend: {name}")
