@@ -46,7 +46,7 @@ let package = Package(
         ),
         .target(
             name: "Voice",
-            dependencies: ["RockyKit", "Telemetry"],
+            dependencies: ["RockyKit", "Telemetry", "SidecarHost", "RobotLink"],
             path: "Sources/Voice"
         ),
         .target(

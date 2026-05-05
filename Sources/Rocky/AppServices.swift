@@ -24,6 +24,8 @@ final class AppServices {
     let wakeFilter: WakeFilter
     let voice: VoiceCoordinator
     let echoSTT: EchoSTT          // placeholder until WhisperKit lands
+    let mediaClient: MediaClient
+    let robotTTS: RobotTTS
 
     // Cognition
     let llm: LMStudioClient
@@ -103,6 +105,21 @@ final class AppServices {
             source: micSource, stt: self.echoSTT, wake: self.wakeFilter, logBus: bus
         )
 
+        // Voice out (TTS): mlx-tts sidecar (say backend by default, real
+        // F5-TTS-MLX engine when the optional extras are installed).
+        self.mediaClient = MediaClient(endpoint: endpoint, logBus: bus)
+        let ttsManifest = Self.devTTSManifest()
+        let ttsDir = Self.locateSidecarDir(named: "mlx-tts")
+            ?? URL(fileURLWithPath: "/")
+        let ttsResolver = ManifestPathResolver(
+            sidecarDir: ttsDir,
+            venvDir: SidecarSupervisor.defaultVenvDir(for: "mlx-tts")
+        )
+        let ttsRuntime = SidecarRuntime(
+            manifest: ttsManifest, resolver: ttsResolver, logBus: bus
+        )
+        self.robotTTS = RobotTTS(sidecar: ttsRuntime, media: self.mediaClient, logBus: bus)
+
         // Cognition: LM Studio client + tool registry.
         self.llm = LMStudioClient(logBus: bus)
         self.toolRegistry = ToolRegistry(logBus: bus)
@@ -120,6 +137,19 @@ final class AppServices {
             await logBus.publish(.error(scope: "app/face-tracker",
                                         message: "\(error)",
                                         recoverable: true))
+        }
+
+        // Best-effort: bring up the TTS sidecar in the background so the
+        // first `say` tool call is fast. Failure is non-fatal; the LLM
+        // simply hears an error on `say` until the sidecar comes up.
+        Task { [robotTTS, logBus] in
+            do {
+                try await robotTTS.start()
+            } catch {
+                await logBus.publish(.error(
+                    scope: "app/mlx-tts", message: "\(error)", recoverable: true
+                ))
+            }
         }
 
         // Pump face-tracker events into observable mirrors.
@@ -437,9 +467,7 @@ final class AppServices {
             }
         )
 
-        // `say` is a stub until M5 wires the TTS sidecar. It echoes the text
-        // back so the dashboard's Brain card can render the assistant's
-        // intent even before voice-out is real.
+        let tts = robotTTS
         await toolRegistry.register(
             name: "say",
             description: "Speak the given text aloud through Rocky's speaker.",
@@ -452,8 +480,26 @@ final class AppServices {
             ]),
             handler: { args in
                 let text = args.asObject?["text"]?.asString ?? ""
-                await bus.publish(.ttsRequest(text: text, voiceRefId: "(stub)", firstChunkMs: nil))
-                return .object(["ok": .bool(true), "queued": .bool(true)])
+                guard !text.isEmpty else {
+                    return .object(["ok": .bool(false),
+                                    "error": .string("empty text")])
+                }
+                let stats = try await tts.speak(text)
+                return .object([
+                    "ok": .bool(true),
+                    "synth_ms": .number(stats.synthMs),
+                    "upload_ms": .number(stats.uploadMs),
+                    "duration_s": .number(stats.durationS),
+                ])
+            }
+        )
+
+        await toolRegistry.register(
+            name: "stop_speaking",
+            description: "Stop any in-progress robot speech.",
+            handler: { _ in
+                try await tts.cancel()
+                return .object(["ok": .bool(true)])
             }
         )
 
@@ -511,6 +557,27 @@ final class AppServices {
             ],
             readyTimeoutS: 15,
             shutdownGraceS: 3
+        )
+    }
+
+    private nonisolated static func devTTSManifest() -> SidecarManifest {
+        SidecarManifest(
+            name: "mlx-tts",
+            version: "0.1.0-dev",
+            binary: "/usr/bin/python3",
+            args: ["-u", "-m", "rocky_tts.runner"],
+            workingDir: locateSidecarDir(named: "mlx-tts")?
+                .path(percentEncoded: false) ?? ".",
+            env: [
+                "PYTHONPATH": locateSidecarDir(named: "mlx-tts")?
+                    .path(percentEncoded: false) ?? ".",
+                "ROCKY_TTS_BACKEND": "say",
+                "ROCKY_TTS_VOICE": "Samantha",
+                "ROCKY_TTS_RATE": "180",
+            ],
+            readyTimeoutS: 15,
+            shutdownGraceS: 3,
+            timeouts: ["*": 5, "synthesize": 30]
         )
     }
 

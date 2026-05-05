@@ -136,6 +136,41 @@ Dashboard `BrainCard`:
 
 LM Studio not running locally — confirmed graceful degradation: `BrainCard` shows "brain offline", manual sends echo a polite "(brain offline · …)" reply.
 
+## [2026-05-05] code | Rocky M5 base — TTS via robot speaker
+
+Voice out shipped end-to-end with a `say` placeholder backend so the wire path is provable today; F5-TTS-MLX swap is a one-file change inside the sidecar.
+
+Sidecar `Sidecars/mlx-tts/`:
+
+- Two pluggable backends share one `Backend` interface:
+  - **`say`** (default) — macOS bundled TTS via `say -o file.aiff` + `afconvert -f WAVE -d LEI16@16000`. Always available, no Python deps.
+  - **`f5-tts-mlx`** (gated behind `[mlx]` extras) — F5-TTS-MLX engine for cloned voice. Activated by `ROCKY_TTS_BACKEND=f5-tts-mlx` once the user provides a 5–10 s reference WAV.
+- Methods: `synthesize(text, voice_ref_id?)` returns base64 WAV + sample rate + duration + synth_ms; `set_voice_ref(name, wav_b64)`; `health()`; `warm_up()`.
+- Smoke test: `say` backend produces 1.15 s of "hi from rocky" in ~836 ms.
+
+`RobotLink/MediaClient` actor:
+
+- `uploadSound(filename, data)` — multipart/form-data POST to `/api/media/sounds/upload`. Returns the daemon's stored path.
+- `playSound(file)` — JSON POST to `/api/media/play_sound`.
+- `stopSound()` — POST `/api/media/stop_sound`.
+
+Live wire confirmed: posted `say` output → upload (200 OK, path `/tmp/reachy_mini_sounds/rocky_test.wav`) → play_sound (200 OK) → robot's onboard speaker said "hello, I am Rocky" out loud.
+
+`Voice/RobotTTS` actor:
+
+- `speak(text)` — synthesize → upload → play; returns `SpeakStats(synthMs, uploadMs, totalMs, durationS)`.
+- `setVoiceRef(name, wavData)` — forwards to the sidecar.
+- `cancel()` — calls `stopSound`.
+- `start()` / `stop()` — sidecar lifecycle.
+
+`AppServices`:
+
+- `mlx-tts` sidecar registered with the supervisor via a dev manifest (`/usr/bin/python3` + `say` backend). Spawned in the background on launch.
+- `say` tool handler now calls `robotTTS.speak(text)` and returns real `synth_ms` / `upload_ms` / `duration_s` to the LLM.
+- `stop_speaking` tool registered.
+
+The vertical slice "voice → brain → robot" is now real end-to-end (modulo STT — WhisperKit lands as a follow-up). Once LM Studio and the user's voice reference are in place, Rocky can hear, think, and talk.
+
 ## [2026-05-05] init | Wiki bootstrapped from doc pass
 
 Documentation pass on Reachy Mini Wireless. Wiki structure created in `docs/`; project-root `CLAUDE.md` points here.
