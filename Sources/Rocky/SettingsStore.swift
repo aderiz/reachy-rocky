@@ -23,7 +23,7 @@ final class SettingsStore {
         self.robotHost = d.string(forKey: Keys.robotHost) ?? "reachy-mini.local"
         self.robotPort = d.object(forKey: Keys.robotPort) as? Int ?? 8000
         self.lmStudioURL = d.string(forKey: Keys.lmURL) ?? "http://localhost:1234/v1"
-        self.lmStudioModel = d.string(forKey: Keys.lmModel) ?? "qwen3.6-27b@4bit"
+        self.lmStudioModel = d.string(forKey: Keys.lmModel) ?? "gemma-4-e4b-it-mlx"
         self.lmStudioApiKey = d.string(forKey: Keys.lmApiKey) ?? ""
         self.persona = d.string(forKey: Keys.persona) ?? Self.defaultPersona
         self.ttsBackend = d.string(forKey: Keys.ttsBackend) ?? Self.detectDefaultTTSBackend()
