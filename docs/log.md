@@ -16,6 +16,22 @@ Plan approved (`/Users/amplifiedai/.claude/plans/i-d-like-this-to-swirling-octop
 
 Open M1 work: live `/openapi.json` validation against the actual robot, `HealthChecker` periodic poll, WebSocket state subscriber, motion-card visualization. Will land in subsequent commits before moving to M2.
 
+## [2026-05-05] code | Rocky M2 — SidecarHost end-to-end
+
+Implemented the user-mandated Sidecar contract end-to-end:
+
+- `SidecarRuntime` actor: spawns a `Process`, owns three pipes, dispatches stdout envelopes through `JSONLineCodec`, drains stderr as logs, correlates `id`-keyed responses, supports stream methods, applies per-method timeouts via `withThrowingTaskGroup`, surfaces unsolicited events through an `AsyncStream`.
+- `SidecarSupervisor`: registers a manifest as a runtime, watches each runtime's events stream, detects `.failing` and applies `restartPolicy` with per-minute circuit breaker (`restart_max_per_minute`).
+- `FirstRunSetup`: idempotent installer that runs `setup.sh` only when `.venv/bin/python` is missing.
+- `Sidecars/echo/`: stdlib-only Python proof-of-contract sidecar (echo, add, slow, fail, stream_count, crash). Manifest pins `/usr/bin/python3` so tests don't need a venv build.
+- `EchoSidecarIntegrationTests` (6 tests): basic round-trip, concurrent requests, error envelopes, stream lifecycle, slow-method timeout, **supervisor-restarts-after-crash** (kills the process via `sys.exit(7)`, asserts the supervisor brings it back to `.ready` within 3s and a follow-up `echo` succeeds).
+
+Total tests: 18/18 green. The supervisor crash-recovery test runs in ~0.4s end-to-end on M-series.
+
+The Sidecar contract is now real and reusable. Subsequent sidecars (face-tracker M3, mlx-tts M5) drop in as a directory + a Swift adapter layer.
+
+Tried `curl http://reachy-mini.local:8000/openapi.json` — robot not reachable (mDNS timeout). Live REST validation deferred until robot is on. Continuing with M3 in the meantime.
+
 ## [2026-05-05] init | Wiki bootstrapped from doc pass
 
 Documentation pass on Reachy Mini Wireless. Wiki structure created in `docs/`; project-root `CLAUDE.md` points here.
