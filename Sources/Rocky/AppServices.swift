@@ -277,9 +277,20 @@ final class AppServices {
             }
         }
 
-        // Tool registry + LM Studio probe.
+        // Tool registry + LM Studio probe. Auto-retries every 8 s while
+        // status is offline so users don't have to click "Probe" after
+        // launching LM Studio.
         await registerInitialTools()
         Task { [weak self] in await self?.probeLMStudio() }
+        Task { [weak self] in
+            while let self {
+                try? await Task.sleep(nanoseconds: 8_000_000_000)
+                let isOffline: Bool = await MainActor.run {
+                    if case .offline = self.llmStatus { return true } else { return false }
+                }
+                if isOffline { await self.probeLMStudio() }
+            }
+        }
 
         // Speech recognition authorization.
         Task { [weak self] in await self?.warmUpSTT() }

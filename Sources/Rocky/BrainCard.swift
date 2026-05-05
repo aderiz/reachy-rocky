@@ -72,8 +72,13 @@ struct BrainCard: View {
             return AnyView(Pill(text: "checking…", tint: .gray))
         case .online(let model):
             return AnyView(Pill(text: model, tint: .green))
-        case .offline(_):
-            return AnyView(Pill(text: "brain offline", tint: .red))
+        case .offline(let reason):
+            // Truncate to keep the pill compact; full reason in the help tip.
+            let short = reason.split(separator: ":").last.map(String.init) ?? reason
+            return AnyView(
+                Pill(text: "offline · \(short.prefix(40))", tint: .red)
+                    .help(reason)
+            )
         }
     }
 
