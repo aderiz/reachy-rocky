@@ -20,7 +20,7 @@ from pathlib import Path
 from .backends import Backend, SynthesisResult
 
 
-CHATTERBOX_MODEL = "mlx-community/chatterbox-turbo-fp16"
+DEFAULT_CHATTERBOX_MODEL = "mlx-community/chatterbox-fp16"
 DEFAULT_REF_DIR = Path.home() / "Library" / "Application Support" / "Rocky" / "voice"
 
 
@@ -29,11 +29,15 @@ class ChatterboxBackend(Backend):
 
     def __init__(
         self,
-        model_id: str = CHATTERBOX_MODEL,
+        model_id: str | None = None,
         ref_audio_path: str | None = None,
         ref_text: str | None = None,
     ) -> None:
-        self.model_id = model_id
+        self.model_id = (
+            model_id
+            or os.environ.get("ROCKY_TTS_CHATTERBOX_MODEL")
+            or DEFAULT_CHATTERBOX_MODEL
+        )
         # Default reference: ~/Library/Application Support/Rocky/voice/sample.{wav,txt}
         env_ref = os.environ.get("ROCKY_TTS_REF_AUDIO")
         env_text = os.environ.get("ROCKY_TTS_REF_TEXT")

@@ -582,9 +582,10 @@ final class AppServices {
     private var hasAutoWokenThisSession = false
 
     func wakeRobot() async {
-        // Mark transition window so the UI can show "waking…" state.
+        // The wake_up recorded move runs ~2-3s; give the avatar a small
+        // settle margin afterwards.
         await MainActor.run {
-            self.transitioningUntil = Date().addingTimeInterval(3.0)
+            self.transitioningUntil = Date().addingTimeInterval(3.5)
         }
         do { try await robotLink.wakeUp() }
         catch {
@@ -596,8 +597,11 @@ final class AppServices {
     }
 
     func sleepRobot() async {
+        // goto_sleep runs ~2.7s and is followed by motor-disable. The
+        // RobotLinkClient already awaits the full sequence; we keep the
+        // transition flag a bit longer so the slump animation is visible.
         await MainActor.run {
-            self.transitioningUntil = Date().addingTimeInterval(3.0)
+            self.transitioningUntil = Date().addingTimeInterval(4.0)
         }
         do { try await robotLink.goToSleep() }
         catch {

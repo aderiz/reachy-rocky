@@ -102,16 +102,25 @@ public actor RobotLinkClient {
         try ensureOK(status: status, body: data)
     }
 
-    /// `POST /api/move/play/wake_up`
+    /// Mirror the Reachy Mini SDK's `wake_up()` semantics: enable motors
+    /// first (so the recorded move can actually drive the joints), then
+    /// play the wake_up animation that brings the head upright.
     public func wakeUp() async throws {
+        try? await setMotorMode(.enabled)
+        // Tiny pause so the daemon registers motors-enabled before the
+        // recorded move is dispatched; otherwise the play can race.
+        try? await Task.sleep(nanoseconds: 80_000_000)
         let (data, status) = try await post(path: "/api/move/play/wake_up", body: Data())
         try ensureOK(status: status, body: data)
     }
 
-    /// `POST /api/move/play/goto_sleep`
+    /// Mirror the SDK's `goto_sleep()`: play the slump animation, wait for
+    /// it to land (~2.7 s), then disable motors so the head rests gently.
     public func goToSleep() async throws {
         let (data, status) = try await post(path: "/api/move/play/goto_sleep", body: Data())
         try ensureOK(status: status, body: data)
+        try? await Task.sleep(nanoseconds: 2_700_000_000)
+        try? await setMotorMode(.disabled)
     }
 
     /// `POST /api/move/play/recorded-move-dataset/{dataset}/{move}` — play
