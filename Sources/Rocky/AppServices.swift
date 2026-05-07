@@ -304,9 +304,36 @@ final class AppServices {
                     self.lastFaceDetection = mapped
                     self.faceDetectionCount &+= 1
                 }
-                // A face was just detected — if Rocky is asleep, wake him
-                // so the targets we're computing can actually move the head.
+                // First detection of this asleep-cycle wakes Rocky. The
+                // 30s rate-limit inside maybeAutoWake stops re-triggering.
                 await self.maybeAutoWake()
+            }
+        }
+
+        // Watch the rockyState transition: pause MacFaceTracker's pushes
+        // to TargetStreamer while a wake_up / goto_sleep recorded move
+        // is playing — otherwise the streamer fights the primary animation.
+        Task { [weak self] in
+            var lastSuppressed: Bool? = nil
+            while true {
+                guard let self else { return }
+                let suppress = await MainActor.run { () -> Bool in
+                    if let until = self.transitioningUntil, Date() < until {
+                        return true
+                    }
+                    if self.isAsleep { return true }
+                    if let mode = self.lastRobotState?.controlMode,
+                       mode != .enabled {
+                        return true
+                    }
+                    return false
+                }
+                if suppress != lastSuppressed {
+                    await self.macFaceTracker.setStreamerSuppressed(suppress)
+                    await self.targetStreamer.setPrimaryMoveActive(suppress)
+                    lastSuppressed = suppress
+                }
+                try? await Task.sleep(nanoseconds: 200_000_000)
             }
         }
         let macTargets = await macFaceTracker.targets
@@ -332,17 +359,8 @@ final class AppServices {
             }
         }
 
-        // Update the Mac face tracker's "commanded pose" knob from live
-        // robot state so world-frame angles stay sane.
-        let statesForFaceTracker = stateSubscriber.states
-        Task { [weak self] in
-            for await s in statesForFaceTracker {
-                guard let self else { return }
-                await self.macFaceTracker.updateCommandedPose(
-                    yawRad: s.headPose.yaw, pitchRad: s.headPose.pitch
-                )
-            }
-        }
+        // (no longer needed — MacFaceTracker uses its damper state as the
+        // world-frame baseline, not a lagged state-stream sample.)
 
         // Bring up the robot-camera sidecar (best-effort — failure means
         // the Vision card stays placeholder until next attempt).

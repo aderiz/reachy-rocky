@@ -22,10 +22,15 @@ public actor MacFaceTracker {
         /// Reachy Mini's wide-angle camera FOV.
         public var hfovDeg: Double = 65.0
         public var vfovDeg: Double = 39.0
-        /// World-frame target smoothing.
-        public var emaAlpha: Double = 0.5
-        /// Critical-damper natural frequency (rad/s). 3 → ~1.9 s settle.
-        public var damperOmega: Double = 3.0
+        /// EMA on the world-frame target. Lower = more responsive.
+        /// 0.25 weights the new detection at 75% — fast follow without
+        /// reacting to per-frame jitter.
+        public var emaAlpha: Double = 0.25
+        /// Critical-damper natural frequency (rad/s). 6 → ~0.97 s settle
+        /// (5%) but visibly responsive within ~250 ms. Apple Vision
+        /// at 30 FPS gives plenty of signal density to support this; the
+        /// old 3 was tuned for SAM 3.1's sparse 11 Hz detections.
+        public var damperOmega: Double = 6.0
         /// Drop detections smaller than this fraction of the frame.
         public var minBboxNorm: Double = 0.05
         /// After this idle window with no detections, decay world target home.
@@ -34,6 +39,10 @@ public actor MacFaceTracker {
         public var decayPerSecond: Double = 0.6
         /// Tick frequency for the command loop.
         public var commandHz: Double = 50.0
+        /// Max angular speed the damper output is allowed to change per
+        /// tick (rad/s). Prevents step-jumps during target snaps. Set to
+        /// 0 to disable.
+        public var maxSpeedRadPerS: Double = 6.0  // ~344°/s
 
         public init() {}
     }
@@ -67,8 +76,9 @@ public actor MacFaceTracker {
     private var dampPitchX: Double = 0; private var dampPitchV: Double = 0
 
     private var lastDetectionTs: Date?
-    private var commandedYaw: Double = 0
-    private var commandedPitch: Double = 0
+    /// Suspends pushing to `streamer` while the daemon plays a primary
+    /// move (wake_up / goto_sleep / emotion). Caller toggles this.
+    private var streamerSuppressed: Bool = false
 
     private var detectorTask: Task<Void, Never>?
     private var commandTask: Task<Void, Never>?
@@ -91,9 +101,10 @@ public actor MacFaceTracker {
         self.streamer = s
     }
 
-    public func updateCommandedPose(yawRad: Double, pitchRad: Double) {
-        self.commandedYaw = yawRad
-        self.commandedPitch = pitchRad
+    /// Pause/unpause pushes to the streamer (used during recorded moves
+    /// like wake_up so we don't fight a primary animation).
+    public func setStreamerSuppressed(_ suppressed: Bool) {
+        self.streamerSuppressed = suppressed
     }
 
     /// Start the 50 Hz command tick. Caller pushes frames in via `ingest(_:)`.
@@ -173,6 +184,9 @@ public actor MacFaceTracker {
         detectionsContinuation.yield(det)
 
         // Convert centroid → camera-frame angle → world-frame target.
+        // Use the DAMPER's current commanded position as the world-frame
+        // baseline (not a lagged state-stream sample). This removes the
+        // ~100 ms feedback delay that was making the loop oscillate.
         let cxD: Double = Double(pixelRect.midX)
         let cyD: Double = Double(pixelRect.midY)
         let imgWD: Double = Double(imgW)
@@ -183,8 +197,8 @@ public actor MacFaceTracker {
         let vfovRad: Double = config.vfovDeg * Double.pi / 180.0
         let yawOffset: Double = -un * hfovRad / 2.0
         let pitchOffset: Double = vn * vfovRad / 2.0
-        let worldYaw = commandedYaw + yawOffset
-        let worldPitch = commandedPitch + pitchOffset
+        let worldYaw = dampYawX + yawOffset
+        let worldPitch = dampPitchX + pitchOffset
 
         // EMA-smooth the world target.
         if emaInitialized {
@@ -205,7 +219,9 @@ public actor MacFaceTracker {
         while !Task.isCancelled {
             try? await Task.sleep(nanoseconds: periodNs)
             let now = ContinuousClock.now
-            let dt = max(0.0, Double((now - lastTick).components.attoseconds) / 1.0e18)
+            let dtRaw = Double((now - lastTick).components.attoseconds) / 1.0e18
+                      + Double((now - lastTick).components.seconds)
+            let dt = max(0.0, min(0.05, dtRaw))   // clamp to avoid huge jumps
             lastTick = now
 
             let decay = await self.decayIfIdle(dt: dt)
@@ -219,9 +235,18 @@ public actor MacFaceTracker {
             let w = config.damperOmega
             let aY = -2.0 * w * dampYawV - (w * w) * (dampYawX - targetYaw)
             dampYawV += dt * aY
+            // Speed cap so any single-tick jump from a target snap is bounded.
+            if config.maxSpeedRadPerS > 0 {
+                dampYawV = max(-config.maxSpeedRadPerS,
+                               min(config.maxSpeedRadPerS, dampYawV))
+            }
             dampYawX += dt * dampYawV
             let aP = -2.0 * w * dampPitchV - (w * w) * (dampPitchX - targetPitch)
             dampPitchV += dt * aP
+            if config.maxSpeedRadPerS > 0 {
+                dampPitchV = max(-config.maxSpeedRadPerS,
+                                 min(config.maxSpeedRadPerS, dampPitchV))
+            }
             dampPitchX += dt * dampPitchV
 
             let yawClamped = SafetyLimits.clamp(dampYawX, to: SafetyLimits.headYawMax)
@@ -229,8 +254,9 @@ public actor MacFaceTracker {
 
             targetsContinuation.yield((yawClamped, pitchClamped, decay))
 
-            // Push to streamer if attached.
-            if let streamer {
+            // Push to streamer unless caller suppressed (e.g., during a
+            // wake_up / goto_sleep recorded move).
+            if let streamer, !streamerSuppressed {
                 let pose = RPYPose(roll: 0, pitch: pitchClamped, yaw: yawClamped)
                 await streamer.update(.init(headPose: pose), source: .face)
             }
