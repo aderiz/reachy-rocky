@@ -71,13 +71,15 @@ public actor MacFaceTracker {
         public var idleYawPeriodS: Double = 30.0
         public var idlePitchPeriodS: Double = 18.0
 
-        // Antenna twitches — randomised small antenna joint moves
-        // every 6–12 s while the bot is awake. Adds personality
-        // without affecting the head/body trajectory.
-        public var antennaTwitchMinInterval: Double = 6.0
-        public var antennaTwitchMaxInterval: Double = 12.0
-        public var antennaTwitchAmplitude: Double = 0.18
-        public var antennaTwitchHoldS: Double = 0.4
+        // Antenna twitches — independent Poisson-process triggers per
+        // antenna so the timing is genuinely random (exponentially-
+        // distributed gaps), not a regular tempo. Mean rate ~0.18/s
+        // per antenna ≈ one twitch every 5–6 s on average, but with
+        // wide variance: occasional bursts and long quiet periods.
+        public var antennaTwitchRatePerS: Double = 0.18
+        public var antennaTwitchAmplitude: Double = 0.20
+        public var antennaTwitchMinHold: Double = 0.18
+        public var antennaTwitchMaxHold: Double = 0.55
 
         public init() {}
     }
@@ -171,14 +173,15 @@ public actor MacFaceTracker {
     private var dampPitchX: Double = 0; private var dampPitchV: Double = 0
     private var dampBodyYawX: Double = 0; private var dampBodyYawV: Double = 0
 
-    // Antenna twitch state. Holds the current commanded antenna joint
-    // angles (in radians) and schedules a fresh twitch at a randomised
-    // interval. Between twitches the antennas relax toward zero with
-    // an exponential decay so the return to neutral isn't a hard step.
+    // Antenna twitch state. Each antenna runs an independent Poisson
+    // process — every command tick (50 Hz) it gets a small probability
+    // of firing. Exponentially-distributed gaps mean the rhythm has
+    // no perceptible period: bursts, lulls, asymmetric movement —
+    // looks and feels random instead of clockwork.
     private var antennaLeftCmd: Double = 0
     private var antennaRightCmd: Double = 0
-    private var nextAntennaTwitchAt: Date?
-    private var antennaTwitchReleaseAt: Date?
+    private var leftTwitchReleaseAt: Date?
+    private var rightTwitchReleaseAt: Date?
 
     private var lastDetectionTs: Date?
     /// Suspends pushing to `streamer` while the daemon plays a primary
@@ -539,41 +542,65 @@ public actor MacFaceTracker {
     }
 
     /// Updates `antennaLeftCmd` / `antennaRightCmd` for the current
-    /// tick. Most of the time both are 0 (relaxed), with occasional
-    /// 0.4 s "twitches" of small random angles. Returns the antenna
-    /// pair to push to the daemon this tick.
+    /// tick. Each antenna runs an independent Poisson trigger — every
+    /// tick has probability `dt * rate` of firing — so the inter-
+    /// twitch gaps are exponentially distributed and the pattern has
+    /// no perceptible rhythm.
     private func tickAntennas(dt: Double) -> Antennas {
         let now = Date()
-        if nextAntennaTwitchAt == nil {
-            nextAntennaTwitchAt = now.addingTimeInterval(
-                Double.random(in: config.antennaTwitchMinInterval
-                                 ... config.antennaTwitchMaxInterval)
-            )
-        }
-        if let due = nextAntennaTwitchAt, now >= due {
-            antennaLeftCmd = Double.random(
-                in: -config.antennaTwitchAmplitude ... config.antennaTwitchAmplitude
-            )
-            antennaRightCmd = Double.random(
-                in: -config.antennaTwitchAmplitude ... config.antennaTwitchAmplitude
-            )
-            antennaTwitchReleaseAt = now.addingTimeInterval(config.antennaTwitchHoldS)
-            nextAntennaTwitchAt = now.addingTimeInterval(
-                Double.random(in: config.antennaTwitchMinInterval
-                                 ... config.antennaTwitchMaxInterval)
-            )
-        }
-        if let release = antennaTwitchReleaseAt, now >= release {
-            // After hold, exponentially decay toward zero (not a hard step).
-            let k = max(0.0, 1.0 - 4.0 * dt)
-            antennaLeftCmd *= k
-            antennaRightCmd *= k
-            if abs(antennaLeftCmd) < 1e-3 && abs(antennaRightCmd) < 1e-3 {
-                antennaLeftCmd = 0; antennaRightCmd = 0
-                antennaTwitchReleaseAt = nil
+        antennaLeftCmd = updateOneAntenna(
+            cmd: antennaLeftCmd,
+            releaseAt: &leftTwitchReleaseAt,
+            now: now, dt: dt
+        )
+        antennaRightCmd = updateOneAntenna(
+            cmd: antennaRightCmd,
+            releaseAt: &rightTwitchReleaseAt,
+            now: now, dt: dt
+        )
+        return Antennas(rightRad: antennaRightCmd, leftRad: antennaLeftCmd)
+    }
+
+    /// Per-antenna twitch step. Three pieces:
+    /// 1. Poisson trigger — fire iff `Double.random < dt*rate`. With
+    ///    a 0.18/s rate that's ~one twitch every ~5.5 s on average,
+    ///    but the actual times are exponentially distributed so
+    ///    bursts and long lulls both happen.
+    /// 2. Random amplitude in `[-A, +A]` and random hold duration
+    ///    in `[minHold, maxHold]`, drawn separately each fire.
+    /// 3. Exponential decay back to neutral after the hold expires.
+    private func updateOneAntenna(
+        cmd: Double,
+        releaseAt: inout Date?,
+        now: Date, dt: Double
+    ) -> Double {
+        var c = cmd
+        // Don't queue another twitch while the current one is still
+        // holding — gives each twitch room to be visible. Poisson
+        // sampling resumes once the antenna has decayed back.
+        if releaseAt == nil {
+            let triggerProb = dt * config.antennaTwitchRatePerS
+            if Double.random(in: 0...1) < triggerProb {
+                c = Double.random(
+                    in: -config.antennaTwitchAmplitude
+                       ... config.antennaTwitchAmplitude
+                )
+                let hold = Double.random(
+                    in: config.antennaTwitchMinHold
+                      ... config.antennaTwitchMaxHold
+                )
+                releaseAt = now.addingTimeInterval(hold)
             }
         }
-        return Antennas(rightRad: antennaRightCmd, leftRad: antennaLeftCmd)
+        if let release = releaseAt, now >= release {
+            let k = max(0.0, 1.0 - 4.0 * dt)
+            c *= k
+            if abs(c) < 1e-3 {
+                c = 0
+                releaseAt = nil
+            }
+        }
+        return c
     }
 }
 

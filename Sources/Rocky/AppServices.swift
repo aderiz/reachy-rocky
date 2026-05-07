@@ -148,23 +148,22 @@ final class AppServices {
         case error(String)
     }
 
-    /// Computed top-level mode. Order of precedence matches user
-    /// expectation: errors > sleeping > engaged > active > idle.
+    /// Computed top-level mode. Only escalates to `.error` for
+    /// daemon-level problems — i.e. the robot itself is unreachable.
+    /// Voice / mic / sidecar errors are surfaced in their own card
+    /// (Voice card, Logs view) so a mic permission issue doesn't
+    /// cause the dashboard to claim the robot is in error when the
+    /// daemon probe says it's online.
     var botMode: BotMode {
         if case .offline(let reason) = daemonReachability {
             return .error("robot offline · \(reason)")
         }
-        if let voiceError = voiceErrorMessage, !voiceError.isEmpty {
-            return .error(voiceError)
-        }
         if isAsleep { return .sleeping }
-        // Engaged: brain is processing OR speaking OR window is open.
         if let until = ttsBusyUntil, Date() < until { return .engaged }
         if brainBusy { return .engaged }
         if let until = conversationOpenUntil, Date() < until { return .engaged }
-        // Active: face has been seen recently.
         if let last = lastFaceDetectionAt,
-           Date().timeIntervalSince(last) < 1.5 {
+           Date().timeIntervalSince(last) < 8.0 {
             return .active
         }
         return .idle
@@ -213,12 +212,11 @@ final class AppServices {
     }
 
     var rockyState: RockyState {
-        // Errors take precedence so the user notices them.
+        // Only the daemon being unreachable is a global "error" — voice
+        // and other peripheral failures stay in their own surfaces and
+        // don't cause the top-level avatar to claim error.
         if case .offline(let reason) = daemonReachability {
             return .error("robot offline · \(reason)")
-        }
-        if let voiceError = voiceErrorMessage, !voiceError.isEmpty {
-            return .error(voiceError)
         }
         if let until = transitioningUntil, Date() < until {
             return .waking
@@ -737,7 +735,7 @@ final class AppServices {
                 // subscriber per toggle was creating racing handlers
                 // that double-dispatched transcripts to the LLM.
             } catch {
-                voiceErrorMessage = "\(error)"
+                voiceErrorMessage = Self.friendlyVoiceErrorMessage(for: error)
             }
         }
     }
@@ -1070,69 +1068,57 @@ final class AppServices {
     /// Tracks the last successful auto-wake so we don't spam the daemon.
     private var lastAutoWakeAt: Date?
 
-    /// Watches mic RMS for a sharp transient while sleeping, and wakes
-    /// the robot when one fires. The detector is "two spikes within
-    /// 0.8 s" — single loud sounds (door, dropped item) get filtered
-    /// out, but a deliberate tap-tap on the head shell wakes Rocky.
-    /// Stays running for the lifetime of the app; cheap when not
-    /// sleeping (just polls a Float).
+    /// Watches mic RMS for a loud transient while sleeping, and wakes
+    /// the robot when one fires. Single-tap detection: any RMS above
+    /// `spikeThreshold` triggers a wake, with a 3 s cooldown so a long
+    /// loud event (e.g. someone speaking nearby) doesn't fire repeatedly.
+    /// The earlier "two spikes within 0.8 s" gate was rejecting too
+    /// many legitimate single pats.
     private func runPatMonitor() async {
         let pollInterval: UInt64 = 50_000_000  // 50 ms (20 Hz)
-        let spikeThreshold: Float = 0.10
-        let baseline: Float = 0.025
-        let pairWindowS: TimeInterval = 0.8
-        var prev: Float = 0
-        var firstSpikeAt: Date?
+        // Any audible activity wakes the robot — a chassis tap, a
+        // spoken word, a clap. With the mic always-on while sleeping,
+        // setting a low threshold and a cooldown gives the user
+        // multiple ways to wake without false-positive runaway.
+        let spikeThreshold: Float = 0.03
+        let cooldownS: TimeInterval = 3.0
+        var lastWakeAttempt: Date = .distantPast
 
         while !Task.isCancelled {
             try? await Task.sleep(nanoseconds: pollInterval)
-            // Cheap early-out: only act while sleeping with mic on.
             let (asleep, micOn, useRobot) = await MainActor.run {
                 (self.isAsleep,
                  self.micEnabled,
                  self.settings.micSource == "robot")
             }
-            guard asleep, micOn else {
-                prev = 0; firstSpikeAt = nil
-                continue
-            }
+            guard asleep, micOn else { continue }
+            if Date().timeIntervalSince(lastWakeAttempt) < cooldownS { continue }
             let rms: Float = useRobot
                 ? await self.robotMic.lastRMS
                 : self.mic.lastRMS
-            // Sharp rise from quiet baseline counts as a spike.
-            let isSpike = (rms > spikeThreshold) && (prev < baseline)
-            prev = rms
-            if isSpike {
-                let now = Date()
-                if let first = firstSpikeAt,
-                   now.timeIntervalSince(first) < pairWindowS {
-                    // Second spike inside the window — pat confirmed.
-                    await self.logBus.publish(.sidecarLog(
-                        sidecar: "pat-monitor", level: .info,
-                        message: "pat detected — waking",
-                        fields: [:]
-                    ))
-                    firstSpikeAt = nil
-                    await self.wakeRobot()
-                } else {
-                    firstSpikeAt = now
-                }
-            } else if let first = firstSpikeAt,
-                      Date().timeIntervalSince(first) > pairWindowS {
-                // Single spike with no follow-up; reset.
-                firstSpikeAt = nil
+            if rms > spikeThreshold {
+                lastWakeAttempt = Date()
+                await self.logBus.publish(.sidecarLog(
+                    sidecar: "pat-monitor", level: .info,
+                    message: "wake (rms \(String(format: "%.3f", rms)))",
+                    fields: [:]
+                ))
+                await self.wakeRobot()
             }
         }
     }
 
     func wakeRobot() async {
-        // The wake_up recorded move runs ~2-3s; give the avatar a small
-        // settle margin afterwards.
+        // wakeUp now runs two goto segments (yawn lift + settle), total
+        // ~2.6–3 s of motion. transitioningUntil suppresses the face
+        // tracker streamer and shows "Waking" in the UI for the duration.
         await MainActor.run {
-            self.transitioningUntil = Date().addingTimeInterval(3.5)
+            self.transitioningUntil = Date().addingTimeInterval(3.2)
         }
-        do { try await robotLink.wakeUp() }
-        catch {
+        do {
+            try await robotLink.wakeUp()
+            await MainActor.run { self.transitioningUntil = nil }
+        } catch {
             await MainActor.run { self.transitioningUntil = nil }
             await logBus.publish(.error(
                 scope: "app/wake", message: "\(error)", recoverable: true
@@ -1577,6 +1563,27 @@ final class AppServices {
             shutdownGraceS: 3,
             timeouts: ["*": 10]
         )
+    }
+
+    /// Translate raw sidecar / network errors into something a user can
+    /// act on. The most common failure pattern is "Reachy Mini WebRTC
+    /// is single-subscriber — another client (the official Reachy app)
+    /// is already connected, so our sidecar's `acquire_media()` fails
+    /// with code=503 / 'Network connection attempt failed'."
+    private nonisolated static func friendlyVoiceErrorMessage(for error: Error) -> String {
+        let raw = "\(error)"
+        let lower = raw.lowercased()
+        if lower.contains("503") ||
+            lower.contains("network connection") ||
+            lower.contains("sidecar init failed") ||
+            lower.contains("acquire_media") {
+            return "Robot mic unavailable — close the official Reachy app (it holds the WebRTC stream) and try again."
+        }
+        if lower.contains("not authorized") ||
+            lower.contains("permission") {
+            return "Microphone permission denied — open System Settings → Privacy & Security → Microphone and enable Rocky."
+        }
+        return raw
     }
 
     /// Walk up from this source file until we find `Sidecars/<name>/`. Works

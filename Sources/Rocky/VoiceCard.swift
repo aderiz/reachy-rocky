@@ -85,7 +85,11 @@ struct VoiceCard: View {
 
     @ViewBuilder
     private var conversationPill: some View {
-        if let until = services.conversationOpenUntil {
+        if services.isAsleep {
+            StatusPill(text: "asleep \u{2014} tap or say \u{201C}Rocky\u{201D} to wake",
+                       tint: .secondary,
+                       systemImage: "moon.fill")
+        } else if let until = services.conversationOpenUntil {
             let secs = max(0, Int(until.timeIntervalSinceNow))
             StatusPill(text: "listening · \(secs)s", tint: .green,
                        systemImage: "mic.fill")

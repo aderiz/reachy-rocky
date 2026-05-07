@@ -102,16 +102,25 @@ public actor RobotLinkClient {
         try ensureOK(status: status, body: data)
     }
 
-    /// Mirror the Reachy Mini SDK's `wake_up()` semantics: enable motors
-    /// first (so the recorded move can actually drive the joints), then
-    /// play the wake_up animation that brings the head upright.
+    /// Wake the bot gently. Single slow `minjerk` goto from the slumped
+    /// sleep pose up to neutral — same easing curve as `look_at`, just
+    /// over a longer (2 s) duration. Avoids the daemon's recorded
+    /// `wake_up` animation (which read as snappy) and avoids chained
+    /// gotos (which were a behaviour change just before "no video /
+    /// no audio" started — keeping the move minimal so the daemon
+    /// can't get confused).
+    /// `setMotorMode` errors are swallowed (`try?`): if the daemon
+    /// rejects the mode change transiently, the goto still attempts
+    /// and the second `setMotorMode` re-asserts.
     public func wakeUp() async throws {
         try? await setMotorMode(.enabled)
-        // Tiny pause so the daemon registers motors-enabled before the
-        // recorded move is dispatched; otherwise the play can race.
-        try? await Task.sleep(nanoseconds: 80_000_000)
-        let (data, status) = try await post(path: "/api/move/play/wake_up", body: Data())
-        try ensureOK(status: status, body: data)
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        try await goto(
+            headPose: RPYPose(roll: 0, pitch: 0, yaw: 0),
+            durationS: 2.0,
+            interpolation: .minjerk
+        )
+        try? await setMotorMode(.enabled)
     }
 
     /// Mirror the SDK's `goto_sleep()`: play the slump animation, wait for
