@@ -25,10 +25,19 @@ public actor RobotTTS {
     public private(set) var lastStats: SpeakStats?
     private var seq: UInt64 = 0
 
+    /// 0.0 (silent) ... 1.0 (no scaling). Applied to the synthesized WAV
+    /// in-memory just before upload by scaling each PCM sample. See
+    /// `scaleWavVolume(_:factor:)`.
+    public private(set) var volume: Double = 0.85
+
     public init(sidecar: any Sidecar, media: MediaClient, logBus: LogBus) {
         self.sidecar = sidecar
         self.media = media
         self.logBus = logBus
+    }
+
+    public func setVolume(_ v: Double) {
+        self.volume = max(0.0, min(1.0, v))
     }
 
     /// Launch the underlying TTS sidecar process. Idempotent.
@@ -75,9 +84,13 @@ public actor RobotTTS {
             params: Params(text: text, voice_ref_id: voiceRefId)
         )
         let synthMs = Date().timeIntervalSince(synthStart) * 1000
-        guard let wav = Data(base64Encoded: r.wav_b64) else {
+        guard let rawWav = Data(base64Encoded: r.wav_b64) else {
             throw VoiceError.sttUnavailable("invalid base64 from tts sidecar")
         }
+        // Apply user volume by scaling the WAV's PCM samples. Avoids a
+        // round trip to the daemon for a `set_volume` endpoint and works
+        // with whatever audio path the robot exposes.
+        let wav = Self.scaleWavVolume(rawWav, factor: volume)
 
         seq &+= 1
         let filename = "rocky_tts_\(seq).wav"
@@ -102,5 +115,58 @@ public actor RobotTTS {
 
     public func cancel() async throws {
         try await media.stopSound()
+    }
+
+    /// Scale a 16-bit PCM WAV's samples by `factor` (clamped 0...1).
+    /// Walks the RIFF chunk list to locate `data` rather than assuming
+    /// a fixed header offset, so it tolerates extra `LIST`/`INFO`
+    /// chunks that some encoders produce. Bit depths other than 16 are
+    /// passed through unmodified.
+    private static func scaleWavVolume(_ wav: Data, factor: Double) -> Data {
+        let f = max(0.0, min(1.0, factor))
+        if f >= 0.999 { return wav }
+        guard wav.count >= 44 else { return wav }
+        // RIFF/WAVE sanity.
+        guard wav.subdata(in: 0..<4) == Data("RIFF".utf8),
+              wav.subdata(in: 8..<12) == Data("WAVE".utf8)
+        else { return wav }
+        // Locate `fmt ` and `data` chunks.
+        var bitsPerSample: UInt16 = 16
+        var dataStart: Int = -1
+        var dataLen: Int = 0
+        var offset = 12
+        while offset + 8 <= wav.count {
+            let id = wav.subdata(in: offset..<offset+4)
+            let size = wav.withUnsafeBytes { ptr -> UInt32 in
+                ptr.load(fromByteOffset: offset + 4, as: UInt32.self).littleEndian
+            }
+            let chunkStart = offset + 8
+            if id == Data("fmt ".utf8), chunkStart + 16 <= wav.count {
+                bitsPerSample = wav.withUnsafeBytes { ptr in
+                    ptr.load(fromByteOffset: chunkStart + 14, as: UInt16.self).littleEndian
+                }
+            } else if id == Data("data".utf8) {
+                dataStart = chunkStart
+                dataLen = min(Int(size), wav.count - chunkStart)
+                break
+            }
+            offset = chunkStart + Int(size)
+            if size % 2 != 0 { offset += 1 } // RIFF pad byte
+        }
+        guard dataStart >= 0, dataLen > 0, bitsPerSample == 16 else {
+            return wav
+        }
+        var scaled = wav
+        scaled.withUnsafeMutableBytes { rawPtr in
+            guard let base = rawPtr.baseAddress else { return }
+            let samples = base.advanced(by: dataStart)
+                .assumingMemoryBound(to: Int16.self)
+            let count = dataLen / 2
+            for i in 0..<count {
+                let v = Double(samples[i]) * f
+                samples[i] = Int16(clamping: Int(v.rounded()))
+            }
+        }
+        return scaled
     }
 }

@@ -30,15 +30,16 @@ public struct EnergyVAD: VAD {
         public var minSilenceFrames: Int
 
         /// Defaults tuned for a typical desk-mic / robot-array setup.
-        /// - rmsThreshold 0.015: a step up from the previous 0.008 — that
-        ///   was sensitive enough that fan noise + keyboard taps were
-        ///   triggering speechStart and producing junk transcripts.
+        /// - rmsThreshold 0.008: low enough that quiet / distant speech
+        ///   still crosses it. The previous 0.015 was too strict and made
+        ///   listen mode appear "stalled" (it never entered speech state
+        ///   for someone not speaking close to the mic).
         /// - minSilenceFrames 22 (~660 ms at 30 ms frames): the previous
         ///   420 ms was clipping natural mid-sentence pauses, so the user
         ///   would say "Rocky… [breath] what time is it" and the wake
         ///   token landed on its own with no follow-up payload.
         public init(
-            rmsThreshold: Float = 0.015,
+            rmsThreshold: Float = 0.008,
             minSpeechFrames: Int = 3,
             minSilenceFrames: Int = 22
         ) {

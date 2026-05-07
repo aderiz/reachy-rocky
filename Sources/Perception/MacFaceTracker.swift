@@ -48,6 +48,37 @@ public actor MacFaceTracker {
         /// controller from driving past mechanical limits.
         public var maxSpeedRadPerS: Double = 1.2  // ~69°/s
 
+        // Body-follow controller. Reachy Mini has a body_yaw joint that
+        // rotates the whole assembly under the head; a gentle, lagging
+        // body turn alongside the head reads as natural attention
+        // shifting. The body uses an independent damper so it eases in
+        // behind the head's faster motion rather than rigidly mirroring.
+
+        /// Fraction of head-yaw the body tries to match. 0.35 = body
+        /// rotates a third as far as the head — readable but not
+        /// rigid-coupled.
+        public var bodyFollowFactor: Double = 0.35
+        /// Slower than head's `damperOmega` so the body lags behind.
+        public var bodyDamperOmega: Double = 2.5
+        /// 0.7 rad/s ≈ 40°/s — slower still than the head's cap.
+        public var bodyMaxSpeedRadPerS: Double = 0.7
+
+        // Idle look-around — kicks in after `idleTimeoutS` without a
+        // face. Slow Lissajous-y pattern so the bot feels alive
+        // rather than going completely still.
+        public var idleYawAmplitude: Double = 0.30      // ~17°
+        public var idlePitchAmplitude: Double = 0.05    // ~3°
+        public var idleYawPeriodS: Double = 30.0
+        public var idlePitchPeriodS: Double = 18.0
+
+        // Antenna twitches — randomised small antenna joint moves
+        // every 6–12 s while the bot is awake. Adds personality
+        // without affecting the head/body trajectory.
+        public var antennaTwitchMinInterval: Double = 6.0
+        public var antennaTwitchMaxInterval: Double = 12.0
+        public var antennaTwitchAmplitude: Double = 0.18
+        public var antennaTwitchHoldS: Double = 0.4
+
         public init() {}
     }
 
@@ -138,6 +169,16 @@ public actor MacFaceTracker {
     // CriticalDamper state per-axis
     private var dampYawX: Double = 0;   private var dampYawV: Double = 0
     private var dampPitchX: Double = 0; private var dampPitchV: Double = 0
+    private var dampBodyYawX: Double = 0; private var dampBodyYawV: Double = 0
+
+    // Antenna twitch state. Holds the current commanded antenna joint
+    // angles (in radians) and schedules a fresh twitch at a randomised
+    // interval. Between twitches the antennas relax toward zero with
+    // an exponential decay so the return to neutral isn't a hard step.
+    private var antennaLeftCmd: Double = 0
+    private var antennaRightCmd: Double = 0
+    private var nextAntennaTwitchAt: Date?
+    private var antennaTwitchReleaseAt: Date?
 
     private var lastDetectionTs: Date?
     /// Suspends pushing to `streamer` while the daemon plays a primary
@@ -382,13 +423,37 @@ public actor MacFaceTracker {
             let yawClamped = SafetyLimits.clamp(dampYawX, to: SafetyLimits.headYawMax)
             let pitchClamped = SafetyLimits.clamp(dampPitchX, to: SafetyLimits.headPitchMax)
 
+            // Body-yaw follow. Independent damper, slower omega + lower
+            // speed cap, target = head's commanded yaw scaled by the
+            // follow factor. Naturally decays home with the head when
+            // the face leaves view (target shrinks toward 0).
+            let bodyTarget = dampYawX * config.bodyFollowFactor
+            let wB = config.bodyDamperOmega
+            let aB = -2.0 * wB * dampBodyYawV
+                   - (wB * wB) * (dampBodyYawX - bodyTarget)
+            dampBodyYawV += dt * aB
+            if config.bodyMaxSpeedRadPerS > 0 {
+                dampBodyYawV = max(-config.bodyMaxSpeedRadPerS,
+                                   min(config.bodyMaxSpeedRadPerS, dampBodyYawV))
+            }
+            dampBodyYawX += dt * dampBodyYawV
+            let bodyClamped = SafetyLimits.clamp(
+                dampBodyYawX, to: SafetyLimits.bodyYawMax
+            )
+
             targetsContinuation.yield((yawClamped, pitchClamped, decay))
 
             // Push to streamer unless caller suppressed (e.g., during a
-            // wake_up / goto_sleep recorded move).
+            // wake_up / goto_sleep recorded move). We always include
+            // antennas so the twitch pattern animates regardless of
+            // whether the head is actively tracking or idling.
+            let antennas = tickAntennas(dt: dt)
             if let streamer, !streamerSuppressed {
                 let pose = RPYPose(roll: 0, pitch: pitchClamped, yaw: yawClamped)
-                await streamer.update(.init(headPose: pose), source: .face)
+                await streamer.update(
+                    .init(headPose: pose, antennas: antennas, bodyYaw: bodyClamped),
+                    source: .face
+                )
             }
         }
     }
@@ -456,15 +521,59 @@ public actor MacFaceTracker {
         }
     }
 
+    /// Idle look-around: when no face has been seen for `idleTimeoutS`,
+    /// drive the EMA target along a slow Lissajous-style pattern
+    /// instead of decaying to neutral. The bot feels alive — head pans
+    /// gently and pitches up/down at a different period so the motion
+    /// never repeats exactly. The damper still smooths everything.
     private func decayIfIdle(dt: Double) async -> Bool {
         guard let last = lastDetectionTs else { return false }
         let elapsed = Date().timeIntervalSince(last)
         if elapsed < config.idleTimeoutS { return false }
-        // Exponential decay toward zero.
-        let factor = max(0.0, 1.0 - config.decayPerSecond * dt)
-        emaYaw *= factor
-        emaPitch *= factor
+        let t = Date().timeIntervalSince1970
+        emaYaw = config.idleYawAmplitude
+            * sin(2.0 * .pi * t / config.idleYawPeriodS)
+        emaPitch = config.idlePitchAmplitude
+            * sin(2.0 * .pi * t / config.idlePitchPeriodS)
         return true
+    }
+
+    /// Updates `antennaLeftCmd` / `antennaRightCmd` for the current
+    /// tick. Most of the time both are 0 (relaxed), with occasional
+    /// 0.4 s "twitches" of small random angles. Returns the antenna
+    /// pair to push to the daemon this tick.
+    private func tickAntennas(dt: Double) -> Antennas {
+        let now = Date()
+        if nextAntennaTwitchAt == nil {
+            nextAntennaTwitchAt = now.addingTimeInterval(
+                Double.random(in: config.antennaTwitchMinInterval
+                                 ... config.antennaTwitchMaxInterval)
+            )
+        }
+        if let due = nextAntennaTwitchAt, now >= due {
+            antennaLeftCmd = Double.random(
+                in: -config.antennaTwitchAmplitude ... config.antennaTwitchAmplitude
+            )
+            antennaRightCmd = Double.random(
+                in: -config.antennaTwitchAmplitude ... config.antennaTwitchAmplitude
+            )
+            antennaTwitchReleaseAt = now.addingTimeInterval(config.antennaTwitchHoldS)
+            nextAntennaTwitchAt = now.addingTimeInterval(
+                Double.random(in: config.antennaTwitchMinInterval
+                                 ... config.antennaTwitchMaxInterval)
+            )
+        }
+        if let release = antennaTwitchReleaseAt, now >= release {
+            // After hold, exponentially decay toward zero (not a hard step).
+            let k = max(0.0, 1.0 - 4.0 * dt)
+            antennaLeftCmd *= k
+            antennaRightCmd *= k
+            if abs(antennaLeftCmd) < 1e-3 && abs(antennaRightCmd) < 1e-3 {
+                antennaLeftCmd = 0; antennaRightCmd = 0
+                antennaTwitchReleaseAt = nil
+            }
+        }
+        return Antennas(rightRad: antennaRightCmd, leftRad: antennaLeftCmd)
     }
 }
 

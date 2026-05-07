@@ -48,6 +48,17 @@ public actor VoiceCoordinator {
     private var pendingSegment: [Float] = []
     private var segmentStart: Date?
     private var pumpTask: Task<Void, Never>?
+    /// In-flight STT task. The pump never awaits transcription directly —
+    /// it spawns this task and continues draining frames. If a second
+    /// speechEnd arrives while one is in-flight we drop the segment
+    /// rather than queueing (latest user audio matters more than backed-
+    /// up history, and queueing turns into a multi-second stall).
+    private var sttTask: Task<Void, Never>?
+    /// Fires `.windowClosed` when the wake-filter conversation window
+    /// hits its deadline without an extending follow-up. Cancelled and
+    /// rescheduled on every dispatch so the timer always reflects the
+    /// latest deadline.
+    private var windowCloseTask: Task<Void, Never>?
 
     public nonisolated let outputs: AsyncStream<Output>
     private let outputsContinuation: AsyncStream<Output>.Continuation
@@ -88,6 +99,10 @@ public actor VoiceCoordinator {
     public func stop() {
         pumpTask?.cancel()
         pumpTask = nil
+        sttTask?.cancel()
+        sttTask = nil
+        windowCloseTask?.cancel()
+        windowCloseTask = nil
         // Drop any half-captured segment so the next start() doesn't
         // resume with stale audio prepended to fresh frames.
         pendingSegment.removeAll(keepingCapacity: true)
@@ -148,6 +163,12 @@ public actor VoiceCoordinator {
         }
     }
 
+    /// Closes the current pending segment and hands it to a background
+    /// STT task. Returns immediately. The pump must NEVER await this
+    /// directly — STT typically takes 500–2000 ms, and during that
+    /// window audio keeps arriving in the ring buffer; if the pump is
+    /// blocked we miss the user's next utterance and process Rocky's
+    /// TTS echo instead.
     private func flushSegment(forceEnd: Bool) async {
         guard !pendingSegment.isEmpty else { return }
         let segment = pendingSegment
@@ -156,8 +177,31 @@ public actor VoiceCoordinator {
         segmentStart = nil
         if forceEnd { vad.reset() }
 
+        // Single in-flight STT. If one is already running, drop this
+        // segment. Latest user audio matters more than backed-up
+        // history; queueing turns N segments into N × 1.5 s of latency.
+        if sttTask != nil {
+            await logBus.publish(.sidecarLog(
+                sidecar: "voice", level: .info,
+                message: "stt busy — dropped \(segment.count) samples",
+                fields: [:]
+            ))
+            return
+        }
+
+        sttTask = Task { [weak self] in
+            await self?.runSTT(segment: segment, started: started)
+        }
+    }
+
+    private func runSTT(segment: [Float], started: Date) async {
+        defer { sttTask = nil }
+        if Task.isCancelled { return }
         do {
-            let transcript = try await stt.transcribe(samples: segment, at: config.sampleRate)
+            let transcript = try await stt.transcribe(
+                samples: segment, at: config.sampleRate
+            )
+            if Task.isCancelled { return }
             let totalMs = Date().timeIntervalSince(started) * 1000
             await logBus.publish(.sttFinal(text: transcript.text, totalMs: totalMs))
             await dispatchFinal(transcript.text)
@@ -173,6 +217,13 @@ public actor VoiceCoordinator {
         switch decision {
         case .dispatch(let transcript, let reason):
             outputsContinuation.yield(.finalText(text: transcript, dispatched: true, reason: reason))
+            // Surface the (re)opened window to AppServices so its
+            // `conversationOpenUntil` mirror tracks the wake filter and
+            // schedule the idle-close timer for the new deadline.
+            if case .open(let until) = await wake.state {
+                outputsContinuation.yield(.windowOpened(until: until))
+                scheduleIdleClose(at: until)
+            }
             switch reason {
             case .wakeMatch(let name):
                 await logBus.publish(.wakeMatch(name: name, transcript: transcript))
@@ -183,8 +234,32 @@ public actor VoiceCoordinator {
         case .ignore:
             outputsContinuation.yield(.finalText(text: text, dispatched: false, reason: nil))
         case .close(let reason):
+            windowCloseTask?.cancel()
+            windowCloseTask = nil
             outputsContinuation.yield(.windowClosed(reason: reason))
             await logBus.publish(.conversationWindow(transition: .closed, reason: reason))
         }
+    }
+
+    private func scheduleIdleClose(at deadline: Date) {
+        windowCloseTask?.cancel()
+        windowCloseTask = Task { [weak self] in
+            let secs = deadline.timeIntervalSinceNow
+            if secs > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(secs * 1_000_000_000))
+            }
+            if Task.isCancelled { return }
+            await self?.fireIdleClose()
+        }
+    }
+
+    private func fireIdleClose() async {
+        // Only act if the wake filter is still in the open state we
+        // armed for — a follow-up dispatch will have rescheduled its
+        // own task already.
+        guard case .open = await wake.state else { return }
+        await wake.closeWindow()
+        outputsContinuation.yield(.windowClosed(reason: "idle timeout"))
+        await logBus.publish(.conversationWindow(transition: .closed, reason: "idle"))
     }
 }

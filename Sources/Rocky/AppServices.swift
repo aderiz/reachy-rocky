@@ -135,6 +135,41 @@ final class AppServices {
         case unknown, online, offline(reason: String)
     }
 
+    /// Top-level bot behaviour mode. The four-state model the user
+    /// asked for: a single, glanceable status. `RockyState` below is
+    /// kept for finer-grained avatar cues (listening / thinking /
+    /// speaking inside `engaged`) but `botMode` is what the UI shows
+    /// as the primary indicator.
+    enum BotMode: Sendable, Equatable {
+        case sleeping       // motors disabled / gravity-comp
+        case idle           // awake, no person identified
+        case active         // awake, tracking a person
+        case engaged        // in active dialogue
+        case error(String)
+    }
+
+    /// Computed top-level mode. Order of precedence matches user
+    /// expectation: errors > sleeping > engaged > active > idle.
+    var botMode: BotMode {
+        if case .offline(let reason) = daemonReachability {
+            return .error("robot offline · \(reason)")
+        }
+        if let voiceError = voiceErrorMessage, !voiceError.isEmpty {
+            return .error(voiceError)
+        }
+        if isAsleep { return .sleeping }
+        // Engaged: brain is processing OR speaking OR window is open.
+        if let until = ttsBusyUntil, Date() < until { return .engaged }
+        if brainBusy { return .engaged }
+        if let until = conversationOpenUntil, Date() < until { return .engaged }
+        // Active: face has been seen recently.
+        if let last = lastFaceDetectionAt,
+           Date().timeIntervalSince(last) < 1.5 {
+            return .active
+        }
+        return .idle
+    }
+
     /// Coarse, glanceable state Rocky communicates from the menu bar and
     /// hero card. Computed from sub-states so the UI is honest.
     enum RockyState: Sendable, Equatable {
@@ -339,6 +374,7 @@ final class AppServices {
         // so identification runs against the user's known faces.
         await faceLibrary.loadFromDisk()
         await faceLibrary.setAcceptThreshold(settings.faceMatchThreshold)
+        await robotTTS.setVolume(settings.audioVolume)
         await macFaceTracker.setLibrary(faceLibrary)
         await refreshEnrolledFaces()
         await macFaceTracker.start()
@@ -354,7 +390,7 @@ final class AppServices {
         // therefore lastRobotState transitively). At >10 Hz the AppKit
         // run loop ends up too busy with SwiftUI diffs to deliver
         // keystrokes to TextFields, so typing breaks app-wide.
-        let macDetections = await macFaceTracker.detections
+        let macDetections = macFaceTracker.detections
         Task { [weak self] in
             var lastMirror = Date.distantPast
             var counter = 0
@@ -395,7 +431,7 @@ final class AppServices {
         // routes through handleIdentitySeen. The state machine's per-name
         // 30 s absence threshold ensures a face that's been around for a
         // while doesn't get re-greeted on every cycle.
-        let identitiesStream = await macFaceTracker.identitiesInView
+        let identitiesStream = macFaceTracker.identitiesInView
         Task { [weak self] in
             for await names in identitiesStream {
                 guard let self else { return }
@@ -431,7 +467,7 @@ final class AppServices {
                 try? await Task.sleep(nanoseconds: 200_000_000)
             }
         }
-        let macTargets = await macFaceTracker.targets
+        let macTargets = macFaceTracker.targets
         Task { [weak self] in
             var lastUpdate = Date.distantPast
             var counter = 0
@@ -586,6 +622,19 @@ final class AppServices {
             }
         }
 
+        // Pat-on-head wake monitor. Polls the active mic's RMS at
+        // 20 Hz; while the robot is asleep AND the mic is on, a sharp
+        // transient (RMS jumps from quiet baseline to a loud spike in
+        // one frame) is treated as a pat and wakes the robot. Requires
+        // listen mode to be on; if you sleep with the mic muted, only
+        // the Wake button works.
+        Task { [weak self] in await self?.runPatMonitor() }
+
+        // Listen mode is on by default — the user can still disable it
+        // via the toggle in HeroCard / menu bar, but they shouldn't
+        // have to click "Listen" to start a normal session.
+        if !micEnabled { await toggleMic() }
+
         // Tool registry + LM Studio probe. Auto-retries every 8 s while
         // status is offline so users don't have to click "Probe" after
         // launching LM Studio.
@@ -660,6 +709,12 @@ final class AppServices {
                     sttBackendName = "Apple Speech ← Mac mic"
                 }
                 await voice.start()
+                // Wake-word semantics: clicking Listen turns the mic
+                // hot but the wake filter stays asleep — the user has
+                // to say "Rocky" to start a conversation. Follow-ups
+                // within the 60 s window don't need the wake word; the
+                // window auto-closes on idle and the wake word becomes
+                // required again.
                 micEnabled = true
                 voiceErrorMessage = nil
                 // Periodic poll so the VU meter updates without
@@ -697,14 +752,15 @@ final class AppServices {
                 if dispatched { self.lastDispatched = text }
             }
             if dispatched {
-                // Echo gate: drop any "user transcript" that was captured
-                // while Rocky was speaking (or in the 0.8 s tail after).
-                // Without this the robot speaker bleeds into the mic, the
-                // STT transcribes Rocky's own voice as user input, and
-                // every reply triggers another reply — feedback loop.
+                // Echo gate: drop transcripts captured while Rocky is
+                // speaking (or in a small tail after). Without this the
+                // robot speaker bleeds into the mic, STT transcribes
+                // Rocky's own voice, and every reply triggers another —
+                // feedback loop. The tail (0.3 s) is small enough that
+                // an immediate user follow-up gets through.
                 let now = Date()
                 let inEcho = ttsBusyUntil.map {
-                    now < $0.addingTimeInterval(0.8)
+                    now < $0.addingTimeInterval(0.3)
                 } ?? false
                 if inEcho {
                     await logBus.publish(.sidecarLog(
@@ -718,8 +774,18 @@ final class AppServices {
             }
         case .windowOpened(let until):
             await MainActor.run { self.conversationOpenUntil = until }
-        case .windowClosed:
+        case .windowClosed(let reason):
             await MainActor.run { self.conversationOpenUntil = nil }
+            // "go to sleep" / "good night" / "stop listening" should
+            // actually put the robot to sleep, not just close the
+            // wake window. WakeFilter's stop phrases yield reason
+            // "stop phrase"; the timer fires "idle timeout"; explicit
+            // closes use other reasons. Only act on stop-phrase.
+            let l = reason.lowercased()
+            if l.contains("stop phrase") || l.contains("good night")
+                 || l.contains("go to sleep") {
+                await sleepRobot()
+            }
         }
     }
 
@@ -745,81 +811,131 @@ final class AppServices {
         await MainActor.run {
             self.brainTurns.append(.init(role: "user", content: trimmed))
             self.brainBusy = true
+            self.brainErrorMessage = nil
         }
-        let started = Date()
-        var assistantBuffer = ""
-        var firstChunkMs: Double?
-        var assistantTurnId: UUID?
 
+        // Hard wall on the whole brain turn. If LM Studio stalls (or a
+        // tool call inside the response wedges — `say` waiting on a
+        // hung TTS sidecar is the classic case), we don't want the
+        // user staring at "Routed to brain" forever. Race the event
+        // loop against a timeout; whichever wins, we always reset
+        // `brainBusy` and surface a message.
+        let timeoutS: TimeInterval = 60
         let stream = await cognition.send(userText: trimmed)
-        do {
-            for try await output in stream {
-                switch output {
-                case .assistantDelta(let delta):
-                    if firstChunkMs == nil {
-                        firstChunkMs = Date().timeIntervalSince(started) * 1000
-                    }
-                    assistantBuffer += delta
-                    let snapshot = assistantBuffer
-                    let f = firstChunkMs
-                    await MainActor.run {
-                        if let id = assistantTurnId,
-                           let idx = self.brainTurns.firstIndex(where: { $0.id == id }) {
-                            self.brainTurns[idx].content = snapshot
-                        } else {
-                            var turn = BrainTurn(role: "assistant", content: snapshot)
-                            turn.firstChunkMs = f
-                            self.brainTurns.append(turn)
-                            assistantTurnId = turn.id
-                        }
-                    }
-                case .assistantFinal(_, let totalMs, let firstMs):
-                    let id = assistantTurnId
-                    let buf = assistantBuffer
-                    await MainActor.run {
-                        if let id, let idx = self.brainTurns.firstIndex(where: { $0.id == id }) {
-                            self.brainTurns[idx].content = buf
-                            self.brainTurns[idx].totalMs = totalMs
-                            self.brainTurns[idx].firstChunkMs = firstMs
-                        } else if !buf.isEmpty {
-                            var t = BrainTurn(role: "assistant", content: buf)
-                            t.totalMs = totalMs
-                            t.firstChunkMs = firstMs
-                            self.brainTurns.append(t)
-                        }
-                    }
-                case .toolCallDispatched(let name, let argumentsJSON, _):
-                    let detail = argumentsJSON
-                    await MainActor.run {
-                        self.brainTurns.append(.init(
-                            role: "tool", content: "→ \(name)", detail: detail
-                        ))
-                    }
-                case .toolCallResult(let result):
-                    let summary = result.ok ? "ok" : "error"
-                    let detail = result.resultJSON
-                    let name = result.name
-                    let ms = result.latencyMs
-                    await MainActor.run {
-                        self.brainTurns.append(.init(
-                            role: "tool",
-                            content: "← \(name) (\(summary), \(Int(ms))ms)",
-                            detail: detail
-                        ))
-                    }
-                case .error(let msg):
-                    await MainActor.run {
-                        self.brainErrorMessage = msg
-                    }
-                }
-            }
-        } catch {
+        let timedOut = await drainBrainStream(stream, timeoutS: timeoutS)
+        if timedOut {
             await MainActor.run {
-                self.brainErrorMessage = "\(error)"
-                self.llmStatus = .offline(reason: "\(error)")
+                self.brainErrorMessage = "Brain didn't respond after \(Int(timeoutS))s — try again."
+                self.brainTurns.append(.init(
+                    role: "assistant",
+                    content: "(brain timeout — reset and try again)"
+                ))
             }
         }
         await MainActor.run { self.brainBusy = false }
+    }
+
+    /// Drains a CognitionEngine output stream into the observable
+    /// `brainTurns`. Returns `true` if the timeout fired before the
+    /// stream completed, `false` on normal completion (or non-timeout
+    /// error, which is captured into `brainErrorMessage`).
+    private func drainBrainStream(
+        _ stream: AsyncThrowingStream<CognitionEngine.Output, Error>,
+        timeoutS: TimeInterval
+    ) async -> Bool {
+        return await withTaskGroup(of: Bool.self) { group in
+            // Drain task — owns its own local state so nothing is captured
+            // mutably across the Task boundary.
+            group.addTask { [weak self] in
+                var assistantBuffer = ""
+                var firstChunkMs: Double?
+                var assistantTurnId: UUID?
+                let started = Date()
+                do {
+                    for try await output in stream {
+                        if Task.isCancelled { break }
+                        guard let self else { break }
+                        switch output {
+                        case .assistantDelta(let delta):
+                            if firstChunkMs == nil {
+                                firstChunkMs = Date().timeIntervalSince(started) * 1000
+                            }
+                            assistantBuffer += delta
+                            let snapshot = assistantBuffer
+                            let f = firstChunkMs
+                            let id = assistantTurnId
+                            let newId: UUID = await MainActor.run { [weak self] in
+                                guard let self else { return UUID() }
+                                if let id, let idx = self.brainTurns.firstIndex(where: { $0.id == id }) {
+                                    self.brainTurns[idx].content = snapshot
+                                    return id
+                                }
+                                var turn = BrainTurn(role: "assistant", content: snapshot)
+                                turn.firstChunkMs = f
+                                self.brainTurns.append(turn)
+                                return turn.id
+                            }
+                            assistantTurnId = newId
+                        case .assistantFinal(_, let totalMs, let firstMs):
+                            let id = assistantTurnId
+                            let buf = assistantBuffer
+                            await MainActor.run { [weak self] in
+                                guard let self else { return }
+                                if let id, let idx = self.brainTurns.firstIndex(where: { $0.id == id }) {
+                                    self.brainTurns[idx].content = buf
+                                    self.brainTurns[idx].totalMs = totalMs
+                                    self.brainTurns[idx].firstChunkMs = firstMs
+                                } else if !buf.isEmpty {
+                                    var t = BrainTurn(role: "assistant", content: buf)
+                                    t.totalMs = totalMs
+                                    t.firstChunkMs = firstMs
+                                    self.brainTurns.append(t)
+                                }
+                            }
+                        case .toolCallDispatched(let name, let argumentsJSON, _):
+                            let detail = argumentsJSON
+                            await MainActor.run { [weak self] in
+                                self?.brainTurns.append(.init(
+                                    role: "tool", content: "→ \(name)", detail: detail
+                                ))
+                            }
+                        case .toolCallResult(let result):
+                            let summary = result.ok ? "ok" : "error"
+                            let detail = result.resultJSON
+                            let name = result.name
+                            let ms = result.latencyMs
+                            await MainActor.run { [weak self] in
+                                self?.brainTurns.append(.init(
+                                    role: "tool",
+                                    content: "← \(name) (\(summary), \(Int(ms))ms)",
+                                    detail: detail
+                                ))
+                            }
+                        case .error(let msg):
+                            await MainActor.run { [weak self] in
+                                self?.brainErrorMessage = msg
+                            }
+                        }
+                    }
+                } catch {
+                    await MainActor.run { [weak self] in
+                        self?.brainErrorMessage = "\(error)"
+                        self?.llmStatus = .offline(reason: "\(error)")
+                    }
+                }
+                return false  // completed normally / errored — NOT timeout
+            }
+            // Timer task — fires `true` after the timeout, racing the
+            // drain. Whichever finishes first wins; the other is
+            // cancelled by `group.cancelAll`.
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(timeoutS * 1_000_000_000))
+                return true
+            }
+            let winner = await group.next() ?? false
+            group.cancelAll()
+            return winner
+        }
     }
 
     func resetBrain() async {
@@ -954,6 +1070,61 @@ final class AppServices {
     /// Tracks the last successful auto-wake so we don't spam the daemon.
     private var lastAutoWakeAt: Date?
 
+    /// Watches mic RMS for a sharp transient while sleeping, and wakes
+    /// the robot when one fires. The detector is "two spikes within
+    /// 0.8 s" — single loud sounds (door, dropped item) get filtered
+    /// out, but a deliberate tap-tap on the head shell wakes Rocky.
+    /// Stays running for the lifetime of the app; cheap when not
+    /// sleeping (just polls a Float).
+    private func runPatMonitor() async {
+        let pollInterval: UInt64 = 50_000_000  // 50 ms (20 Hz)
+        let spikeThreshold: Float = 0.10
+        let baseline: Float = 0.025
+        let pairWindowS: TimeInterval = 0.8
+        var prev: Float = 0
+        var firstSpikeAt: Date?
+
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: pollInterval)
+            // Cheap early-out: only act while sleeping with mic on.
+            let (asleep, micOn, useRobot) = await MainActor.run {
+                (self.isAsleep,
+                 self.micEnabled,
+                 self.settings.micSource == "robot")
+            }
+            guard asleep, micOn else {
+                prev = 0; firstSpikeAt = nil
+                continue
+            }
+            let rms: Float = useRobot
+                ? await self.robotMic.lastRMS
+                : self.mic.lastRMS
+            // Sharp rise from quiet baseline counts as a spike.
+            let isSpike = (rms > spikeThreshold) && (prev < baseline)
+            prev = rms
+            if isSpike {
+                let now = Date()
+                if let first = firstSpikeAt,
+                   now.timeIntervalSince(first) < pairWindowS {
+                    // Second spike inside the window — pat confirmed.
+                    await self.logBus.publish(.sidecarLog(
+                        sidecar: "pat-monitor", level: .info,
+                        message: "pat detected — waking",
+                        fields: [:]
+                    ))
+                    firstSpikeAt = nil
+                    await self.wakeRobot()
+                } else {
+                    firstSpikeAt = now
+                }
+            } else if let first = firstSpikeAt,
+                      Date().timeIntervalSince(first) > pairWindowS {
+                // Single spike with no follow-up; reset.
+                firstSpikeAt = nil
+            }
+        }
+    }
+
     func wakeRobot() async {
         // The wake_up recorded move runs ~2-3s; give the avatar a small
         // settle margin afterwards.
@@ -1042,6 +1213,7 @@ final class AppServices {
         await llm.setConfig(settings.lmStudioConfig())
         await cognition.setConfig(.init(systemPrompt: settings.persona))
         await faceLibrary.setAcceptThreshold(settings.faceMatchThreshold)
+        await robotTTS.setVolume(settings.audioVolume)
         await probeLMStudio()
     }
 

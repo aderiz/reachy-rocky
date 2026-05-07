@@ -18,6 +18,13 @@ final class SettingsStore {
     var ttsBackend: String { didSet { save() } }     // "say" | "chatterbox"
     var micSource: String  { didSet { save() } }     // "mac" | "robot"
 
+    /// Persona schema version. Bumped whenever `defaultPersona` is
+    /// rewritten in code so that older installs get the new default
+    /// once instead of being permanently pinned to whatever they had
+    /// when they first launched. Subsequent app launches honour any
+    /// user customisation beyond the migration.
+    static let currentPersonaVersion: Int = 2
+
     /// Apple Vision feature-print accept threshold for face recognition.
     /// Smaller = stricter; range typically 0.4 (very tight) – 1.5 (very
     /// loose). Apple's image feature-print distances cluster around 0.3
@@ -27,6 +34,10 @@ final class SettingsStore {
     /// once they've enrolled real faces and seen the live distances.
     var faceMatchThreshold: Double { didSet { save() } }
 
+    /// Robot-speaker output volume, 0.0 ... 1.0. Applied by scaling the
+    /// PCM samples of the synthesized WAV before upload.
+    var audioVolume: Double { didSet { save() } }
+
     init() {
         let d = UserDefaults.standard
         self.robotHost = d.string(forKey: Keys.robotHost) ?? "reachy-mini.local"
@@ -34,10 +45,24 @@ final class SettingsStore {
         self.lmStudioURL = d.string(forKey: Keys.lmURL) ?? "http://localhost:1234/v1"
         self.lmStudioModel = d.string(forKey: Keys.lmModel) ?? "gemma-4-e4b-it-mlx"
         self.lmStudioApiKey = d.string(forKey: Keys.lmApiKey) ?? ""
-        self.persona = d.string(forKey: Keys.persona) ?? Self.defaultPersona
+        // Persona migration: if the stored schema version is older than
+        // current, force-replace persona with the in-code default. This
+        // is what keeps Rocky's voice consistent across app updates —
+        // previously the LLM kept reverting to whichever persona was
+        // saved on first install, regardless of what we now ship as
+        // default.
+        let storedPersonaVersion = d.integer(forKey: Keys.personaVersion)
+        if storedPersonaVersion < Self.currentPersonaVersion {
+            self.persona = Self.defaultPersona
+            d.set(Self.defaultPersona, forKey: Keys.persona)
+            d.set(Self.currentPersonaVersion, forKey: Keys.personaVersion)
+        } else {
+            self.persona = d.string(forKey: Keys.persona) ?? Self.defaultPersona
+        }
         self.ttsBackend = d.string(forKey: Keys.ttsBackend) ?? Self.detectDefaultTTSBackend()
         self.micSource = d.string(forKey: Keys.micSource) ?? Self.detectDefaultMicSource()
         self.faceMatchThreshold = (d.object(forKey: Keys.faceMatchThreshold) as? Double) ?? 1.0
+        self.audioVolume = (d.object(forKey: Keys.audioVolume) as? Double) ?? 0.85
     }
 
     /// Pick robot if the robot-mic sidecar venv has been built; otherwise mac.
@@ -76,6 +101,7 @@ final class SettingsStore {
         d.set(ttsBackend, forKey: Keys.ttsBackend)
         d.set(micSource, forKey: Keys.micSource)
         d.set(faceMatchThreshold, forKey: Keys.faceMatchThreshold)
+        d.set(audioVolume, forKey: Keys.audioVolume)
     }
 
     func robotEndpoint() -> RobotEndpoint {
@@ -171,5 +197,7 @@ final class SettingsStore {
         static let ttsBackend = "rocky.tts.backend"
         static let micSource = "rocky.mic.source"
         static let faceMatchThreshold = "rocky.face.match.threshold"
+        static let audioVolume = "rocky.audio.volume"
+        static let personaVersion = "rocky.persona.version"
     }
 }

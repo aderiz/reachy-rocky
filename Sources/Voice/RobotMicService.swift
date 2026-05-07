@@ -24,7 +24,16 @@ public actor RobotMicService {
     }
 
     public func start() async throws {
-        try await sidecar.start()
+        // The Python sidecar process is started ONCE; subsequent
+        // listen-toggle cycles just flip the recording state via RPC
+        // and don't re-spawn the process. `SidecarRuntime.start()`
+        // throws `alreadyRunning` if the process is already in
+        // `.ready` / `.starting` — that's expected here, not an error.
+        do {
+            try await sidecar.start()
+        } catch SidecarError.alreadyRunning {
+            // sidecar already up — continue to start_recording.
+        }
 
         struct Empty: Encodable, Sendable {}
         struct R: Decodable, Sendable { let recording: Bool }

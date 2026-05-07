@@ -46,16 +46,15 @@ struct RockyApp: App {
 private struct MenuBarLabel: View {
     @Environment(AppServices.self) private var services
     var body: some View {
-        // SF Symbol that subtly conveys the current state in the menu bar.
-        let symbol: String = switch services.rockyState {
-        case .sleeping:   "moon.fill"
-        case .waking:     "sun.max"
-        case .idle:       "circle.fill"
-        case .tracking:   "viewfinder"
-        case .listening:  "ear"
-        case .thinking:   "circle.dotted"
-        case .speaking:   "waveform"
-        case .error:      "exclamationmark.circle.fill"
+        // Drive the menu bar from the four-state BotMode so the icon
+        // matches the prominent dashboard pill rather than diverging
+        // through finer sub-states.
+        let symbol: String = switch services.botMode {
+        case .sleeping: "moon.fill"
+        case .idle:     "circle.dotted"
+        case .active:   "viewfinder"
+        case .engaged:  "waveform"
+        case .error:    "exclamationmark.triangle.fill"
         }
         Image(systemName: symbol)
     }

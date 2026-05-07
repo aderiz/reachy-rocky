@@ -27,9 +27,12 @@ struct HeroCard: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Rocky")
                         .font(.system(size: 30, weight: .semibold, design: .rounded))
-                    Text(label(for: state))
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(color(for: state))
+                    HStack(spacing: 8) {
+                        BotModeBadge(mode: services.botMode)
+                        Text(label(for: state))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                     HStack(spacing: 6) {
                         if let llm = lastLLMTotalMs {
                             StatusPill(text: "LLM \(Int(llm))ms", tint: .accentColor)
@@ -176,4 +179,36 @@ struct HeroCard: View {
     }
 
     private var lastTTSFirstChunkMs: Double? { nil }
+}
+
+/// Big pill that shows the four-state top-level bot mode prominently
+/// next to the title. Sub-states (listening/thinking/speaking) appear
+/// as the smaller secondary label alongside.
+private struct BotModeBadge: View {
+    let mode: AppServices.BotMode
+
+    var body: some View {
+        let (text, color, symbol) = labelTuple()
+        return HStack(spacing: 6) {
+            Image(systemName: symbol)
+                .font(.caption.weight(.semibold))
+            Text(text)
+                .font(.subheadline.weight(.semibold))
+        }
+        .foregroundStyle(color)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 4)
+        .background(Capsule().fill(color.opacity(0.15)))
+        .overlay(Capsule().stroke(color.opacity(0.45), lineWidth: 1))
+    }
+
+    private func labelTuple() -> (String, Color, String) {
+        switch mode {
+        case .sleeping: return ("Sleeping", .gray,        "moon.fill")
+        case .idle:     return ("Idle",     .secondary,   "circle.dotted")
+        case .active:   return ("Watching", .accentColor, "viewfinder")
+        case .engaged:  return ("Engaged",  .green,       "waveform")
+        case .error:    return ("Error",    .red,         "exclamationmark.triangle.fill")
+        }
+    }
 }

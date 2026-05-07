@@ -107,8 +107,17 @@ struct SettingsView: View {
                     .background(textFieldBackground)
             } else {
                 Picker("", selection: $lmModelDraft) {
-                    if !models.contains(lmModelDraft) && !lmModelDraft.isEmpty {
-                        Text("\(lmModelDraft) (not loaded)").tag(lmModelDraft)
+                    // Always include a tag matching the current draft so
+                    // `selection` is never "" / unmatched (which makes
+                    // SwiftUI log "selection is invalid…"). Covers two
+                    // cases: the draft is briefly empty before
+                    // `syncFromStore` runs, and the saved model isn't
+                    // currently loaded in LM Studio.
+                    if !models.contains(lmModelDraft) {
+                        Text(lmModelDraft.isEmpty
+                             ? "—"
+                             : "\(lmModelDraft) (not loaded)")
+                            .tag(lmModelDraft)
                     }
                     ForEach(models, id: \.self) { m in
                         Text(m).tag(m)
@@ -141,7 +150,7 @@ struct SettingsView: View {
         Card {
             CardHeader("Voice (TTS)", icon: "speaker.wave.2")
         } content: {
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 14) {
                 Picker("Engine", selection: $ttsBackendDraft) {
                     Text("System voice (say)").tag("say")
                     Text("Chatterbox FP16 (cloned)").tag("chatterbox")
@@ -150,6 +159,8 @@ struct SettingsView: View {
                 Text("Chatterbox uses your cloned voice from ~/Library/Application Support/Rocky/voice/. Engine change takes effect on next launch.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                BotVolumeSlider()
             }
         }
     }
@@ -509,6 +520,51 @@ private struct EnrollFaceForm: View {
         CGImageDestinationAddImage(dest, cgImage, opts as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { return nil }
         return buffer as Data
+    }
+}
+
+/// Robot speaker output volume. Drags apply live by scaling the next
+/// synthesized WAV's PCM samples — no daemon round-trip needed. The
+/// underlying setting persists immediately.
+private struct BotVolumeSlider: View {
+    @Environment(AppServices.self) private var services
+
+    var body: some View {
+        let value = services.settings.audioVolume
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline) {
+                SectionLabel(text: "Robot speaker volume")
+                Spacer()
+                Text("\(Int(value * 100))%")
+                    .font(.caption.monospacedDigit().weight(.medium))
+                    .foregroundStyle(.primary)
+            }
+            Slider(
+                value: Binding(
+                    get: { services.settings.audioVolume },
+                    set: { newValue in
+                        services.settings.audioVolume = newValue
+                        Task { await services.robotTTS.setVolume(newValue) }
+                    }
+                ),
+                in: 0.0...1.0,
+                step: 0.05
+            ) {
+                Text("Volume")
+            } minimumValueLabel: {
+                Image(systemName: "speaker.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } maximumValueLabel: {
+                Image(systemName: "speaker.wave.3.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Text("Applied to every TTS clip before it's uploaded to the robot — works for both Chatterbox cloned voice and the system fallback.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 4)
     }
 }
 

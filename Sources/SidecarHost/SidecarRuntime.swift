@@ -198,7 +198,7 @@ public actor SidecarRuntime: Sidecar {
             self.readyContinuation = cont
             Task {
                 try? await Task.sleep(nanoseconds: UInt64(manifest.readyTimeoutS * 1_000_000_000))
-                await self.failReadyIfPending()
+                self.failReadyIfPending()
             }
         }
     }
