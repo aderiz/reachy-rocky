@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import RobotLink
 import RockyKit
 import SidecarHost
@@ -7,6 +8,20 @@ import Telemetry
 @main
 struct RockyApp: App {
     @State private var services = AppServices()
+
+    init() {
+        // Without this, a SwiftPM executable launched directly (e.g. ⌘R
+        // in Xcode on Package.swift, or `swift run`) defaults to the
+        // `.prohibited` activation policy because there's no Info.plist
+        // bundle to define one. In that mode AppKit doesn't make the
+        // SwiftUI window key, and TextFields silently refuse keyboard
+        // input. `build/Rocky.app` (from scripts/build-app.sh) ships an
+        // Info.plist so this isn't strictly required for the bundled
+        // app, but doing it unconditionally lets either launch path work
+        // identically — useful while iterating in Xcode's debugger.
+        NSApplication.shared.setActivationPolicy(.regular)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+    }
 
     var body: some Scene {
         WindowGroup("Rocky") {

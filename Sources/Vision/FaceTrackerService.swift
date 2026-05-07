@@ -17,14 +17,23 @@ public actor FaceTrackerService {
         public let promptId: String
         public let frameWidth: Int
         public let frameHeight: Int
+        /// Recognised name from the on-Mac face library, when the live
+        /// face matches an enrolled person within threshold. Nil for
+        /// unknown faces.
+        public let identity: String?
+        public let identityDistance: Double?
 
         public init(bbox: CGRect, confidence: Double, promptId: String,
-                    frameWidth: Int, frameHeight: Int) {
+                    frameWidth: Int, frameHeight: Int,
+                    identity: String? = nil,
+                    identityDistance: Double? = nil) {
             self.bbox = bbox
             self.confidence = confidence
             self.promptId = promptId
             self.frameWidth = frameWidth
             self.frameHeight = frameHeight
+            self.identity = identity
+            self.identityDistance = identityDistance
         }
     }
 

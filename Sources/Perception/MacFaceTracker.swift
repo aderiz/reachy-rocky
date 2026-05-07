@@ -56,6 +56,13 @@ public actor MacFaceTracker {
         public let confidence: Double
         public let frameWidth: Int
         public let frameHeight: Int
+        /// Name of the recognised person, if the face matches an enrolled
+        /// entry in `FaceLibrary` within the accept threshold. Nil while
+        /// the face is unknown or while identification hasn't run yet.
+        public let identity: String?
+        /// Distance to the matched sample (smaller = better). Surfaced for
+        /// debugging / display only.
+        public let identityDistance: Double?
     }
 
     /// Live stream of detections (for the Vision card overlay).
@@ -69,11 +76,27 @@ public actor MacFaceTracker {
     private let logBus: LogBus
     private var config: Config
     private var streamer: TargetStreamer?
+    private var library: FaceLibrary?
 
     // EMA state (world-frame)
     private var emaYaw: Double = 0
     private var emaPitch: Double = 0
     private var emaInitialized: Bool = false
+
+    // Identification state — last successful match, with TTL so a stale
+    // identity doesn't haunt the Detection forever.
+    private var lastIdentityName: String?
+    private var lastIdentityDistance: Double?
+    private var lastIdentityTs: Date?
+    private let identityTTL: TimeInterval = 3.0
+    private var frameCounter: Int = 0
+    /// Run identification every Nth ingested frame. 6 → ~5 Hz at 30 FPS,
+    /// which is plenty for "who is this" while the per-frame detection
+    /// path stays fast.
+    private let identifyEvery: Int = 6
+    /// Set to true while an async identify task is running so we don't
+    /// fan out parallel identifications.
+    private var identifying: Bool = false
 
     // CriticalDamper state per-axis
     private var dampYawX: Double = 0;   private var dampYawV: Double = 0
@@ -103,6 +126,10 @@ public actor MacFaceTracker {
 
     public func setStreamer(_ s: TargetStreamer) {
         self.streamer = s
+    }
+
+    public func setLibrary(_ lib: FaceLibrary) {
+        self.library = lib
     }
 
     /// Pause/unpause pushes to the streamer (used during recorded moves
@@ -176,18 +203,49 @@ public actor MacFaceTracker {
             width: bb.size.width * imgW,
             height: bb.size.height * imgH
         )
-        let det = Detection(
-            bbox: pixelRect,
-            confidence: Double(largest.confidence),
-            frameWidth: cgImage.width,
-            frameHeight: cgImage.height
-        )
-
         // Gate on bbox size.
         let bboxNorm = max(pixelRect.width / imgW, pixelRect.height / imgH)
         guard bboxNorm >= config.minBboxNorm else { return }
 
+        // Decay stale identity past TTL. We do this here rather than on a
+        // timer so it stays cheap and synchronous.
+        if let ts = lastIdentityTs,
+           Date().timeIntervalSince(ts) > identityTTL {
+            lastIdentityName = nil
+            lastIdentityDistance = nil
+        }
+
+        let det = Detection(
+            bbox: pixelRect,
+            confidence: Double(largest.confidence),
+            frameWidth: cgImage.width,
+            frameHeight: cgImage.height,
+            identity: lastIdentityName,
+            identityDistance: lastIdentityDistance
+        )
         detectionsContinuation.yield(det)
+
+        // Throttled, fire-and-forget identification path. Crops the face
+        // out of the current cgImage with a small margin and asks the
+        // library for a match; the result populates `lastIdentity*` for
+        // the NEXT detection emission.
+        frameCounter &+= 1
+        if !identifying,
+           let lib = library,
+           frameCounter % identifyEvery == 0 {
+            identifying = true
+            let cropRect = pixelRect.insetBy(
+                dx: -pixelRect.width * 0.25,
+                dy: -pixelRect.height * 0.25
+            ).intersection(CGRect(x: 0, y: 0, width: imgW, height: imgH))
+            if let cropped = cgImage.cropping(to: cropRect) {
+                Task { [weak self] in
+                    await self?.runIdentification(crop: cropped, library: lib)
+                }
+            } else {
+                identifying = false
+            }
+        }
 
         // Convert centroid → camera-frame angle → world-frame target.
         // Use the DAMPER's current commanded position as the world-frame
@@ -267,6 +325,24 @@ public actor MacFaceTracker {
                 await streamer.update(.init(headPose: pose), source: .face)
             }
         }
+    }
+
+    /// Generates a feature print from the cropped face and asks the
+    /// library for the closest enrolled match. Updates `lastIdentity*`
+    /// fields under actor isolation so the next emitted Detection picks
+    /// up the result.
+    private func runIdentification(crop: CGImage, library: FaceLibrary) async {
+        defer { identifying = false }
+        guard let observation = await library.generatePrint(cgImage: crop)
+        else { return }
+        if let match = await library.identify(observation) {
+            lastIdentityName = match.person.name
+            lastIdentityDistance = match.distance
+            lastIdentityTs = Date()
+        }
+        // If no match, leave the previous identity alone and let the TTL
+        // decay it on the next ingest. That avoids "name flicker" when a
+        // single frame fails to match.
     }
 
     private func decayIfIdle(dt: Double) async -> Bool {

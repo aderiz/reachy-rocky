@@ -19,7 +19,7 @@ struct VisionCard: View {
                     )
                 }
                 StatusPill(
-                    text: services.lastFaceDetection != nil ? "tracking" : "idle",
+                    text: trackingPillText,
                     tint: services.lastFaceDetection != nil ? .green : .secondary,
                     systemImage: services.lastFaceDetection != nil ? "viewfinder" : "circle"
                 )
@@ -76,6 +76,12 @@ struct VisionCard: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+
+    private var trackingPillText: String {
+        guard let det = services.lastFaceDetection else { return "idle" }
+        if let identity = det.identity { return "tracking · \(identity)" }
+        return "tracking"
     }
 
     @ViewBuilder
@@ -135,13 +141,20 @@ private struct FacePreview: View {
                             width: det.bbox.width * scaleX,
                             height: det.bbox.height * scaleY
                         )
+                        let strokeColor: Color = det.identity != nil ? .accentColor : .green
                         ctx.stroke(Path(roundedRect: r, cornerRadius: 8),
-                                   with: .color(.green),
+                                   with: .color(strokeColor),
                                    style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                        let conf = Text(String(format: "%.0f%%", det.confidence * 100))
+                        let labelString: String
+                        if let identity = det.identity {
+                            labelString = identity
+                        } else {
+                            labelString = String(format: "%.0f%%", det.confidence * 100)
+                        }
+                        let label = Text(labelString)
                             .font(.caption.monospacedDigit().bold())
                             .foregroundColor(.white)
-                        ctx.draw(conf,
+                        ctx.draw(label,
                                  at: CGPoint(x: r.minX + 6, y: r.minY + 10),
                                  anchor: .leading)
                     }

@@ -177,23 +177,14 @@ private struct Face: View {
                     .position(x: w * 0.5, y: h * 0.85)
             }
         }
-        .onAppear {
-            // Blink loop
-            Task { @MainActor in
-                while true {
-                    try? await Task.sleep(nanoseconds: UInt64.random(in: 2_000_000_000...5_000_000_000))
-                    withAnimation(.easeInOut(duration: 0.08)) { blink = true }
-                    try? await Task.sleep(nanoseconds: 90_000_000)
-                    withAnimation(.easeInOut(duration: 0.08)) { blink = false }
-                }
-            }
-            withAnimation(.linear(duration: 1.4).repeatForever(autoreverses: false)) {
-                thinkingPhase = .pi * 2
-            }
-            withAnimation(.easeInOut(duration: 0.32).repeatForever(autoreverses: true)) {
-                speakingPhase = 1
-            }
-        }
+        // Removed the previous .onAppear that kicked off two repeatForever
+        // animations and an unbounded blink Task. Those animations drove
+        // a 60+ Hz view-body re-evaluation app-wide for as long as the
+        // app was running, which thrashed the SwiftUI/AppKit run loop
+        // and stole keystrokes from every TextField in the window. The
+        // avatar still moves (head/antennas track live pose via the
+        // .animation(...value:) modifiers above) — it just no longer
+        // runs continuous decorative animations.
     }
 
     @ViewBuilder

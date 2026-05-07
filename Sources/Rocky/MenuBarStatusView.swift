@@ -1,11 +1,12 @@
 import SwiftUI
 
-/// Menu bar surface. Custom icon + status mirror Rocky's `RockyState`;
-/// the popup reveals quick actions: mute mic / mute voice / pause
-/// face-tracking / wake / sleep / open dashboard / quit.
+/// Menu bar surface. Every label, icon, and toggle binds to the same
+/// `AppServices` observable that drives the main window — there is no
+/// local `@State` for app behaviour here, so the menu and the dashboard
+/// stay in lockstep regardless of which one the user interacted with
+/// last.
 struct MenuBarStatusView: View {
     @Environment(AppServices.self) private var services
-    @State private var faceTrackingPaused: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -32,22 +33,18 @@ struct MenuBarStatusView: View {
                     systemImage: services.ttsMuted ? "speaker.slash" : "speaker.wave.2") {
                     Task { await services.toggleTTSMute() }
                 }
-                row(label: faceTrackingPaused ? "Resume tracking" : "Pause tracking",
-                    systemImage: faceTrackingPaused ? "play.circle" : "pause.circle") {
-                    Task {
-                        faceTrackingPaused.toggle()
-                        await services.setFaceTrackingEnabled(!faceTrackingPaused)
-                    }
+                row(label: services.faceTrackingEnabled ? "Pause tracking" : "Resume tracking",
+                    systemImage: services.faceTrackingEnabled ? "pause.circle" : "play.circle") {
+                    let next = !services.faceTrackingEnabled
+                    Task { await services.setFaceTrackingEnabled(next) }
                 }
 
                 Divider().padding(.vertical, 6)
 
-                row(label: "Wake robot", systemImage: "sun.max") {
-                    Task { await services.wakeRobot() }
-                }
-                row(label: "Sleep robot", systemImage: "moon") {
-                    Task { await services.sleepRobot() }
-                }
+                // Single contextual wake/sleep row — matches the
+                // dashboard's HeroCard button so the menu and main
+                // window present the same affordance for the same state.
+                wakeSleepRow(state: services.rockyState)
 
                 Divider().padding(.vertical, 6)
 
@@ -58,6 +55,22 @@ struct MenuBarStatusView: View {
             .padding(.horizontal, 4).padding(.bottom, 6)
         }
         .frame(width: 240)
+    }
+
+    @ViewBuilder
+    private func wakeSleepRow(state: AppServices.RockyState) -> some View {
+        switch state {
+        case .sleeping, .error:
+            row(label: "Wake Rocky", systemImage: "sun.max.fill") {
+                Task { await services.wakeRobot() }
+            }
+        case .waking:
+            row(label: "Waking\u{2026}", systemImage: "hourglass") { }
+        default:
+            row(label: "Sleep Rocky", systemImage: "moon.fill") {
+                Task { await services.sleepRobot() }
+            }
+        }
     }
 
     @ViewBuilder

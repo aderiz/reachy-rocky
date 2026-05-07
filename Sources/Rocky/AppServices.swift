@@ -23,6 +23,7 @@ final class AppServices {
     let targetStreamer: TargetStreamer
     let robotCamera: RobotCameraService
     let macFaceTracker: MacFaceTracker
+    let faceLibrary: FaceLibrary
     let stateSubscriber: StateSubscriber
 
     // Voice
@@ -51,6 +52,28 @@ final class AppServices {
     var lastFaceDetection: FaceTrackerService.Detection?
     var faceTargetCount: Int = 0
     var faceDetectionCount: Int = 0
+
+    /// Mirror of the on-disk face library (snapshot refreshed after enroll
+    /// / remove). The Settings view binds against this for the list UI.
+    var enrolledPeople: [FaceLibrary.Person] = []
+
+    /// Per-person "last seen" timestamps. Drives the greeting state
+    /// machine: a name re-entering after `presenceAbsenceThreshold`
+    /// seconds of absence triggers a fresh "hey, {name}".
+    @ObservationIgnored
+    private var personPresence: [String: Date] = [:]
+    @ObservationIgnored
+    private var lastGreetingIndex: Int?
+    private let presenceAbsenceThreshold: TimeInterval = 30.0
+    private static let greetingTemplates: [String] = [
+        "Hey, {name}.",
+        "Hi {name}.",
+        "Hey there, {name}.",
+        "{name}! Hey.",
+        "Welcome back, {name}.",
+        "Hello, {name}.",
+        "Oh, hey {name}.",
+    ]
 
     /// Latest robot-camera frame as JPEG data (the SwiftUI side decodes it).
     var lastCameraFrame: RobotCameraService.Frame?
@@ -93,6 +116,11 @@ final class AppServices {
 
     /// Manual UI mutes (separate from sidecar/permission errors).
     var ttsMuted: Bool = false
+
+    /// Whether the on-Mac face tracker is allowed to push targets to the
+    /// streamer. Driven by `setFaceTrackingEnabled` so menu bar and any
+    /// future dashboard control read the same source of truth.
+    var faceTrackingEnabled: Bool = true
 
     /// Sidecar lifecycle mirrors so the Status panel can render real states
     /// without poking actors on every redraw.
@@ -211,6 +239,7 @@ final class AppServices {
         // On-Mac face tracker — runs Apple's Vision face detection over the
         // camera frames and drives the TargetStreamer directly.
         self.macFaceTracker = MacFaceTracker(logBus: bus)
+        self.faceLibrary = FaceLibrary(logBus: bus)
 
         // Voice pipeline. Mac mic + robot mic both write into a SHARED
         // AudioRingBuffer; VoiceCoordinator pulls from it without caring
@@ -285,28 +314,54 @@ final class AppServices {
         // we don't attach faceTargetBridge to its stream by default.
         await targetStreamer.start()
         await macFaceTracker.setStreamer(targetStreamer)
+        // Load enrolled-face library from disk and hand it to the tracker
+        // so identification runs against the user's known faces.
+        await faceLibrary.loadFromDisk()
+        await macFaceTracker.setLibrary(faceLibrary)
+        await refreshEnrolledFaces()
         await macFaceTracker.start()
 
         // Mirror Mac face tracker detections + targets into observable state
         // so the dashboard reflects what the Mac detector saw.
+        //
+        // CRITICAL: keep main-actor mutations under 5 Hz. The detection
+        // stream produces ~30 Hz; the camera, target, and state-stream
+        // loops also publish to MainActor. Their combined rate determines
+        // how often SwiftUI reconsiders any view that reads anything off
+        // `services` — including MenuBarLabel which reads rockyState (and
+        // therefore lastRobotState transitively). At >10 Hz the AppKit
+        // run loop ends up too busy with SwiftUI diffs to deliver
+        // keystrokes to TextFields, so typing breaks app-wide.
         let macDetections = await macFaceTracker.detections
         Task { [weak self] in
+            var lastMirror = Date.distantPast
+            var counter = 0
             for await det in macDetections {
                 guard let self else { return }
+                counter += 1
+                // Always run the (low-cost) greeting state machine — it
+                // guards itself with a 30 s absence threshold.
+                if let name = det.identity {
+                    await self.handleIdentitySeen(name: name)
+                }
+                // Mirror to the observable surface at 5 Hz max.
+                let now = Date()
+                if now.timeIntervalSince(lastMirror) < 0.2 { continue }
+                lastMirror = now
                 let mapped = RockyVision.FaceTrackerService.Detection(
                     bbox: det.bbox,
                     confidence: det.confidence,
                     promptId: "vision-face",
                     frameWidth: det.frameWidth,
-                    frameHeight: det.frameHeight
+                    frameHeight: det.frameHeight,
+                    identity: det.identity,
+                    identityDistance: det.identityDistance
                 )
+                let snap = counter
                 await MainActor.run {
                     self.lastFaceDetection = mapped
-                    self.faceDetectionCount &+= 1
+                    self.faceDetectionCount = snap
                 }
-                // First detection of this asleep-cycle wakes Rocky. The
-                // 30s rate-limit inside maybeAutoWake stops re-triggering.
-                await self.maybeAutoWake()
             }
         }
 
@@ -344,7 +399,8 @@ final class AppServices {
                 guard let self else { return }
                 counter += 1
                 let now = Date()
-                if now.timeIntervalSince(lastUpdate) < 0.1 { continue }
+                // 5 Hz mirror — see detection loop for rationale.
+                if now.timeIntervalSince(lastUpdate) < 0.2 { continue }
                 lastUpdate = now
                 let mapped = RockyVision.FaceTrackerService.Target(
                     yawRad: t.yawRad,
@@ -376,15 +432,29 @@ final class AppServices {
         // to both the SwiftUI mirror AND the Mac face tracker. AsyncStream
         // is single-consumer; if the dashboard and the face tracker both
         // subscribed independently, one of them would starve.
+        //
+        // The face tracker gets EVERY frame (30 Hz) so detection latency is
+        // honest; the SwiftUI mirror is throttled to 10 Hz so VisionCard
+        // doesn't repaint a fresh JPEG 30 times a second on the main actor
+        // and starve text-field keyboard handling in BrainCard.
         let cameraFrames = robotCamera.frames
         Task { [weak self] in
+            var lastUiUpdate = Date.distantPast
+            var counter = 0
             for await frame in cameraFrames {
                 guard let self else { return }
+                counter += 1
+                await self.macFaceTracker.ingestFrame(frame)
+                let now = Date()
+                // 5 Hz mirror — see detection loop above. The face
+                // tracker still gets every frame; only the UI is throttled.
+                if now.timeIntervalSince(lastUiUpdate) < 0.2 { continue }
+                lastUiUpdate = now
+                let snap = counter
                 await MainActor.run {
                     self.lastCameraFrame = frame
-                    self.cameraFrameCount &+= 1
+                    self.cameraFrameCount = snap
                 }
-                await self.macFaceTracker.ingestFrame(frame)
             }
         }
 
@@ -439,17 +509,26 @@ final class AppServices {
         await stateSubscriber.start()
         let states = stateSubscriber.states
         Task { [weak self] in
+            // Throttle observable mutations to 5 Hz — see the detection
+            // loop above for the rationale. The robot pose visualisation
+            // doesn't need 10 fps; the menu bar absolutely shouldn't
+            // redraw at 10 fps while the user is typing.
+            var lastMirror = Date.distantPast
+            var counter = 0
             for await state in states {
                 guard let self else { return }
+                counter += 1
+                let now = Date()
+                if now.timeIntervalSince(lastMirror) < 0.2 { continue }
+                lastMirror = now
+                let snap = counter
                 await MainActor.run {
                     self.lastRobotState = state
-                    self.stateUpdateCount &+= 1
+                    self.stateUpdateCount = snap
                     if self.daemonReachability != .online {
                         self.daemonReachability = .online
                     }
                 }
-                // Try to auto-wake if Rocky is slumped on first connect.
-                await self.maybeAutoWake()
             }
         }
 
@@ -684,7 +763,10 @@ final class AppServices {
     }
 
     /// Stop face tracking from pushing target events into the streamer.
+    /// Mirrored on `faceTrackingEnabled` so the menu bar and main
+    /// window stay in lockstep regardless of which surface toggled it.
     func setFaceTrackingEnabled(_ enabled: Bool) async {
+        faceTrackingEnabled = enabled
         do {
             try await faceTracker.setEnabled(enabled)
         } catch {
@@ -1153,5 +1235,92 @@ final class AppServices {
             url = url.deletingLastPathComponent()
         }
         return nil
+    }
+
+    // MARK: - Face library + greeting
+
+    func refreshEnrolledFaces() async {
+        let snap = await faceLibrary.snapshot()
+        self.enrolledPeople = snap.people
+    }
+
+    /// Enroll a new person from the supplied photo JPEGs. Returns the
+    /// number of usable face crops the library extracted. Zero indicates
+    /// none of the photos contained a detectable face.
+    @discardableResult
+    func enrollFace(name: String,
+                    pronunciation: String,
+                    photoJPEGs: [Data]) async -> Bool {
+        let person = await faceLibrary.enroll(
+            name: name, pronunciation: pronunciation, photoJPEGs: photoJPEGs
+        )
+        await refreshEnrolledFaces()
+        return person != nil
+    }
+
+    func updateFace(id: UUID, name: String, pronunciation: String) async {
+        await faceLibrary.update(id: id, name: name, pronunciation: pronunciation)
+        await refreshEnrolledFaces()
+    }
+
+    func removeFace(id: UUID) async {
+        await faceLibrary.remove(id: id)
+        await refreshEnrolledFaces()
+        // Forget any presence record under this person's name so the
+        // next person we enroll with the same name doesn't inherit a
+        // stale "recently seen" timestamp.
+        personPresence.removeAll()
+    }
+
+    /// Called from the face-detection stream whenever a recognised name
+    /// is in view. Drives the per-person "absent → present" transition
+    /// and triggers a TTS greeting on re-entry.
+    private func handleIdentitySeen(name: String) async {
+        let now = Date()
+        let lastSeen = personPresence[name]
+        let wasAbsent = lastSeen.map {
+            now.timeIntervalSince($0) > presenceAbsenceThreshold
+        } ?? true
+        personPresence[name] = now
+        guard wasAbsent else { return }
+
+        // Don't greet from a sleeping or muted/busy state — Rocky should
+        // be present and able to speak.
+        guard rockyState.isAwake else { return }
+        if ttsMuted { return }
+        if brainBusy { return }
+        if let until = ttsBusyUntil, now < until { return }
+
+        let pronunciation = enrolledPeople.first(where: { $0.name == name })?
+            .spokenName ?? name
+
+        // Pick a phrase, avoiding immediate repetition of the last one.
+        let templates = Self.greetingTemplates
+        var idx = Int.random(in: 0..<templates.count)
+        if templates.count > 1, let last = lastGreetingIndex, last == idx {
+            idx = (idx + 1) % templates.count
+        }
+        lastGreetingIndex = idx
+        let phrase = templates[idx]
+            .replacingOccurrences(of: "{name}", with: pronunciation)
+
+        // Tag a busy window so concurrent "speaking" gating in
+        // rockyState reflects the greeting and we don't overlap with a
+        // dispatched LLM reply.
+        ttsBusyUntil = now.addingTimeInterval(3.0)
+        await logBus.publish(.sidecarLog(
+            sidecar: "greeting", level: .info,
+            message: "greeting \(name) — \"\(phrase)\"",
+            fields: [:]
+        ))
+        Task { [robotTTS, logBus] in
+            do {
+                _ = try await robotTTS.speak(phrase)
+            } catch {
+                await logBus.publish(.error(
+                    scope: "greeting", message: "\(error)", recoverable: true
+                ))
+            }
+        }
     }
 }
