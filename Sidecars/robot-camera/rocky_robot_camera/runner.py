@@ -60,24 +60,80 @@ class Runner:
             automatic_body_yaw=False,
             log_level="WARNING",
         )
-        # Camera frames stay None until media is explicitly acquired.
+        self._acquire_media()
+        log("info", "connected to robot")
+
+    def _acquire_media(self) -> bool:
+        """Try to acquire camera/audio media from the daemon. Idempotent."""
         try:
             self.mini.acquire_media()
             log("info", "media acquired")
+            return True
         except Exception as exc:  # noqa: BLE001
             log("warn", "acquire_media failed", error=str(exc))
-        log("info", "connected to robot")
+            return False
+
+    def _refresh_media(self) -> bool:
+        """Best-effort release+reacquire to recover from a silent WebRTC
+        drop. Some daemon versions don't expose release_media; ignore
+        AttributeError."""
+        try:
+            self.mini.release_media()
+            log("info", "media released for refresh")
+        except (AttributeError, Exception) as exc:  # noqa: BLE001
+            log("debug", "release_media skipped", error=str(exc))
+        time.sleep(0.3)  # let the daemon settle before re-acquiring
+        return self._acquire_media()
 
     def stream_loop(self) -> None:
         log("info", "frame stream started",
             target_width=self.target_width, jpeg_quality=self.jpeg_quality)
         period = 1.0 / max(1.0, self.fps)
         last_emit = 0.0
+        last_success = time.monotonic()
+        last_health_log = time.monotonic()
+        last_refresh = 0.0
+        consecutive_none = 0
+        was_stale = False
+
+        # Tunables — keep conservative.
+        STALE_REFRESH_S = float(os.environ.get("ROCKY_CAM_STALE_REFRESH_S", "3"))
+        FATAL_S = float(os.environ.get("ROCKY_CAM_FATAL_S", "20"))
+        HEALTH_LOG_PERIOD_S = 5.0
+        REFRESH_COOLDOWN_S = 8.0
+
         while not self.shutdown_flag.is_set() and self.streaming:
             now = time.monotonic()
             if now - last_emit < period:
                 time.sleep(0.005)
                 continue
+
+            staleness = now - last_success
+
+            # Periodic health log so the user can see what's happening.
+            if now - last_health_log > HEALTH_LOG_PERIOD_S:
+                log("debug", "camera health",
+                    frames=self.frame_seq, stale_s=f"{staleness:.1f}",
+                    consecutive_none=consecutive_none)
+                last_health_log = now
+
+            # If staleness exceeds threshold, try to refresh the WebRTC
+            # connection by releasing + re-acquiring media. Cooldown to
+            # avoid hammering on a totally broken connection.
+            if staleness > STALE_REFRESH_S and now - last_refresh > REFRESH_COOLDOWN_S:
+                log("warn", "camera stale — refreshing media",
+                    stale_s=f"{staleness:.1f}")
+                self._refresh_media()
+                last_refresh = now
+                # Don't reset last_success; if refresh works the next
+                # successful frame will reset it naturally.
+
+            # If staleness exceeds the fatal threshold, exit non-zero.
+            # The supervisor will restart this sidecar with fresh state.
+            if staleness > FATAL_S:
+                log("error", "camera dead — exiting for supervisor restart",
+                    stale_s=f"{staleness:.1f}")
+                sys.exit(2)
 
             try:
                 frame = self.mini.media.get_frame()
@@ -85,24 +141,29 @@ class Runner:
                 log("warn", "get_frame failed", error=str(exc))
                 time.sleep(0.05)
                 continue
+
             if frame is None:
+                consecutive_none += 1
                 time.sleep(0.01)
                 continue
 
-            arr = np.asarray(frame, dtype=np.uint8)
+            try:
+                arr = np.asarray(frame, dtype=np.uint8)
+            except Exception as exc:  # noqa: BLE001
+                log("warn", "asarray failed", error=str(exc))
+                time.sleep(0.05)
+                continue
+
             if arr.ndim != 3 or arr.shape[2] != 3:
                 log("warn", "unexpected frame shape", shape=str(arr.shape))
                 time.sleep(0.05)
                 continue
             h, w, _ = arr.shape
 
-            # Downsample to target width preserving aspect ratio.
             scale = self.target_width / float(w)
             new_w = self.target_width
             new_h = max(1, int(h * scale))
             try:
-                # Frames from reachy_mini are typically RGB. If they're BGR
-                # we'd see swapped colors but otherwise valid output.
                 pil = Image.fromarray(arr)
                 pil = pil.resize((new_w, new_h), Image.BILINEAR)
                 buf = io.BytesIO()
@@ -113,7 +174,17 @@ class Runner:
                 time.sleep(0.05)
                 continue
 
+            # Recovery message — emit once per regression.
+            if was_stale:
+                log("info", "camera recovered",
+                    after_stale_s=f"{staleness:.1f}")
+                was_stale = False
+            elif staleness > STALE_REFRESH_S:
+                was_stale = True
+
             self.frame_seq += 1
+            consecutive_none = 0
+            last_success = now
             emit({
                 "event": "frame",
                 "payload": {
@@ -127,7 +198,8 @@ class Runner:
             })
             last_emit = now
 
-        log("info", "frame stream stopped")
+        log("info", "frame stream stopped",
+            total_frames=self.frame_seq)
 
     def handle(self, req: dict[str, Any]) -> None:
         rid = req.get("id")

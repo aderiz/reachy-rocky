@@ -25,8 +25,10 @@ public actor RobotCameraService {
     private let sidecar: any Sidecar
     private let logBus: LogBus
     private var pumpTask: Task<Void, Never>?
+    private var stateTask: Task<Void, Never>?
     public private(set) var isStreaming: Bool = false
     public private(set) var lastSeq: Int = 0
+    public private(set) var lastFrameAt: Date?
 
     public init(sidecar: any Sidecar, logBus: LogBus) {
         self.sidecar = sidecar
@@ -40,9 +42,7 @@ public actor RobotCameraService {
 
     public func start() async throws {
         try await sidecar.start()
-        struct Empty: Encodable, Sendable {}
-        struct R: Decodable, Sendable { let streaming: Bool }
-        let _: R = try await sidecar.send(method: "start_streaming", params: Empty())
+        try await sendStartStreaming()
 
         let events = sidecar.events
         pumpTask?.cancel()
@@ -54,16 +54,64 @@ public actor RobotCameraService {
                 if Task.isCancelled { break }
             }
         }
+
+        // Watch sidecar lifecycle: when the supervisor restarts the
+        // process (e.g., after our 20s "fatal" exit), re-arm streaming
+        // so frames resume without app intervention.
+        stateTask?.cancel()
+        stateTask = Task { [weak self] in
+            await self?.watchSidecarState()
+        }
         isStreaming = true
     }
 
     public func stop() async {
-        pumpTask?.cancel()
-        pumpTask = nil
+        pumpTask?.cancel(); pumpTask = nil
+        stateTask?.cancel(); stateTask = nil
         isStreaming = false
         struct Empty: Encodable, Sendable {}
         struct R: Decodable, Sendable { let streaming: Bool }
         let _: R? = try? await sidecar.send(method: "stop_streaming", params: Empty())
+    }
+
+    /// Hits the sidecar's `start_streaming` RPC. Caller handles errors.
+    private func sendStartStreaming() async throws {
+        struct Empty: Encodable, Sendable {}
+        struct R: Decodable, Sendable { let streaming: Bool }
+        let _: R = try await sidecar.send(method: "start_streaming", params: Empty())
+    }
+
+    private func watchSidecarState() async {
+        var sawReadyOnce = false
+        for await event in sidecar.events {
+            if case .state(let s) = event {
+                switch s {
+                case .ready:
+                    if sawReadyOnce {
+                        // Restart — re-arm streaming. The sidecar's init
+                        // already runs acquire_media on its main thread.
+                        do {
+                            try await sendStartStreaming()
+                            await logBus.publish(.sidecarLog(
+                                sidecar: "robot-camera", level: .info,
+                                message: "re-armed streaming after restart",
+                                fields: [:]
+                            ))
+                        } catch {
+                            await logBus.publish(.error(
+                                scope: "robot-camera",
+                                message: "re-arm failed: \(error)",
+                                recoverable: true
+                            ))
+                        }
+                    }
+                    sawReadyOnce = true
+                default:
+                    break
+                }
+            }
+            if Task.isCancelled { break }
+        }
     }
 
     private func ingest(_ payload: Data) async {
@@ -80,6 +128,7 @@ public actor RobotCameraService {
         lastSeq = seq
         let frame = Frame(seq: seq, width: width, height: height,
                           sourceWidth: srcW, sourceHeight: srcH, jpeg: jpeg)
+        lastFrameAt = Date()
         framesContinuation.yield(frame)
     }
 }

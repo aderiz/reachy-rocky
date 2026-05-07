@@ -2,7 +2,7 @@ import Foundation
 import CoreGraphics
 import CoreImage
 import ImageIO
-@preconcurrency import Vision  // Apple's Vision framework — face detection
+import Vision                  // Apple's Vision framework — face detection
 import RockyKit
 import RobotLink
 import RockyVision             // Our Vision module (renamed to avoid collision)
@@ -26,11 +26,12 @@ public actor MacFaceTracker {
         /// 0.25 weights the new detection at 75% — fast follow without
         /// reacting to per-frame jitter.
         public var emaAlpha: Double = 0.25
-        /// Critical-damper natural frequency (rad/s). 6 → ~0.97 s settle
-        /// (5%) but visibly responsive within ~250 ms. Apple Vision
-        /// at 30 FPS gives plenty of signal density to support this; the
-        /// old 3 was tuned for SAM 3.1's sparse 11 Hz detections.
-        public var damperOmega: Double = 6.0
+        /// Critical-damper natural frequency (rad/s). 4.0 → ~1.5 s settle
+        /// (5%), visibly responsive but no snap. Single tweak from the
+        /// previous 6.0 which was felt as too aggressive. Per robot-safety
+        /// rule we change one knob at a time; if this is still too hot,
+        /// next pass tightens the speed cap.
+        public var damperOmega: Double = 4.0
         /// Drop detections smaller than this fraction of the frame.
         public var minBboxNorm: Double = 0.05
         /// After this idle window with no detections, decay world target home.
@@ -41,8 +42,11 @@ public actor MacFaceTracker {
         public var commandHz: Double = 50.0
         /// Max angular speed the damper output is allowed to change per
         /// tick (rad/s). Prevents step-jumps during target snaps. Set to
-        /// 0 to disable.
-        public var maxSpeedRadPerS: Double = 6.0  // ~344°/s
+        /// 0 to disable. 2.0 ≈ 115°/s, in the range of a calm human head
+        /// turn (peak ~150°/s during fast saccades, ~60°/s for casual
+        /// gaze shifts). Pairs with the omega-4 damper above so big
+        /// target jumps unwind smoothly instead of snapping.
+        public var maxSpeedRadPerS: Double = 2.0  // ~115°/s
 
         public init() {}
     }
@@ -138,10 +142,12 @@ public actor MacFaceTracker {
               )
         else { return }
 
-        // Run Vision face detection. Modern (macOS 26+) async API.
-        let observations: [FaceObservation]
+        // Run Vision face detection. Modern (macOS 15+) async Swift API.
+        // Fully-qualified to avoid Xcode index confusion with our local
+        // `RockyVision` module which shares the same name root.
+        let observations: [Vision.FaceObservation]
         do {
-            let request = DetectFaceRectanglesRequest()
+            let request = Vision.DetectFaceRectanglesRequest()
             observations = try await request.perform(on: cgImage)
         } catch {
             await logBus.publish(.error(
