@@ -33,16 +33,14 @@ struct SettingsView: View {
                 }
 
                 section(title: "Brain (LM Studio)",
-                        footer: "Apply hot-reloads the client. No relaunch needed.") {
+                        footer: "Apply hot-reloads the client and refreshes the model list. No relaunch needed.") {
                     LabeledContent("Base URL") {
                         TextField("http://localhost:1234/v1", text: $lmURLDraft)
                             .textFieldStyle(.roundedBorder)
                             .frame(maxWidth: 360)
                     }
                     LabeledContent("Model") {
-                        TextField("qwen2.5-7b-instruct", text: $lmModelDraft)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(maxWidth: 280)
+                        modelPicker
                     }
                     LabeledContent("API key") {
                         SecureField("(blank for none)", text: $lmApiKeyDraft)
@@ -113,6 +111,48 @@ struct SettingsView: View {
             Text("Tune Rocky's connections and personality.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    /// Model dropdown sourced from `services.availableLLMModels` (refreshed
+    /// on every LM Studio probe). Falls back to a free-text field when LM
+    /// Studio is unreachable so the user can still pre-configure a name.
+    @ViewBuilder
+    private var modelPicker: some View {
+        let models = services.availableLLMModels
+        if models.isEmpty {
+            HStack(spacing: 6) {
+                TextField("(LM Studio offline)", text: $lmModelDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 280)
+                Button {
+                    Task { await services.probeLMStudioPublic() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .help("Re-probe LM Studio")
+                .controlSize(.small)
+            }
+        } else {
+            HStack(spacing: 6) {
+                Picker("", selection: $lmModelDraft) {
+                    if !models.contains(lmModelDraft) && !lmModelDraft.isEmpty {
+                        Text("\(lmModelDraft) (not loaded)").tag(lmModelDraft)
+                    }
+                    ForEach(models, id: \.self) { m in
+                        Text(m).tag(m)
+                    }
+                }
+                .labelsHidden()
+                .frame(maxWidth: 320)
+                Button {
+                    Task { await services.probeLMStudioPublic() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .help("Re-probe LM Studio")
+                .controlSize(.small)
+            }
         }
     }
 

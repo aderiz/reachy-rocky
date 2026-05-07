@@ -62,6 +62,9 @@ final class AppServices {
         case online(model: String)
         case offline(reason: String)
     }
+
+    /// Models available on the active LM Studio endpoint, refreshed on every probe.
+    var availableLLMModels: [String] = []
     struct BrainTurn: Sendable, Identifiable, Equatable {
         let id = UUID()
         var role: String           // "user" | "assistant" | "tool"
@@ -255,14 +258,25 @@ final class AppServices {
         }
 
         // Pump face-tracker events into observable mirrors.
+        // Face-tracker target events arrive at 50 Hz. Mirroring every one
+        // into Observable state thrashes SwiftUI redraws (TextField focus
+        // loss, jittery layout). Coalesce to 10 Hz max for the UI; the
+        // 50 Hz robot command stream still happens via TargetStreamer.
         let targets = faceTracker.targets
         let detections = faceTracker.detections
         Task { [weak self] in
+            var lastUpdate = Date.distantPast
+            var counter: Int = 0
             for await t in targets {
                 guard let self else { return }
+                counter += 1
+                let now = Date()
+                if now.timeIntervalSince(lastUpdate) < 0.1 { continue }
+                lastUpdate = now
+                let snapshot = counter
                 await MainActor.run {
                     self.lastFaceTarget = t
-                    self.faceTargetCount &+= 1
+                    self.faceTargetCount = snapshot
                 }
             }
         }
@@ -374,7 +388,8 @@ final class AppServices {
                         await MainActor.run {
                             self.lastMicRMS = rms
                         }
-                        try? await Task.sleep(nanoseconds: 50_000_000)
+                        // 10 Hz: smooth-enough VU without thrashing redraws.
+                        try? await Task.sleep(nanoseconds: 100_000_000)
                     }
                 }
                 // Pump voice outputs into observable mirrors.
@@ -561,11 +576,23 @@ final class AppServices {
     private func probeLMStudio() async {
         do {
             let models = try await llm.listModels()
-            let model = models.first ?? "(no models loaded)"
-            await MainActor.run { self.llmStatus = .online(model: model) }
+            let pinned = settings.lmStudioModel
+            // If the pinned model exists in the list, report it as the
+            // active one. Otherwise fall back to the first available.
+            let active: String
+            if !pinned.isEmpty, models.contains(pinned) {
+                active = pinned
+            } else {
+                active = models.first ?? "(no models loaded)"
+            }
+            await MainActor.run {
+                self.llmStatus = .online(model: active)
+                self.availableLLMModels = models
+            }
         } catch {
             await MainActor.run {
                 self.llmStatus = .offline(reason: "\(error)")
+                self.availableLLMModels = []
             }
         }
     }

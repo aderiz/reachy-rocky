@@ -11,8 +11,6 @@ import SwiftUI
 /// when known (per the plan's "latency-honest" UX principle).
 struct HeroCard: View {
     @Environment(AppServices.self) private var services
-    @State private var ticker = Date()
-    @State private var animatePhase: Double = 0
 
     var body: some View {
         let state = services.rockyState
@@ -58,11 +56,6 @@ struct HeroCard: View {
         }
         .padding(20)
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
-        // 30 Hz heartbeat keeps countdown / animation snapshot fresh.
-        .onReceive(Timer.publish(every: 0.033, on: .main, in: .common).autoconnect()) { _ in
-            ticker = Date()
-            animatePhase += 0.06
-        }
     }
 
     private var actionRow: some View {

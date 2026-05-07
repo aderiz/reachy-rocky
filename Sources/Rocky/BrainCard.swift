@@ -50,11 +50,13 @@ struct BrainCard: View {
             HStack(spacing: 8) {
                 TextField("Ask Rocky…", text: $draft, axis: .horizontal)
                     .textFieldStyle(.roundedBorder)
+                    .submitLabel(.send)
                     .onSubmit { send() }
+                if services.brainBusy {
+                    ProgressView().controlSize(.small)
+                }
                 Button("Send") { send() }
-                    .keyboardShortcut(.return, modifiers: [])
-                    .disabled(draft.trimmingCharacters(in: .whitespaces).isEmpty
-                              || services.brainBusy)
+                    .disabled(draft.trimmingCharacters(in: .whitespaces).isEmpty)
             }
 
             if let err = services.brainErrorMessage {
@@ -66,19 +68,19 @@ struct BrainCard: View {
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
     }
 
+    @ViewBuilder
     private var statusPill: some View {
         switch services.llmStatus {
         case .unknown:
-            return AnyView(Pill(text: "checking…", tint: .gray))
+            Pill(text: "checking…", tint: .gray)
         case .online(let model):
-            return AnyView(Pill(text: model, tint: .green))
+            Pill(text: model, tint: .green)
         case .offline(let reason):
             // Truncate to keep the pill compact; full reason in the help tip.
-            let short = reason.split(separator: ":").last.map(String.init) ?? reason
-            return AnyView(
-                Pill(text: "offline · \(short.prefix(40))", tint: .red)
-                    .help(reason)
-            )
+            let short = String((reason.split(separator: ":").last
+                                .map(String.init) ?? reason).prefix(40))
+            Pill(text: "offline · \(short)", tint: .red)
+                .help(reason)
         }
     }
 
