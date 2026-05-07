@@ -18,6 +18,9 @@ final class AppServices {
     let robotLink: RobotLinkClient
     let supervisor: SidecarSupervisor
     let faceTracker: FaceTrackerService
+    let faceTargetBridge: FaceTargetBridge
+    let targetStreamer: TargetStreamer
+    let robotCamera: RobotCameraService
     let stateSubscriber: StateSubscriber
 
     // Voice
@@ -46,6 +49,10 @@ final class AppServices {
     var lastFaceDetection: FaceTrackerService.Detection?
     var faceTargetCount: Int = 0
     var faceDetectionCount: Int = 0
+
+    /// Latest robot-camera frame as JPEG data (the SwiftUI side decodes it).
+    var lastCameraFrame: RobotCameraService.Frame?
+    var cameraFrameCount: Int = 0
 
     // Live voice state
     var micEnabled: Bool = false
@@ -179,6 +186,26 @@ final class AppServices {
         let runtime = SidecarRuntime(manifest: manifest, resolver: resolver, logBus: bus)
         self.faceTracker = FaceTrackerService(sidecar: runtime, logBus: bus)
 
+        // Wire face-tracker targets into a 50 Hz set_target stream so the
+        // robot actually moves when faces are detected.
+        self.targetStreamer = TargetStreamer(client: self.robotLink, logBus: bus)
+        self.faceTargetBridge = FaceTargetBridge(
+            streamer: self.targetStreamer, logBus: bus
+        )
+
+        // Robot-camera sidecar. Streams JPEG frames over the wire.
+        let cameraManifest = Self.devRobotCameraManifest()
+        let cameraDir = Self.locateSidecarDir(named: "robot-camera")
+            ?? URL(fileURLWithPath: "/")
+        let cameraResolver = ManifestPathResolver(
+            sidecarDir: cameraDir,
+            venvDir: SidecarSupervisor.defaultVenvDir(for: "robot-camera")
+        )
+        let cameraRuntime = SidecarRuntime(
+            manifest: cameraManifest, resolver: cameraResolver, logBus: bus
+        )
+        self.robotCamera = RobotCameraService(sidecar: cameraRuntime, logBus: bus)
+
         // Voice pipeline. Mac mic + robot mic both write into a SHARED
         // AudioRingBuffer; VoiceCoordinator pulls from it without caring
         // which source produced the bytes.
@@ -245,6 +272,33 @@ final class AppServices {
             await logBus.publish(.error(scope: "app/face-tracker",
                                         message: "\(error)",
                                         recoverable: true))
+        }
+
+        // Wire face-tracker targets into the 50 Hz set_target streamer
+        // so detected faces actually move the robot.
+        await targetStreamer.start()
+        await faceTargetBridge.attach(to: faceTracker.targets)
+
+        // Bring up the robot-camera sidecar (best-effort — failure means
+        // the Vision card stays placeholder until next attempt).
+        Task { [robotCamera, logBus] in
+            do { try await robotCamera.start() }
+            catch {
+                await logBus.publish(.error(
+                    scope: "app/robot-camera", message: "\(error)", recoverable: true
+                ))
+            }
+        }
+        // Mirror frames into observable state for SwiftUI.
+        let cameraFrames = robotCamera.frames
+        Task { [weak self] in
+            for await frame in cameraFrames {
+                guard let self else { return }
+                await MainActor.run {
+                    self.lastCameraFrame = frame
+                    self.cameraFrameCount &+= 1
+                }
+            }
         }
 
         // Best-effort: bring up the TTS sidecar in the background so the
@@ -984,6 +1038,31 @@ final class AppServices {
                 "PYTHONPATH": dir,
                 "ROCKY_ROBOT_HOST": "reachy-mini.local",
                 "ROCKY_ROBOT_PORT": "8000",
+            ],
+            readyTimeoutS: 30,
+            shutdownGraceS: 3,
+            timeouts: ["*": 10]
+        )
+    }
+
+    private nonisolated static func devRobotCameraManifest() -> SidecarManifest {
+        let venvPython = SidecarSupervisor.defaultVenvDir(for: "robot-camera")
+            .appendingPathComponent("bin/python")
+        let dir = locateSidecarDir(named: "robot-camera")?
+            .path(percentEncoded: false) ?? "."
+        return SidecarManifest(
+            name: "robot-camera",
+            version: "0.1.0-dev",
+            binary: venvPython.path,
+            args: ["-u", "-m", "rocky_robot_camera.runner"],
+            workingDir: dir,
+            env: [
+                "PYTHONPATH": dir,
+                "ROCKY_ROBOT_HOST": "reachy-mini.local",
+                "ROCKY_ROBOT_PORT": "8000",
+                "ROCKY_CAM_FPS": "10",
+                "ROCKY_CAM_WIDTH": "480",
+                "ROCKY_CAM_QUALITY": "65",
             ],
             readyTimeoutS: 30,
             shutdownGraceS: 3,

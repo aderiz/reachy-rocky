@@ -1,15 +1,23 @@
 import SwiftUI
+import AppKit
 import Vision
 
-/// VisionCard — what Rocky sees. Shows the (synthetic or real) face-tracker
-/// preview with a face bbox overlay + the controller's commanded gaze
-/// direction. Info row shows yaw/pitch + counters.
+/// VisionCard — what Rocky sees through the actual robot camera. Live JPEG
+/// frames stream in from the `robot-camera` sidecar; the face-tracker
+/// sidecar's bbox + commanded gaze direction are overlaid on top.
 struct VisionCard: View {
     @Environment(AppServices.self) private var services
 
     var body: some View {
         Card {
             CardHeader("Vision", icon: "eye") {
+                if services.cameraFrameCount > 0 {
+                    StatusPill(
+                        text: "live · \(services.cameraFrameCount) frames",
+                        tint: .green,
+                        systemImage: "video.fill"
+                    )
+                }
                 StatusPill(
                     text: services.lastFaceDetection != nil ? "tracking" : "idle",
                     tint: services.lastFaceDetection != nil ? .green : .secondary,
@@ -19,10 +27,11 @@ struct VisionCard: View {
         } content: {
             HStack(alignment: .top, spacing: 18) {
                 FacePreview(
+                    frame: services.lastCameraFrame,
                     detection: services.lastFaceDetection,
                     target: services.lastFaceTarget
                 )
-                .frame(width: 360, height: 200)
+                .frame(width: 380, height: 214)
 
                 VStack(alignment: .leading, spacing: 14) {
                     VStack(alignment: .leading, spacing: 4) {
@@ -45,6 +54,9 @@ struct VisionCard: View {
                         Text("\(services.faceDetectionCount.formatted()) detections")
                             .font(.caption.monospacedDigit())
                             .foregroundStyle(.secondary)
+                        Text("\(services.cameraFrameCount.formatted()) camera frames")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
                     }
 
                     if services.lastFaceTarget?.decayActive == true {
@@ -52,6 +64,13 @@ struct VisionCard: View {
                             .font(.caption.weight(.medium))
                             .foregroundStyle(.orange)
                     }
+
+                    if services.lastCameraFrame == nil {
+                        Label("Waiting for camera…", systemImage: "video.slash")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
                     Spacer()
                 }
             }
@@ -79,89 +98,79 @@ struct VisionCard: View {
 }
 
 private struct FacePreview: View {
+    let frame: RobotCameraService.Frame?
     let detection: Vision.FaceTrackerService.Detection?
     let target: Vision.FaceTrackerService.Target?
 
     var body: some View {
-        Canvas { ctx, size in
-            // Cinematic background gradient
-            let bg = LinearGradient(
-                colors: [
-                    Color(red: 0.06, green: 0.07, blue: 0.10),
-                    Color(red: 0.10, green: 0.12, blue: 0.16),
-                ],
-                startPoint: .topLeading, endPoint: .bottomTrailing
-            )
-            ctx.fill(Path(roundedRect: CGRect(origin: .zero, size: size),
-                          cornerRadius: 12),
-                     with: .linearGradient(
-                        Gradient(colors: [
-                            Color(red: 0.06, green: 0.07, blue: 0.10),
-                            Color(red: 0.10, green: 0.12, blue: 0.16),
-                        ]),
-                        startPoint: .zero, endPoint: CGPoint(x: size.width, y: size.height)))
-            _ = bg
-            // Subtle horizon line
-            var hpath = Path()
-            hpath.move(to: CGPoint(x: 0, y: size.height / 2))
-            hpath.addLine(to: CGPoint(x: size.width, y: size.height / 2))
-            ctx.stroke(hpath, with: .color(.white.opacity(0.07)),
-                       style: StrokeStyle(lineWidth: 1, dash: [3, 4]))
-            var vpath = Path()
-            vpath.move(to: CGPoint(x: size.width / 2, y: 0))
-            vpath.addLine(to: CGPoint(x: size.width / 2, y: size.height))
-            ctx.stroke(vpath, with: .color(.white.opacity(0.07)),
-                       style: StrokeStyle(lineWidth: 1, dash: [3, 4]))
-
-            // Detection bbox (if any)
-            if let det = detection {
-                let scaleX = size.width / CGFloat(det.frameWidth)
-                let scaleY = size.height / CGFloat(det.frameHeight)
-                let r = CGRect(
-                    x: det.bbox.origin.x * scaleX,
-                    y: det.bbox.origin.y * scaleY,
-                    width: det.bbox.width * scaleX,
-                    height: det.bbox.height * scaleY
+        ZStack {
+            // Live camera image as the background, or a dark gradient if
+            // no frame has arrived yet.
+            if let frame, let nsImage = NSImage(data: frame.jpeg) {
+                Image(nsImage: nsImage)
+                    .resizable()
+                    .interpolation(.medium)
+                    .aspectRatio(contentMode: .fill)
+            } else {
+                LinearGradient(
+                    colors: [
+                        Color(red: 0.06, green: 0.07, blue: 0.10),
+                        Color(red: 0.10, green: 0.12, blue: 0.16),
+                    ],
+                    startPoint: .topLeading, endPoint: .bottomTrailing
                 )
-                // Soft fill + green frame
-                ctx.fill(Path(roundedRect: r, cornerRadius: 8),
-                         with: .color(.green.opacity(0.10)))
-                ctx.stroke(Path(roundedRect: r, cornerRadius: 8),
-                           with: .color(.green),
-                           style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                // Confidence label
-                let confText = Text(String(format: "%.0f%%", det.confidence * 100))
-                    .font(.caption.monospacedDigit().bold())
-                    .foregroundColor(.white)
-                ctx.draw(confText,
-                         at: CGPoint(x: r.minX + 6, y: r.minY + 10),
-                         anchor: .leading)
+                Image(systemName: "video.slash")
+                    .font(.title)
+                    .foregroundStyle(.white.opacity(0.25))
             }
 
-            // Target arrow (yaw, pitch) projected from frame center
-            let center = CGPoint(x: size.width / 2, y: size.height / 2)
-            let yaw = target?.yawRad ?? 0
-            let pitch = target?.pitchRad ?? 0
-            let dx = -CGFloat(yaw) * size.width * 0.45
-            let dy = CGFloat(pitch) * size.height * 0.45
-            let tip = CGPoint(x: center.x + dx, y: center.y + dy)
+            // Detection bbox + target arrow on top of the image.
+            Canvas { ctx, size in
+                    if let det = detection {
+                        let scaleX = size.width / CGFloat(det.frameWidth)
+                        let scaleY = size.height / CGFloat(det.frameHeight)
+                        let r = CGRect(
+                            x: det.bbox.origin.x * scaleX,
+                            y: det.bbox.origin.y * scaleY,
+                            width: det.bbox.width * scaleX,
+                            height: det.bbox.height * scaleY
+                        )
+                        ctx.stroke(Path(roundedRect: r, cornerRadius: 8),
+                                   with: .color(.green),
+                                   style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                        let conf = Text(String(format: "%.0f%%", det.confidence * 100))
+                            .font(.caption.monospacedDigit().bold())
+                            .foregroundColor(.white)
+                        ctx.draw(conf,
+                                 at: CGPoint(x: r.minX + 6, y: r.minY + 10),
+                                 anchor: .leading)
+                    }
 
-            var arrow = Path()
-            arrow.move(to: center)
-            arrow.addLine(to: tip)
-            ctx.stroke(arrow, with: .color(.accentColor),
-                       style: StrokeStyle(lineWidth: 3, lineCap: .round))
-            ctx.fill(
-                Path(ellipseIn: CGRect(x: tip.x - 5, y: tip.y - 5,
-                                       width: 10, height: 10)),
-                with: .color(.accentColor)
-            )
-            ctx.fill(
-                Path(ellipseIn: CGRect(x: center.x - 3, y: center.y - 3,
-                                       width: 6, height: 6)),
-                with: .color(.white.opacity(0.8))
-            )
+                    let center = CGPoint(x: size.width / 2, y: size.height / 2)
+                    let yaw = target?.yawRad ?? 0
+                    let pitch = target?.pitchRad ?? 0
+                    let dx = -CGFloat(yaw) * size.width * 0.45
+                    let dy = CGFloat(pitch) * size.height * 0.45
+                    let tip = CGPoint(x: center.x + dx, y: center.y + dy)
+
+                    var arrow = Path()
+                    arrow.move(to: center)
+                    arrow.addLine(to: tip)
+                    ctx.stroke(arrow, with: .color(.accentColor),
+                               style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                    ctx.fill(
+                        Path(ellipseIn: CGRect(x: tip.x - 5, y: tip.y - 5,
+                                               width: 10, height: 10)),
+                        with: .color(.accentColor)
+                    )
+                    ctx.fill(
+                        Path(ellipseIn: CGRect(x: center.x - 3, y: center.y - 3,
+                                               width: 6, height: 6)),
+                        with: .color(.white.opacity(0.8))
+                    )
+            }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
