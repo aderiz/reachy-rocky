@@ -1049,6 +1049,98 @@ final class AppServices {
         }
     }
 
+    /// Run a Rocky-voice utterance concurrently with a physical motion
+    /// so the verbalisation overlaps the gesture. TTS is skipped (but
+    /// motion still plays) when the user has muted output. Used by
+    /// `express` and `play_emotion` to enforce the "always speak while
+    /// moving" rule.
+    func speakAndMove(text: String,
+                      _ motion: @Sendable @escaping () async throws -> Void)
+    async throws {
+        let muted = await MainActor.run { self.ttsMuted }
+        async let move: () = motion()
+        async let speech: RobotTTS.SpeakStats? = muted
+            ? nil
+            : try await self.robotTTS.speak(text)
+        let (_, stats) = try await (move, speech)
+        if let stats {
+            let until = Date().addingTimeInterval(stats.durationS + 0.2)
+            await MainActor.run { self.ttsBusyUntil = until }
+        }
+    }
+
+    /// Play a pre-recorded move from the Pollen emotions library
+    /// (`pollen-robotics/reachy-mini-emotions-library`).
+    ///
+    /// **Velocity watchdog**: the daemon plays recorded moves at the
+    /// authored tempo with no speed knob — once kicked off, we can't
+    /// slow it down. So while it plays we sample the streaming state
+    /// at 20 Hz and compute each joint's instantaneous angular
+    /// velocity. If any axis exceeds
+    /// `SafetyLimits.maxJointVelocityRadPerS`, the move is force-
+    /// stopped. The vast majority of authored emotions stay well
+    /// under the cap and play normally; only the genuinely violent
+    /// ones get cut off.
+    ///
+    /// **Duration cap**: a separate hard ceiling on total runtime.
+    /// If a move never finishes (state stream dies, daemon hangs),
+    /// `stopMove` fires regardless.
+    ///
+    /// Suppresses face tracking for the duration so the streamer
+    /// doesn't compete with the playback, and flags `transitioningUntil`
+    /// so the avatar reflects the busy state.
+    func playRecordedEmotion(_ name: String) async throws {
+        let dataset = "pollen-robotics/reachy-mini-emotions-library"
+        let safetyCap: TimeInterval = 8.0
+        await MainActor.run {
+            self.transitioningUntil = Date().addingTimeInterval(safetyCap)
+        }
+        defer {
+            Task { @MainActor in self.transitioningUntil = nil }
+        }
+        try? await faceTracker.setEnabled(false)
+        defer { Task { try? await faceTracker.setEnabled(true) } }
+
+        try await robotLink.playRecordedMove(dataset: dataset, move: name)
+
+        // Velocity watchdog + completion / cap loop. Sample the
+        // mirrored state every 50 ms (≈20 Hz) and:
+        //   - return early when the daemon reports no move running
+        //   - force-stop on excessive instantaneous joint velocity
+        //   - force-stop on cap timeout
+        let logBus = self.logBus
+        let robot = self.robotLink
+        let deadline = Date().addingTimeInterval(safetyCap)
+        var prevPose: RPYPose? = nil
+        var prevTime = Date()
+        while Date() < deadline {
+            try await Task.sleep(nanoseconds: 50_000_000)
+            let now = Date()
+            let dt = now.timeIntervalSince(prevTime)
+            let pose = await MainActor.run { self.lastRobotState?.headPose }
+            if let prev = prevPose, let cur = pose, dt > 0 {
+                let dRoll  = abs(cur.roll  - prev.roll)
+                let dPitch = abs(cur.pitch - prev.pitch)
+                let dYaw   = abs(cur.yaw   - prev.yaw)
+                let v = max(dRoll, dPitch, dYaw) / dt
+                if v > SafetyLimits.maxJointVelocityRadPerS {
+                    try? await robot.stopMove()
+                    await logBus.publish(.error(
+                        scope: "play_emotion.watchdog",
+                        message: "aborted \(name): joint velocity \(String(format: "%.2f", v)) rad/s exceeded ceiling \(SafetyLimits.maxJointVelocityRadPerS)",
+                        recoverable: true))
+                    return
+                }
+            }
+            prevPose = pose
+            prevTime = now
+            if let running = try? await robot.isMoveRunning(), !running {
+                return
+            }
+        }
+        try? await robot.stopMove()
+    }
+
     /// Stop face tracking from pushing target events into the streamer.
     /// Mirrored on `faceTrackingEnabled` so the menu bar and main
     /// window stay in lockstep regardless of which surface toggled it.
@@ -1290,9 +1382,11 @@ final class AppServices {
             }
         )
 
-        // Curated subset of the Pollen emotions library; full list pulled
-        // live by Status if needed. Keeping the schema enum here keeps the
-        // LLM honest about what's actually available.
+        // Full Pollen emotions library. The runtime guards
+        // (velocity clamp on `goto`, real-time velocity watchdog on
+        // recorded-move playback — see SafetyLimits + playRecordedEmotion)
+        // catch any motion that exceeds the safe-velocity ceiling, so we
+        // don't have to remove emotions from the menu to stay safe.
         let emotions: [String] = [
             "amazed1", "anxiety1", "attentive1", "boredom1", "calming1",
             "cheerful1", "come1", "confused1", "contempt1", "curious1",
@@ -1310,14 +1404,64 @@ final class AppServices {
             "understanding1", "welcoming1", "yes1", "yes_sad1",
         ]
 
-        _ = emotions  // kept for future reference; not used by `express`
+        // `play_emotion` plays a pre-baked recorded move from the
+        // Pollen emotions library (much richer than the 8 scripted
+        // gestures `express` has). Recorded moves include audio, so
+        // the description below is explicit that this is for *direct*
+        // user requests ("act scared", "do a happy dance") — not for
+        // reactive emoting between sentences. `express` remains the
+        // silent default for the latter.
+        await toolRegistry.register(
+            name: "play_emotion",
+            description: """
+            Play a pre-recorded full-body emotion from the Reachy emotions \
+            library (head + antennas + sound) AND have Rocky verbalise at \
+            the same time. Use when the user explicitly asks Rocky to \
+            perform / act / show / dance / play a specific emotion. The \
+            `text` Rocky speaks must follow Rocky's voice rules (telegraphic, \
+            third person, no -ing/-ed) and fit the emotion. For passive \
+            emotional reactions during normal conversation, use `express` \
+            instead.
+            """,
+            parameters: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "name": .object([
+                        "type": .string("string"),
+                        "enum": .array(emotions.map { .string($0) }),
+                        "description": .string("Emotion identifier from the library"),
+                    ]),
+                    "text": .object([
+                        "type": .string("string"),
+                        "description": .string(
+                            "What Rocky says while the move plays. Required."),
+                    ]),
+                ]),
+                "required": .array([.string("name"), .string("text")]),
+            ]),
+            handler: { [weak self] args in
+                guard let self,
+                      let name = args.asObject?["name"]?.asString,
+                      let text = args.asObject?["text"]?.asString,
+                      !text.isEmpty,
+                      emotions.contains(name)
+                else {
+                    return .object([
+                        "ok": .bool(false),
+                        "error": .string("missing or unknown args"),
+                    ])
+                }
+                try await self.speakAndMove(text: text) {
+                    try await self.playRecordedEmotion(name)
+                }
+                return .object(["ok": .bool(true), "name": .string(name)])
+            }
+        )
 
-        // The Pollen `play_emotion` tool was removed because it plays
-        // recorded moves with audio baked in, which fired during normal
-        // turns. `express` is its silent replacement: scripted head-pose
-        // sequences via `goto`, no audio, ~1–1.5 s each. Face tracking
-        // is suppressed for the duration so the streamer doesn't fight
-        // the playback.
+        // The custom `express` tool stays alongside `play_emotion`.
+        // It produces silent scripted head-pose sequences via `goto`,
+        // ~1–1.5 s each. Face tracking is suppressed for the duration
+        // so the streamer doesn't fight the playback.
         let exprNames: [String] = [
             "scared", "agree", "disagree", "excited",
             "sad", "curious", "look_around", "shy",
@@ -1325,9 +1469,12 @@ final class AppServices {
         await toolRegistry.register(
             name: "express",
             description: """
-            Make Rocky perform a short physical expression with the head only \
-            (no audio). Use when the user asks for a feeling/reaction or when \
-            it strengthens what Rocky is saying. Each gesture takes 1–1.5 s. \
+            Make Rocky perform a short physical expression (head only, no \
+            built-in audio) AND have Rocky verbalise at the same time. Use \
+            when the user asks for a feeling/reaction or when it strengthens \
+            what Rocky is saying. The `text` Rocky speaks must follow \
+            Rocky's voice rules (telegraphic, third person, no -ing/-ed) \
+            and fit the expression. Each gesture takes 1.5–3 s. \
             Available expressions: scared, agree, disagree, excited, sad, \
             curious, look_around, shy.
             """,
@@ -1339,18 +1486,28 @@ final class AppServices {
                         "enum": .array(exprNames.map { .string($0) }),
                         "description": .string("Expression to play"),
                     ]),
+                    "text": .object([
+                        "type": .string("string"),
+                        "description": .string(
+                            "What Rocky says while the expression plays. Required."),
+                    ]),
                 ]),
-                "required": .array([.string("name")]),
+                "required": .array([.string("name"), .string("text")]),
             ]),
             handler: { [weak self] args in
-                guard let name = args.asObject?["name"]?.asString,
+                guard let self,
+                      let name = args.asObject?["name"]?.asString,
+                      let text = args.asObject?["text"]?.asString,
+                      !text.isEmpty,
                       exprNames.contains(name) else {
                     return .object([
                         "ok": .bool(false),
-                        "error": .string("unknown expression"),
+                        "error": .string("missing or unknown args"),
                     ])
                 }
-                try await self?.playExpression(name)
+                try await self.speakAndMove(text: text) {
+                    try await self.playExpression(name)
+                }
                 return .object(["ok": .bool(true), "name": .string(name)])
             }
         )

@@ -65,6 +65,16 @@ public actor RobotLinkClient {
 
     /// `POST /api/move/goto` — smooth interpolated motion (wire schema:
     /// `GotoModelRequest`). Use for gestures ≥0.5 s, not for streaming control.
+    ///
+    /// **Velocity guard rail**: when a head pose is supplied, the
+    /// implied average velocity (`Δangle / duration`) is checked
+    /// against `SafetyLimits.maxJointVelocityRadPerS`. If the caller
+    /// asked for a duration that would exceed the ceiling, the
+    /// duration is *stretched* to the minimum that respects the cap.
+    /// Slow / normal gotos pass through unchanged. This protects the
+    /// hardware from a callsite that picks too short a duration for
+    /// a large delta — no slowdown for legitimate fast moves, only
+    /// unsafe ones.
     public func goto(
         headPose: RPYPose? = nil,
         antennas: Antennas? = nil,
@@ -79,16 +89,51 @@ public actor RobotLinkClient {
             let duration: Double
             let interpolation: String
         }
+        let safeDuration = try await safeGotoDuration(target: headPose,
+                                                       requested: durationS)
         let payload = Body(
             head_pose: headPose,
             antennas: antennas.map { [$0.right, $0.left] },
             body_yaw: bodyYaw,
-            duration: durationS,
+            duration: safeDuration,
             interpolation: interpolation.rawValue
         )
         let body = try JSONEncoder().encode(payload)
         let (data, status) = try await post(path: "/api/move/goto", body: body)
         try ensureOK(status: status, body: data)
+    }
+
+    /// Compute the safest duration for a goto: max(requested, minimum
+    /// implied by the velocity ceiling). When the requested duration
+    /// already keeps every joint under the cap, returns it unchanged.
+    /// When it doesn't, returns the minimum that does. Logs the
+    /// stretch so excessive callsites are visible in telemetry.
+    private func safeGotoDuration(target: RPYPose?,
+                                   requested: TimeInterval) async throws
+    -> TimeInterval {
+        guard let target else { return requested }
+        let current: RPYPose
+        do {
+            current = try await fullState().headPose
+        } catch {
+            // If state read fails, fall back to a conservative
+            // assumption: treat the move as if every axis travelled
+            // its full range. That over-stretches at most by a
+            // constant factor, which is the safer error.
+            let worstCase = SafetyLimits.headYawMax
+            let safe = worstCase / SafetyLimits.maxJointVelocityRadPerS
+            return max(requested, safe)
+        }
+        let minSafe = SafetyLimits.minGotoDuration(currentHead: current,
+                                                    targetHead: target)
+        if requested < minSafe {
+            await logBus.publish(.error(
+                scope: "goto.velocity_clamp",
+                message: "stretched \(String(format: "%.3f", requested))s → \(String(format: "%.3f", minSafe))s to keep ≤ \(SafetyLimits.maxJointVelocityRadPerS) rad/s",
+                recoverable: true))
+            return minSafe
+        }
+        return requested
     }
 
     /// Maps to the daemon's `InterpolationTechnique` enum.
@@ -100,6 +145,23 @@ public actor RobotLinkClient {
     public func stopMove() async throws {
         let (data, status) = try await post(path: "/api/move/stop", body: Data())
         try ensureOK(status: status, body: data)
+    }
+
+    /// `GET /api/move/running`. Per the wiki note: `is_move_running` is
+    /// not exposed in `state/full`; derive from this endpoint being
+    /// non-empty. Used by the emotion safety cap to detect when a
+    /// recorded move has finished.
+    public func isMoveRunning() async throws -> Bool {
+        let (data, status) = try await get(path: "/api/move/running")
+        try ensureOK(status: status, body: data)
+        if let list = try? JSONDecoder().decode([String].self, from: data) {
+            return !list.isEmpty
+        }
+        if let obj = try? JSONSerialization.jsonObject(with: data)
+                          as? [String: Any] {
+            return !obj.isEmpty
+        }
+        return false
     }
 
     /// Wake the bot gently. Single slow `minjerk` goto from the slumped
