@@ -2,9 +2,7 @@ import SwiftUI
 import Telemetry
 
 /// Tails the LogBus into an in-memory ring buffer (last N events) and
-/// renders a filterable, color-coded list. Surfaces the same events that
-/// power the dashboard cards, but flat — handy when something doesn't
-/// look right and you want to know why.
+/// renders a filterable, color-coded list. Same Card chrome as the rest.
 struct LogsView: View {
     @Environment(AppServices.self) private var services
     @State private var rows: [Row] = []
@@ -15,67 +13,29 @@ struct LogsView: View {
     private let capacity = 500
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Image(systemName: "doc.plaintext")
-                Text("Logs").font(.headline)
-                Spacer()
-                Pill(text: "\(filteredRows.count) / \(rows.count)", tint: .secondary)
-                Toggle(isOn: $paused) { Image(systemName: paused ? "play.fill" : "pause.fill") }
-                    .toggleStyle(.button)
-                    .controlSize(.small)
-                    .help(paused ? "Resume tail" : "Pause tail")
-                Button {
-                    rows.removeAll()
-                } label: {
-                    Image(systemName: "trash")
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                header
+                Card {
+                    CardHeader("Filters", icon: "line.3.horizontal.decrease")
+                } content: {
+                    filtersBar
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .help("Clear")
-            }
-
-            HStack(spacing: 6) {
-                ForEach(Category.allCases) { cat in
-                    Toggle(isOn: Binding(
-                        get: { showCategories.contains(cat) },
-                        set: { isOn in
-                            if isOn { showCategories.insert(cat) }
-                            else    { showCategories.remove(cat) }
-                        }
-                    )) {
-                        Text(cat.label).font(.caption)
+                Card {
+                    CardHeader("Stream", icon: "waveform") {
+                        StatusPill(text: "\(filteredRows.count) of \(rows.count)",
+                                   tint: .secondary)
                     }
-                    .toggleStyle(.button)
-                    .controlSize(.mini)
-                    .tint(cat.color)
-                }
-                Spacer()
-                TextField("filter", text: $filter)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 200)
-            }
-
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 1) {
-                        ForEach(filteredRows) { row in
-                            RowView(row: row).id(row.id)
-                        }
-                    }
-                    .padding(.vertical, 4)
-                }
-                .frame(maxHeight: .infinity)
-                .background(.black.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
-                .onChange(of: filteredRows.last?.id) { _, newId in
-                    guard !paused, let id = newId else { return }
-                    proxy.scrollTo(id, anchor: .bottom)
+                } content: {
+                    streamView
                 }
             }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 22)
+            .frame(maxWidth: 980, alignment: .topLeading)
+            .frame(maxWidth: .infinity)
         }
-        .padding(16)
         .task {
-            // Subscribe to the LogBus once, push events into the ring buffer.
             let bus = services.logBus
             for await event in await bus.subscribe() {
                 if paused { continue }
@@ -86,6 +46,96 @@ struct LogsView: View {
                         rows.removeFirst(rows.count - capacity)
                     }
                 }
+            }
+        }
+    }
+
+    private var header: some View {
+        HStack(alignment: .firstTextBaseline) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Logs")
+                    .font(.system(size: 28, weight: .bold, design: .rounded))
+                Text("Every event Rocky published, in arrival order.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button {
+                paused.toggle()
+            } label: {
+                Label(paused ? "Resume" : "Pause",
+                      systemImage: paused ? "play.fill" : "pause.fill")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            Button {
+                rows.removeAll()
+            } label: {
+                Label("Clear", systemImage: "trash")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+        }
+    }
+
+    private var filtersBar: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            FlowHStack(spacing: 8) {
+                ForEach(Category.allCases) { cat in
+                    let on = showCategories.contains(cat)
+                    Button {
+                        if on { showCategories.remove(cat) }
+                        else  { showCategories.insert(cat) }
+                    } label: {
+                        StatusPill(
+                            text: cat.label,
+                            tint: on ? cat.color : .secondary,
+                            systemImage: on ? "checkmark" : "circle"
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("filter", text: $filter)
+                    .textFieldStyle(.plain)
+                if !filter.isEmpty {
+                    Button { filter = "" } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(.gray.opacity(0.08))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(.gray.opacity(0.20), lineWidth: 1)
+            )
+        }
+    }
+
+    private var streamView: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 1) {
+                    ForEach(filteredRows) { row in
+                        RowView(row: row).id(row.id)
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+            .frame(maxHeight: 480)
+            .onChange(of: filteredRows.last?.id) { _, newId in
+                guard !paused, let id = newId else { return }
+                proxy.scrollTo(id, anchor: .bottom)
             }
         }
     }
@@ -102,7 +152,6 @@ struct LogsView: View {
 
     enum Category: Sendable, Hashable, Identifiable, CaseIterable {
         case motor, vision, voice, brain, sidecar, link, error
-
         var id: Self { self }
         var label: String {
             switch self {
@@ -200,7 +249,7 @@ struct LogsView: View {
                 return (.brain, "llm tool_call \(name) [\(id)]", args)
             case .toolInvocation(let name, let args, let result, let ms, _):
                 return (.brain,
-                        String(format: "tool %@ -> %dms", name, Int(ms)),
+                        String(format: "tool %@ → %dms", name, Int(ms)),
                         "args=\(args)\nresult=\(result)")
             case .sidecarLog(let sidecar, let level, let message, let fields):
                 let f = fields.isEmpty ? "" : "  " + fields
@@ -223,14 +272,16 @@ struct LogsView: View {
         let row: Row
 
         var body: some View {
-            HStack(alignment: .top, spacing: 8) {
+            HStack(alignment: .top, spacing: 10) {
                 Text(timeString)
                     .font(.caption2.monospaced())
                     .foregroundStyle(.secondary)
                     .frame(width: 70, alignment: .leading)
-                Pill(text: row.category.label, tint: row.category.color)
-                    .frame(width: 56)
-                VStack(alignment: .leading, spacing: 0) {
+                Rectangle()
+                    .fill(row.category.color)
+                    .frame(width: 3)
+                    .clipShape(Capsule())
+                VStack(alignment: .leading, spacing: 2) {
                     Text(row.summary).font(.caption.monospaced())
                     if !row.detail.isEmpty {
                         Text(row.detail)
@@ -241,8 +292,7 @@ struct LogsView: View {
                 }
                 Spacer(minLength: 0)
             }
-            .padding(.horizontal, 4)
-            .padding(.vertical, 1)
+            .padding(.horizontal, 6).padding(.vertical, 3)
         }
 
         private var timeString: String {
@@ -251,17 +301,50 @@ struct LogsView: View {
             return f.string(from: row.timestamp)
         }
     }
+}
 
-    private struct Pill: View {
-        let text: String
-        let tint: Color
-        var body: some View {
-            HStack(spacing: 3) {
-                Circle().fill(tint).frame(width: 5, height: 5)
-                Text(text).font(.caption2.weight(.medium))
+/// Tiny flow-layout helper: lays out children left-to-right and wraps when
+/// the row exceeds the available width.
+private struct FlowHStack: Layout {
+    var spacing: CGFloat = 8
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth = proposal.width ?? .infinity
+        var rowWidth: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        var totalHeight: CGFloat = 0
+        var totalWidth: CGFloat = 0
+        for v in subviews {
+            let s = v.sizeThatFits(.unspecified)
+            if rowWidth + s.width > maxWidth {
+                totalHeight += rowHeight + spacing
+                totalWidth = max(totalWidth, rowWidth)
+                rowWidth = 0
+                rowHeight = 0
             }
-            .padding(.horizontal, 5).padding(.vertical, 2)
-            .background(.ultraThinMaterial, in: Capsule())
+            rowWidth += s.width + spacing
+            rowHeight = max(rowHeight, s.height)
+        }
+        totalHeight += rowHeight
+        totalWidth = max(totalWidth, rowWidth)
+        return CGSize(width: totalWidth, height: totalHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize,
+                       subviews: Subviews, cache: inout ()) {
+        var x: CGFloat = bounds.minX
+        var y: CGFloat = bounds.minY
+        var rowHeight: CGFloat = 0
+        for v in subviews {
+            let s = v.sizeThatFits(.unspecified)
+            if x + s.width > bounds.maxX {
+                y += rowHeight + spacing
+                x = bounds.minX
+                rowHeight = 0
+            }
+            v.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(s))
+            x += s.width + spacing
+            rowHeight = max(rowHeight, s.height)
         }
     }
 }

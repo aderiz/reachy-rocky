@@ -4,86 +4,186 @@ import SidecarHost
 import Speech
 
 /// Single-glance health panel. Lists every dependency Rocky needs and what's
-/// wrong (if anything). Doubles as the "onboarding checklist" — each row has
-/// an action that re-runs its check or kicks off recovery.
+/// wrong (if anything). Each row uses the unified Card chrome.
 struct StatusView: View {
     @Environment(AppServices.self) private var services
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Status")
-                    .font(.title2.weight(.semibold))
-                Text("Everything Rocky depends on, in one place.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .padding(.bottom, 4)
+            VStack(alignment: .leading, spacing: 18) {
+                header
 
-                rows
+                groupCard(title: "Connections") {
+                    row(title: "Robot daemon",
+                        subtitle: robotDetail,
+                        state: robotState,
+                        icon: "antenna.radiowaves.left.and.right") {
+                        Button("Probe") {
+                            Task { await services.probeRobotPublic() }
+                        }
+                        .controlSize(.small)
+                    }
+                    Divider().opacity(0.06)
+                    row(title: "LM Studio",
+                        subtitle: llmDetail,
+                        state: llmState,
+                        icon: "brain") {
+                        Button("Probe") {
+                            Task { await services.probeLMStudioPublic() }
+                        }
+                        .controlSize(.small)
+                    }
+                }
+
+                groupCard(title: "Audio") {
+                    row(title: "Microphone",
+                        subtitle: micDetail,
+                        state: micState,
+                        icon: services.micEnabled ? "mic.fill" : "mic.slash") {
+                        Button(services.micEnabled ? "Disable" : "Enable") {
+                            Task { await services.toggleMic() }
+                        }
+                        .controlSize(.small)
+                    }
+                    Divider().opacity(0.06)
+                    row(title: "Speech recognition",
+                        subtitle: sttDetail,
+                        state: sttState,
+                        icon: "waveform.badge.mic") {
+                        Button("Authorize") {
+                            Task { _ = await services.appleSTT.requestAuthorization() }
+                        }
+                        .controlSize(.small)
+                    }
+                }
+
+                groupCard(title: "Sidecars") {
+                    row(title: "Face tracker",
+                        subtitle: faceTrackerDetail,
+                        state: sidecarState(services.faceTrackerSidecarState),
+                        icon: "eye") { EmptyView() }
+                    Divider().opacity(0.06)
+                    row(title: "TTS",
+                        subtitle: ttsDetail,
+                        state: sidecarState(services.ttsSidecarState),
+                        icon: "speaker.wave.2") { EmptyView() }
+                }
             }
-            .padding(20)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 22)
+            .frame(maxWidth: 980, alignment: .topLeading)
+            .frame(maxWidth: .infinity)
         }
     }
 
+    // MARK: - Header
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Status")
+                .font(.system(size: 28, weight: .bold, design: .rounded))
+            HStack(spacing: 10) {
+                Text(summaryText).foregroundStyle(.secondary)
+                StatusPill(text: "\(healthyCount) / \(totalCount) healthy",
+                           tint: healthyCount == totalCount ? .green : .orange,
+                           systemImage: healthyCount == totalCount ? "checkmark.circle.fill" : "exclamationmark.circle")
+            }
+            .font(.subheadline)
+        }
+    }
+
+    private var summaryText: String {
+        if healthyCount == totalCount { return "Everything Rocky needs is online." }
+        return "Some pieces need attention."
+    }
+
+    private var totalCount: Int { 6 }
+
+    private var healthyCount: Int {
+        var n = 0
+        if robotState == .ok { n += 1 }
+        if llmState == .ok { n += 1 }
+        if micState == .ok { n += 1 }
+        if sttState == .ok { n += 1 }
+        if sidecarState(services.faceTrackerSidecarState) == .ok { n += 1 }
+        if sidecarState(services.ttsSidecarState) == .ok { n += 1 }
+        return n
+    }
+
+    // MARK: - Group card
+
     @ViewBuilder
-    private var rows: some View {
-        VStack(spacing: 8) {
-            row(
-                title: "Robot daemon",
-                detail: robotDetail,
-                state: robotState
-            ) {
-                Button("Probe") { Task { await services.probeRobotPublic() } }
+    private func groupCard<Content: View>(
+        title: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        Card {
+            CardHeader(title, icon: groupIcon(for: title))
+        } content: {
+            VStack(spacing: 0) { content() }
+                .padding(.horizontal, -8)
+                .padding(.vertical, -4)
+        }
+    }
+
+    private func groupIcon(for title: String) -> String {
+        switch title {
+        case "Connections":  return "link"
+        case "Audio":        return "ear"
+        case "Sidecars":     return "shippingbox"
+        default:             return "checkmark.shield"
+        }
+    }
+
+    // MARK: - Row
+
+    @ViewBuilder
+    private func row<Trailing: View>(
+        title: String,
+        subtitle: String,
+        state: RowState,
+        icon: String,
+        @ViewBuilder trailing: () -> Trailing
+    ) -> some View {
+        HStack(spacing: 14) {
+            ZStack {
+                Circle()
+                    .fill(state.color.opacity(0.14))
+                    .frame(width: 32, height: 32)
+                Image(systemName: icon)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(state.color)
             }
-            row(
-                title: "LM Studio",
-                detail: llmDetail,
-                state: llmState
-            ) {
-                Button("Probe") { Task { await services.probeLMStudioPublic() } }
-            }
-            row(
-                title: "Microphone",
-                detail: micDetail,
-                state: micState
-            ) {
-                if !services.micEnabled {
-                    Button("Enable") { Task { await services.toggleMic() } }
-                } else {
-                    Button("Disable") { Task { await services.toggleMic() } }
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 8) {
+                    Text(title).font(.body.weight(.semibold))
+                    statePill(state: state)
                 }
+                Text(subtitle)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
-            row(
-                title: "Speech recognition",
-                detail: sttDetail,
-                state: sttState
-            ) {
-                Button("Authorize") {
-                    Task {
-                        _ = await services.appleSTT.requestAuthorization()
-                    }
-                }
-            }
-            row(
-                title: "Face tracker (sidecar)",
-                detail: faceTrackerDetail,
-                state: sidecarState(services.faceTrackerSidecarState)
-            ) {
-                EmptyView()
-            }
-            row(
-                title: "TTS (sidecar)",
-                detail: ttsDetail,
-                state: sidecarState(services.ttsSidecarState)
-            ) {
-                EmptyView()
-            }
+            Spacer()
+            trailing()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+    }
+
+    @ViewBuilder
+    private func statePill(state: RowState) -> some View {
+        switch state {
+        case .ok:      StatusPill(text: "ok",        tint: .green,    systemImage: "checkmark")
+        case .warn:    StatusPill(text: "warning",   tint: .orange,   systemImage: "exclamationmark")
+        case .bad:     StatusPill(text: "down",      tint: .red,      systemImage: "xmark")
+        case .unknown: StatusPill(text: "—",         tint: .secondary)
         }
     }
 
     // MARK: - Per-row state classification
 
-    private enum RowState {
+    private enum RowState: Equatable {
         case ok, warn, bad, unknown
         var color: Color {
             switch self {
@@ -102,17 +202,13 @@ struct StatusView: View {
         case .unknown: .unknown
         }
     }
-
     private var robotDetail: String {
         switch services.daemonReachability {
         case .online:
             let endpoint = services.robotEndpoint
-            let frames = services.stateUpdateCount
-            return "\(endpoint.host):\(endpoint.port) · \(frames) frames"
-        case .offline(let reason):
-            return reason
-        case .unknown:
-            return "checking…"
+            return "\(endpoint.host):\(endpoint.port) · \(services.stateUpdateCount) state frames"
+        case .offline(let reason): return reason
+        case .unknown:             return "checking…"
         }
     }
 
@@ -123,38 +219,30 @@ struct StatusView: View {
         case .unknown: .unknown
         }
     }
-
     private var llmDetail: String {
         switch services.llmStatus {
-        case .online(let model): return "model: \(model)"
+        case .online(let model):  return "model: \(model)"
         case .offline(let reason): return reason
-        case .unknown:           return "checking…"
+        case .unknown:             return "checking…"
         }
     }
 
-    private var micState: RowState {
-        services.micEnabled ? .ok : .unknown
-    }
-
+    private var micState: RowState { services.micEnabled ? .ok : .unknown }
     private var micDetail: String {
-        if services.micEnabled {
-            return String(format: "live · RMS %.3f", services.lastMicRMS)
-        }
-        return "not listening"
+        services.micEnabled
+            ? String(format: "live · RMS %.3f", services.lastMicRMS)
+            : "not listening"
     }
 
     private var sttState: RowState {
         switch services.sttBackendName {
-        case "Apple Speech": .ok
+        case let n where n.contains("Apple Speech"): .ok
         case "unauthorized": .warn
         case "unavailable":  .bad
         default:             .unknown
         }
     }
-
-    private var sttDetail: String {
-        services.sttBackendName
-    }
+    private var sttDetail: String { services.sttBackendName }
 
     private func sidecarState(_ s: SidecarState) -> RowState {
         switch s {
@@ -168,54 +256,27 @@ struct StatusView: View {
 
     private var faceTrackerDetail: String {
         let s = services.faceTrackerSidecarState
-        let extra = "\(services.faceTargetCount) targets, \(services.faceDetectionCount) detections"
+        let extra = "\(services.faceTargetCount) targets · \(services.faceDetectionCount) detections"
         switch s {
-        case .stopped:                 return "stopped · " + extra
+        case .stopped:                 return "stopped"
         case .starting:                return "starting…"
         case .ready:                   return "ready · " + extra
         case .failing(let reason):     return "failing · \(reason)"
         case .circuitOpen(let until):
             let s = max(0, Int(until.timeIntervalSinceNow))
-            return "circuit open · \(s)s cooldown"
+            return "cooldown · \(s)s"
         }
     }
 
     private var ttsDetail: String {
         switch services.ttsSidecarState {
-        case .stopped:    return "stopped"
-        case .starting:   return "starting…"
-        case .ready:      return "ready"
-        case .failing(let reason): return "failing · \(reason)"
+        case .stopped:                 return "stopped"
+        case .starting:                return "starting…"
+        case .ready:                   return "ready"
+        case .failing(let reason):     return "failing · \(reason)"
         case .circuitOpen(let until):
             let s = max(0, Int(until.timeIntervalSinceNow))
-            return "circuit open · \(s)s cooldown"
+            return "cooldown · \(s)s"
         }
-    }
-
-    // MARK: - Layout
-
-    @ViewBuilder
-    private func row(
-        title: String,
-        detail: String,
-        state: RowState,
-        @ViewBuilder action: () -> some View
-    ) -> some View {
-        HStack(spacing: 12) {
-            Circle()
-                .fill(state.color)
-                .frame(width: 10, height: 10)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(title).font(.callout.weight(.semibold))
-                Text(detail).font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            Spacer()
-            action()
-                .controlSize(.small)
-        }
-        .padding(12)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
     }
 }
