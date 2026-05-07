@@ -128,6 +128,13 @@ final class AppServices {
     /// Manual UI mutes (separate from sidecar/permission errors).
     var ttsMuted: Bool = false
 
+    /// Effective TTS-mute state honoured by speak callsites: the user-
+    /// controlled `ttsMuted` toggle OR the time-bounded quiet-mode
+    /// (`dndUntil`). Use this in any callsite that asks "should we
+    /// speak right now?" so the menu-bar's pause-for-X actually
+    /// silences Rocky's voice as well as cutting off dispatch.
+    var effectiveTTSMuted: Bool { ttsMuted || isDoNotDisturb }
+
     /// Whether the on-Mac face tracker is allowed to push targets to the
     /// streamer. Driven by `setFaceTrackingEnabled` so menu bar and any
     /// future dashboard control read the same source of truth.
@@ -150,6 +157,12 @@ final class AppServices {
     /// (the Activity tab, the cockpit margin strip, the menu-bar
     /// popover) re-render at moment cadence rather than firehose.
     var recentMoments: [Moment] = []
+
+    /// Whether the ⌘K command palette sheet is currently open. Lives
+    /// here (rather than in RootView's `@State`) so both the keyboard
+    /// shortcut handler in the cockpit AND the Edit-menu command can
+    /// toggle the same flag.
+    var commandPaletteOpen: Bool = false
 
     /// Quiet mode. When set to a future date, Rocky stops dispatching
     /// the wake-word pipeline (mic stays warm but user utterances aren't
@@ -990,6 +1003,25 @@ final class AppServices {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
+        // Quiet-mode gate. The menu-bar's "Pause Rocky for X" sets
+        // `dndUntil`; while it's in the future, we drop user dispatches
+        // so Rocky genuinely stops responding (rather than just going
+        // silent on the speaker side). Still surface the message in
+        // brainTurns so the user can see Rocky heard them but
+        // intentionally didn't reply.
+        if isDoNotDisturb {
+            await MainActor.run {
+                self.brainTurns.append(.init(role: "user", content: trimmed))
+                let mins = max(1, Int((self.dndUntil?
+                    .timeIntervalSinceNow ?? 0) / 60))
+                self.brainTurns.append(.init(
+                    role: "assistant",
+                    content: "(quiet for \(mins) more min — won't reply until then)"
+                ))
+            }
+            return
+        }
+
         // Probe LM Studio if we don't yet know it's online.
         if case .unknown = llmStatus { await probeLMStudio() }
         if case .offline(let reason) = llmStatus {
@@ -1254,7 +1286,7 @@ final class AppServices {
     func speakAndMove(text: String,
                       _ motion: @Sendable @escaping () async throws -> Void)
     async throws {
-        let muted = await MainActor.run { self.ttsMuted }
+        let muted = await MainActor.run { self.effectiveTTSMuted }
         async let move: () = motion()
         async let speech: RobotTTS.SpeakStats? = muted
             ? nil
@@ -1779,8 +1811,9 @@ final class AppServices {
                     return .object(["ok": .bool(false),
                                     "error": .string("empty text")])
                 }
-                if await MainActor.run(body: { self?.ttsMuted ?? false }) {
-                    return .object(["ok": .bool(false), "error": .string("tts muted")])
+                if await MainActor.run(body: { self?.effectiveTTSMuted ?? false }) {
+                    return .object(["ok": .bool(false),
+                                    "error": .string("tts muted (or quiet mode)")])
                 }
                 let stats = try await tts.speak(text)
                 // Drive the "speaking" hero state: report busy through the
@@ -2087,7 +2120,7 @@ final class AppServices {
         // Don't greet from a sleeping or muted/busy state — Rocky should
         // be present and able to speak.
         guard rockyState.isAwake else { return }
-        if ttsMuted { return }
+        if effectiveTTSMuted { return }
         if brainBusy { return }
         if let until = ttsBusyUntil, now < until { return }
 

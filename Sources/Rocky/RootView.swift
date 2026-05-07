@@ -19,7 +19,8 @@ struct RootView: View {
     @State private var inspectorPresented: Bool = false
 
     var body: some View {
-        CockpitView()
+        @Bindable var bindable = services
+        return CockpitView()
             .navigationTitle("Rocky")
             .toolbar { toolbarContent }
             .inspector(isPresented: $inspectorPresented) {
@@ -40,6 +41,7 @@ struct RootView: View {
             }
             .animation(.easeInOut(duration: 0.25),
                        value: services.settings.firstRunCompleted)
+            .sheet(isPresented: $bindable.commandPaletteOpen) { CommandPalette() }
     }
 
     @ToolbarContentBuilder

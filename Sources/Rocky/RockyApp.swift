@@ -59,6 +59,21 @@ struct RockyApp: App {
                         .makeKeyAndOrderFront(nil)
                 }
             }
+            // Surface the command palette in the Edit menu (after
+            // Find) so users discover ⌘K via the menu bar without
+            // needing the design doc to find it. Both the menu item
+            // and the keyboard shortcut flip the same observable on
+            // AppServices, which the cockpit window subscribes to via
+            // a binding-driven .sheet.
+            CommandGroup(after: .textEditing) {
+                Button("Command Palette…") {
+                    NSApp.activate(ignoringOtherApps: true)
+                    NSApp.windows.first(where: { $0.title == "Rocky" })?
+                        .makeKeyAndOrderFront(nil)
+                    services.commandPaletteOpen = true
+                }
+                .keyboardShortcut("k", modifiers: [.command])
+            }
         }
 
         // Per the cockpit design (`docs/concepts/cockpit-design.md`),
