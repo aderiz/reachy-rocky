@@ -90,16 +90,15 @@ struct MenuBarStatusView: View {
         }
     }
 
-    // MARK: - Recent moments (placeholder)
+    // MARK: - Recent moments
 
     private var recentMomentsBlock: some View {
         VStack(alignment: .leading, spacing: 4) {
             sectionLabel("Recent")
-            // Placeholder: until Wave 4's MomentFeed lands, surface the
-            // last 3 brain turns formatted moment-style. Errors and
-            // sidecar transitions will join the list once we have the
-            // coalescing actor.
-            let recent = Array(services.brainTurns.suffix(3))
+            // Real moments from MomentFeed — last 3 in reverse-chrono.
+            // The Inspector / Activity tab shows the full list with
+            // filters and source detail.
+            let recent = Array(services.recentMoments.suffix(3).reversed())
             if recent.isEmpty {
                 Text("All quiet.")
                     .font(.callout)
@@ -107,17 +106,13 @@ struct MenuBarStatusView: View {
                     .padding(.horizontal, 14)
                     .padding(.bottom, 6)
             } else {
-                ForEach(recent) { turn in
+                ForEach(recent) { moment in
                     HStack(alignment: .top, spacing: 8) {
-                        Image(systemName: turn.role == "assistant" ? "brain"
-                                          : (turn.role == "tool" ? "wrench.and.screwdriver"
-                                                                  : "person.fill"))
+                        Image(systemName: moment.symbolName)
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
                             .frame(width: 16, alignment: .center)
-                        Text(turn.role == "assistant" ? "Rocky said: \(turn.content)"
-                             : (turn.role == "tool"   ? "Rocky used \(turn.content)"
-                                                       : "You: \(turn.content)"))
+                        Text(moment.sentence)
                             .font(.callout)
                             .foregroundStyle(.primary)
                             .lineLimit(1)

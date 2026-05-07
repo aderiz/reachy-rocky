@@ -43,6 +43,10 @@ final class AppServices {
     let toolRegistry: ToolRegistry
     let cognition: CognitionEngine
     let memory: MemoryService
+    /// Coalesces telemetry events into narrative moments at human
+    /// cadence. Drives the cockpit's margin strip, the menu-bar
+    /// popover's "Recent" section, and the Inspector's Activity tab.
+    let momentFeed: MomentFeed
 
     /// Most recent reachability check for the daemon.
     var daemonReachability: Reachability = .unknown
@@ -139,6 +143,13 @@ final class AppServices {
     /// `refreshMemoryCount()`. `-1` means "haven't asked yet" so the
     /// UI can show a neutral placeholder rather than a misleading 0.
     var memoryDrawerCount: Int = -1
+
+    /// Recent narrative moments — the human-cadence successor to
+    /// `LogsView`. Mirror of the most recent slice of `MomentFeed`'s
+    /// ring buffer, re-published on each new moment so SwiftUI views
+    /// (the Activity tab, the cockpit margin strip, the menu-bar
+    /// popover) re-render at moment cadence rather than firehose.
+    var recentMoments: [Moment] = []
 
     /// Quiet mode. When set to a future date, Rocky stops dispatching
     /// the wake-word pipeline (mic stays warm but user utterances aren't
@@ -466,6 +477,10 @@ final class AppServices {
         )
         self.memory = MemoryService(sidecar: memoryRuntime, logBus: bus)
 
+        // MomentFeed — coalesces telemetry into narrative moments at
+        // human cadence. Subscription is wired in start().
+        self.momentFeed = MomentFeed()
+
         // Cognition: LM Studio client + tool registry + memory.
         self.llm = LMStudioClient(config: settings.lmStudioConfig(), logBus: bus)
         self.toolRegistry = ToolRegistry(logBus: bus)
@@ -503,6 +518,30 @@ final class AppServices {
             await logBus.publish(.error(scope: "app/memory",
                                         message: "\(error) — run Sidecars/mempalace/setup.sh",
                                         recoverable: true))
+        }
+
+        // Pump LogBus events into MomentFeed and mirror new moments
+        // back into the @Observable `recentMoments` slice for SwiftUI.
+        // The two pumps run on detached Tasks so they survive any
+        // restart of `start()`.
+        let bus = self.logBus
+        let feed = self.momentFeed
+        Task { [weak self] in
+            for await event in await bus.subscribe() {
+                await feed.ingest(event)
+                if Task.isCancelled { break }
+                _ = self  // keep the closure capturing self for the
+                          // weak guard above
+            }
+        }
+        let momentsStream = await momentFeed.subscribe()
+        Task { [weak self] in
+            for await _ in momentsStream {
+                guard let self else { return }
+                let snapshot = await feed.recent(limit: 50)
+                await MainActor.run { self.recentMoments = snapshot }
+                if Task.isCancelled { break }
+            }
         }
 
         // Mac-side face tracker is the source of truth for set_target now;

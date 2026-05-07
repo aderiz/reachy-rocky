@@ -80,31 +80,11 @@ struct InspectorView: View {
     private var content: some View {
         switch selection {
         case .health:   StatusView()
-        case .activity: ActivityTabPlaceholder()
+        case .activity: ActivityTab()
         case .memory:   MemoryTabPlaceholder()
         case .motion:   MotionCard()
         case .vision:   VisionCard()
         case .raw:      LogsView()
-        }
-    }
-}
-
-/// Activity tab placeholder. Wave 4 replaces with a real moment-feed
-/// view subscribed to the `MomentFeed` actor. Until then we point at
-/// the firehose so the user has something to look at.
-private struct ActivityTabPlaceholder: View {
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Label("Activity at human cadence",
-                  systemImage: "list.bullet.rectangle")
-                .font(.headline)
-            Text("Wave 4 ships the moment-feed actor. For now this tab " +
-                 "points at the raw event stream — see the Raw tab " +
-                 "for filters / pause / categories.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            Divider()
-            LogsView()
         }
     }
 }

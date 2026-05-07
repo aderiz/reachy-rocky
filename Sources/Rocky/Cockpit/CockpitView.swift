@@ -31,6 +31,10 @@ struct CockpitView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             Divider().opacity(0.10)
+            // The moment-feed strip — the cockpit's quiet margin.
+            // Always shows the latest moment; hover expands to four.
+            MomentStrip()
+            Divider().opacity(0.10)
             footer
                 .padding(.horizontal, 24)
                 .padding(.vertical, 10)
