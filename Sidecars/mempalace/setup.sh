@@ -33,7 +33,9 @@ uv pip install --python "$VENV/bin/python" --editable .
 if [[ ! -f "$PALACE/mempalace.yaml" ]]; then
     mkdir -p "$PALACE"
     echo "Initialising palace at $PALACE..."
-    "$VENV/bin/mempalace" init "$PALACE" --no-mine || {
+    # --yes: auto-accept entities (non-interactive)
+    # --no-llm: heuristics-only init, no Ollama / cloud provider needed
+    "$VENV/bin/mempalace" init "$PALACE" --yes --no-llm || {
         echo "warn: mempalace init returned non-zero; will retry from runner.py" >&2
     }
 fi

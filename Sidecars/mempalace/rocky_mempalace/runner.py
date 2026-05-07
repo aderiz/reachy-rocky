@@ -19,10 +19,17 @@ Storage details:
   to "rocky" / "conversation" if unset.
 - All drawers go into the same wing+room; mempalace handles dedup
   internally based on content hash.
-- mempalace's `mcp_server` module redirects sys.stdout to sys.stderr at
-  import time (it expects to OWN stdout for its own JSON-RPC). We
-  capture the real stdout BEFORE that import and use it for our own
-  wire output, so the two layers don't collide.
+
+Stdout protection:
+- mempalace.mcp_server does `os.dup2(2, 1)` at module-load time — an
+  fd-level redirect that points fd 1 (stdout) at fd 2 (stderr) so any
+  print() inside mempalace lands on stderr. That breaks our line-JSON
+  contract because our wire writes also use fd 1.
+- We save the original stdout fd via `os.dup(1)` BEFORE importing
+  mempalace, then write our envelopes directly to that saved fd via
+  `os.write`. This bypasses both `sys.stdout` rebinding AND fd-level
+  dup2, keeping our wire clean while mempalace's chatter still goes
+  to stderr.
 """
 
 from __future__ import annotations
@@ -37,17 +44,26 @@ from pathlib import Path
 from typing import Any
 
 
-# --- preserve stdout BEFORE mempalace imports steal it -------------------
+# --- preserve real stdout fd BEFORE mempalace's dup2(2, 1) ---------------
 
-_REAL_STDOUT = sys.stdout
+try:
+    _REAL_STDOUT_FD = os.dup(1)
+except OSError:
+    _REAL_STDOUT_FD = 1  # fallback; emits will still go somewhere
 _io_lock = threading.Lock()
 
 
 def emit(obj: dict[str, Any]) -> None:
-    line = json.dumps(obj)
+    line = (json.dumps(obj) + "\n").encode("utf-8")
     with _io_lock:
-        _REAL_STDOUT.write(line + "\n")
-        _REAL_STDOUT.flush()
+        try:
+            os.write(_REAL_STDOUT_FD, line)
+        except OSError:
+            # If the saved fd somehow got closed (shouldn't happen during
+            # normal lifetime), fall back to whatever sys.stdout points at
+            # so we at least don't crash.
+            sys.stderr.write(line.decode("utf-8"))
+            sys.stderr.flush()
 
 
 def log(level: str, msg: str, **fields: Any) -> None:
@@ -91,7 +107,8 @@ def ensure_palace_initialised() -> None:
     Path(PALACE_PATH).mkdir(parents=True, exist_ok=True)
     log("info", "initialising palace", path=PALACE_PATH)
     # Use the same python / mempalace as we're running under.
-    cmd = [sys.executable, "-m", "mempalace", "init", PALACE_PATH, "--no-mine"]
+    cmd = [sys.executable, "-m", "mempalace", "init", PALACE_PATH,
+           "--yes", "--no-llm"]
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=120)
     except subprocess.CalledProcessError as exc:
