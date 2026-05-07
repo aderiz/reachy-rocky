@@ -25,17 +25,34 @@ public actor FaceLibrary {
         public var pronunciation: String
         public var samplesB64: [String]
         public var dateEnrolled: Date
+        /// Marks this person as the face Rocky should preferentially
+        /// orient toward when multiple faces are in view. At most one
+        /// person is primary at any time. Decoded as `false` for older
+        /// libraries that didn't have the field.
+        public var isPrimary: Bool
 
         public init(id: UUID = UUID(),
                     name: String,
                     pronunciation: String = "",
                     samplesB64: [String] = [],
-                    dateEnrolled: Date = Date()) {
+                    dateEnrolled: Date = Date(),
+                    isPrimary: Bool = false) {
             self.id = id
             self.name = name
             self.pronunciation = pronunciation
             self.samplesB64 = samplesB64
             self.dateEnrolled = dateEnrolled
+            self.isPrimary = isPrimary
+        }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.id = try c.decode(UUID.self, forKey: .id)
+            self.name = try c.decode(String.self, forKey: .name)
+            self.pronunciation = try c.decodeIfPresent(String.self, forKey: .pronunciation) ?? ""
+            self.samplesB64 = try c.decodeIfPresent([String].self, forKey: .samplesB64) ?? []
+            self.dateEnrolled = try c.decodeIfPresent(Date.self, forKey: .dateEnrolled) ?? Date()
+            self.isPrimary = try c.decodeIfPresent(Bool.self, forKey: .isPrimary) ?? false
         }
 
         /// What the TTS should pronounce — pronunciation field, or name as
@@ -155,6 +172,20 @@ public actor FaceLibrary {
         await saveToDisk()
     }
 
+    /// Mark a person as primary (the face Rocky preferentially tracks).
+    /// Pass `nil` to clear. Mutually exclusive: only one person can be
+    /// primary at a time.
+    public func setPrimary(id: UUID?) async {
+        for i in people.indices {
+            people[i].isPrimary = (people[i].id == id)
+        }
+        await saveToDisk()
+    }
+
+    public func primaryName() -> String? {
+        people.first(where: { $0.isPrimary })?.name
+    }
+
     /// Enroll a new person from one or more photo JPEG blobs. We detect
     /// the largest face in each photo, crop with a 30% margin, encode the
     /// crop as JPEG, and stash both the JPEG (for re-load) and the
@@ -213,10 +244,10 @@ public actor FaceLibrary {
         try? await Vision.GenerateImageFeaturePrintRequest().perform(on: cgImage)
     }
 
-    /// Identify the person whose enrolled samples most resemble the given
-    /// feature print. Returns the closest match within `acceptThreshold`,
-    /// or nil if no enrolled face is close enough.
-    public func identify(_ observation: Vision.FeaturePrintObservation) -> Match? {
+    /// Closest enrolled person to the given feature print, regardless of
+    /// the accept threshold. Used by the UI to surface live distances so
+    /// the user can tune the threshold by watching the actual numbers.
+    public func closestMatch(_ observation: Vision.FeaturePrintObservation) -> Match? {
         var best: (Person, Double)?
         for person in people {
             guard let ps = prints[person.id], !ps.isEmpty else { continue }
@@ -231,8 +262,16 @@ public actor FaceLibrary {
                 best = (person, minD)
             }
         }
-        guard let b = best, b.1 <= acceptThreshold else { return nil }
+        guard let b = best else { return nil }
         return Match(person: b.0, distance: b.1)
+    }
+
+    /// Identify the person whose enrolled samples most resemble the given
+    /// feature print, gated by the current accept threshold.
+    public func identify(_ observation: Vision.FeaturePrintObservation) -> Match? {
+        guard let m = closestMatch(observation), m.distance <= acceptThreshold
+        else { return nil }
+        return m
     }
 
     // MARK: - Helpers

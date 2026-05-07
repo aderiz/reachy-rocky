@@ -22,11 +22,18 @@ public actor FaceTrackerService {
         /// unknown faces.
         public let identity: String?
         public let identityDistance: Double?
+        /// Closest enrolled name + distance regardless of threshold,
+        /// surfaced so the user can see what the live distance is and
+        /// tune the threshold visibly from Settings.
+        public let closestName: String?
+        public let closestDistance: Double?
 
         public init(bbox: CGRect, confidence: Double, promptId: String,
                     frameWidth: Int, frameHeight: Int,
                     identity: String? = nil,
-                    identityDistance: Double? = nil) {
+                    identityDistance: Double? = nil,
+                    closestName: String? = nil,
+                    closestDistance: Double? = nil) {
             self.bbox = bbox
             self.confidence = confidence
             self.promptId = promptId
@@ -34,6 +41,8 @@ public actor FaceTrackerService {
             self.frameHeight = frameHeight
             self.identity = identity
             self.identityDistance = identityDistance
+            self.closestName = closestName
+            self.closestDistance = closestDistance
         }
     }
 

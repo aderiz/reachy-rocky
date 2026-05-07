@@ -75,6 +75,11 @@ public actor VoiceCoordinator {
 
     public func start() {
         guard pumpTask == nil else { return }
+        // Clean state at the start of every listen session — no leftover
+        // audio from a previous session, no stale VAD speech-mode latch.
+        pendingSegment.removeAll(keepingCapacity: true)
+        segmentStart = nil
+        vad.reset()
         pumpTask = Task { [weak self] in
             await self?.pumpLoop()
         }
@@ -83,6 +88,11 @@ public actor VoiceCoordinator {
     public func stop() {
         pumpTask?.cancel()
         pumpTask = nil
+        // Drop any half-captured segment so the next start() doesn't
+        // resume with stale audio prepended to fresh frames.
+        pendingSegment.removeAll(keepingCapacity: true)
+        segmentStart = nil
+        vad.reset()
     }
 
     public func setSTT(_ engine: STTEngine) {

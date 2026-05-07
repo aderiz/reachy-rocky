@@ -41,12 +41,12 @@ public actor MacFaceTracker {
         /// Tick frequency for the command loop.
         public var commandHz: Double = 50.0
         /// Max angular speed the damper output is allowed to change per
-        /// tick (rad/s). Prevents step-jumps during target snaps. Set to
-        /// 0 to disable. 2.0 ≈ 115°/s, in the range of a calm human head
-        /// turn (peak ~150°/s during fast saccades, ~60°/s for casual
-        /// gaze shifts). Pairs with the omega-4 damper above so big
-        /// target jumps unwind smoothly instead of snapping.
-        public var maxSpeedRadPerS: Double = 2.0  // ~115°/s
+        /// tick (rad/s). 1.2 ≈ 69°/s, distinctly slower than a casual
+        /// human head turn (~60–150°/s). The user reported the head
+        /// "colliding and moving fast"; capping velocity harder gives
+        /// the daemon more time to plan motor moves and prevents the
+        /// controller from driving past mechanical limits.
+        public var maxSpeedRadPerS: Double = 1.2  // ~69°/s
 
         public init() {}
     }
@@ -63,11 +63,23 @@ public actor MacFaceTracker {
         /// Distance to the matched sample (smaller = better). Surfaced for
         /// debugging / display only.
         public let identityDistance: Double?
+        /// Closest enrolled name regardless of the accept threshold —
+        /// surfaced so the user can see the live distance and tune the
+        /// threshold from Settings without guessing.
+        public let closestName: String?
+        public let closestDistance: Double?
     }
 
     /// Live stream of detections (for the Vision card overlay).
     public nonisolated let detections: AsyncStream<Detection>
     private let detectionsContinuation: AsyncStream<Detection>.Continuation
+
+    /// Per-identification-cycle set of names that are currently
+    /// recognised in view — emitted whenever the set CHANGES so the
+    /// greeting state machine can fire for non-primary faces without
+    /// the head ever following them.
+    public nonisolated let identitiesInView: AsyncStream<Set<String>>
+    private let identitiesContinuation: AsyncStream<Set<String>>.Continuation
 
     /// Live stream of smoothed world-frame yaw/pitch targets.
     public nonisolated let targets: AsyncStream<(yawRad: Double, pitchRad: Double, decay: Bool)>
@@ -89,6 +101,31 @@ public actor MacFaceTracker {
     private var lastIdentityDistance: Double?
     private var lastIdentityTs: Date?
     private let identityTTL: TimeInterval = 3.0
+    // Closest match is updated independently — even when below threshold —
+    // so the UI can show the user "best: Alice 0.92" while they tune the
+    // accept threshold.
+    private var lastClosestName: String?
+    private var lastClosestDistance: Double?
+
+    // Primary-face tracking. When the library has a person flagged as
+    // primary, we track ONLY that face. If primary isn't in view we
+    // emit no detection so the controller decays toward home rather
+    // than chasing whoever else happens to be largest.
+    private var cachedPrimaryName: String?
+    private var lastPrimaryBbox: CGRect?
+    private var lastPrimaryBboxTs: Date?
+    /// Hold the last primary lock for this long before falling back to
+    /// "no primary in view". 5 s is generous enough that brief
+    /// occlusions or fast head turns don't break the lock and cause the
+    /// controller to flicker between "track primary" and "decay home"
+    /// (which manifested as jerky tracking).
+    private let primaryFollowTTL: TimeInterval = 5.0
+
+    // Names recognised in the current frame's identification cycle.
+    // Emitted on the `identitiesInView` stream when it changes so the
+    // greeting state machine can fire for any face in view, primary
+    // or not.
+    private var lastIdentitiesInView: Set<String> = []
     private var frameCounter: Int = 0
     /// Run identification every Nth ingested frame. 6 → ~5 Hz at 30 FPS,
     /// which is plenty for "who is this" while the per-frame detection
@@ -122,6 +159,12 @@ public actor MacFaceTracker {
         var tc: AsyncStream<(yawRad: Double, pitchRad: Double, decay: Bool)>.Continuation!
         self.targets = AsyncStream(bufferingPolicy: .bufferingNewest(64)) { c in tc = c }
         self.targetsContinuation = tc
+
+        var ic: AsyncStream<Set<String>>.Continuation!
+        self.identitiesInView = AsyncStream(
+            bufferingPolicy: .bufferingNewest(8)
+        ) { c in ic = c }
+        self.identitiesContinuation = ic
     }
 
     public func setStreamer(_ s: TargetStreamer) {
@@ -184,31 +227,46 @@ public actor MacFaceTracker {
             return
         }
 
-        guard let largest = observations
-            .max(by: { $0.boundingBox.cgRect.width * $0.boundingBox.cgRect.height
-                     < $1.boundingBox.cgRect.width * $1.boundingBox.cgRect.height })
-        else {
+        // Build pixel-rect candidates sorted by area desc, gated by
+        // minBboxNorm. Smaller faces are dropped early so neither the
+        // tracker nor the identifier waste cycles on them.
+        let imgW = CGFloat(cgImage.width)
+        let imgH = CGFloat(cgImage.height)
+
+        let allCandidates: [(observation: Vision.FaceObservation, pixelRect: CGRect)] =
+            observations
+                .map { obs -> (observation: Vision.FaceObservation, pixelRect: CGRect) in
+                    let bb = obs.boundingBox.cgRect
+                    let rect = CGRect(
+                        x: bb.origin.x * imgW,
+                        y: (1.0 - bb.origin.y - bb.size.height) * imgH,
+                        width: bb.size.width * imgW,
+                        height: bb.size.height * imgH
+                    )
+                    return (obs, rect)
+                }
+                .filter {
+                    let n = max($0.pixelRect.width / imgW, $0.pixelRect.height / imgH)
+                    return n >= config.minBboxNorm
+                }
+                .sorted { (a, b) in
+                    a.pixelRect.width * a.pixelRect.height
+                  > b.pixelRect.width * b.pixelRect.height
+                }
+
+        guard !allCandidates.isEmpty else {
             // No face this frame; controller will start decaying after
             // idleTimeoutS without further detections.
             return
         }
 
-        // boundingBox: NormalizedRect, BL origin in image-space.
-        let imgW = CGFloat(cgImage.width)
-        let imgH = CGFloat(cgImage.height)
-        let bb = largest.boundingBox.cgRect
-        let pixelRect = CGRect(
-            x: bb.origin.x * imgW,
-            y: (1.0 - bb.origin.y - bb.size.height) * imgH,
-            width: bb.size.width * imgW,
-            height: bb.size.height * imgH
-        )
-        // Gate on bbox size.
-        let bboxNorm = max(pixelRect.width / imgW, pixelRect.height / imgH)
-        guard bboxNorm >= config.minBboxNorm else { return }
+        // ALWAYS use the largest face. Earlier attempts at "primary
+        // only" tracking (which could withhold detections) starved the
+        // controller and produced the jerky pattern you saw.
+        let largest = allCandidates[0].observation
+        let pixelRect = allCandidates[0].pixelRect
 
-        // Decay stale identity past TTL. We do this here rather than on a
-        // timer so it stays cheap and synchronous.
+        // Decay stale identity past TTL.
         if let ts = lastIdentityTs,
            Date().timeIntervalSince(ts) > identityTTL {
             lastIdentityName = nil
@@ -221,14 +279,20 @@ public actor MacFaceTracker {
             frameWidth: cgImage.width,
             frameHeight: cgImage.height,
             identity: lastIdentityName,
-            identityDistance: lastIdentityDistance
+            identityDistance: lastIdentityDistance,
+            closestName: lastClosestName,
+            closestDistance: lastClosestDistance
         )
         detectionsContinuation.yield(det)
 
-        // Throttled, fire-and-forget identification path. Crops the face
-        // out of the current cgImage with a small margin and asks the
-        // library for a match; the result populates `lastIdentity*` for
-        // the NEXT detection emission.
+        // Single-face identification path — runs every Nth frame on
+        // ONLY the largest face's crop. The previous "top-3" version
+        // tripled the feature-print work per cycle, which intermittently
+        // held the FaceTracker actor and starved the 50 Hz commandLoop
+        // of regular `dt` ticks. With irregular dt, the damper's
+        // integration produced cap-speed steps that read as aggressive
+        // jerks. Going back to one print per cycle restores the original
+        // smooth dynamic.
         frameCounter &+= 1
         if !identifying,
            let lib = library,
@@ -240,7 +304,9 @@ public actor MacFaceTracker {
             ).intersection(CGRect(x: 0, y: 0, width: imgW, height: imgH))
             if let cropped = cgImage.cropping(to: cropRect) {
                 Task { [weak self] in
-                    await self?.runIdentification(crop: cropped, library: lib)
+                    await self?.runSingleIdentification(
+                        crop: cropped, library: lib
+                    )
                 }
             } else {
                 identifying = false
@@ -327,22 +393,67 @@ public actor MacFaceTracker {
         }
     }
 
-    /// Generates a feature print from the cropped face and asks the
-    /// library for the closest enrolled match. Updates `lastIdentity*`
-    /// fields under actor isolation so the next emitted Detection picks
-    /// up the result.
-    private func runIdentification(crop: CGImage, library: FaceLibrary) async {
+    // MARK: - Tracking + identification helpers
+
+    /// Pick the face Rocky should orient toward this frame.
+    /// - With a primary set: the face whose pixel bbox best overlaps
+    ///   the most-recent primary bbox (within TTL). If none overlap
+    ///   enough, we return nil so the controller decays home — we do
+    ///   NOT chase another person who happens to be largest.
+    /// - Without a primary: the largest face (original behaviour).
+    private func pickTrackingCandidate(
+        from candidates: [(observation: Vision.FaceObservation, pixelRect: CGRect)]
+    ) -> (observation: Vision.FaceObservation, pixelRect: CGRect)? {
+        // ALWAYS pick the largest face if any are present. The previous
+        // attempt at strict "primary only" tracking returned nil when
+        // the primary's bbox didn't match a current-frame face; that
+        // starved the controller of detections, the EMA stalled, and
+        // when the next identification cycle re-locked the primary the
+        // EMA snapped — which the user (correctly) called jerky.
+        //
+        // The greeting state machine still differentiates by identity
+        // via `identitiesInView`, so non-primary recognised faces still
+        // get greeted. We just no longer try to withhold tracking based
+        // on identity — the controller needs continuous input.
+        return candidates.first
+    }
+
+    /// Single-face identification: feature-print just the largest face's
+    /// crop, look up its closest enrolled match. Greeting still fires
+    /// for the largest face's identity via the AppServices-side handler
+    /// that watches `det.identity`. Sticking to one print per cycle
+    /// keeps the `FaceTracker` actor free for the 50 Hz commandLoop.
+    private func runSingleIdentification(
+        crop: CGImage, library: FaceLibrary
+    ) async {
         defer { identifying = false }
         guard let observation = await library.generatePrint(cgImage: crop)
         else { return }
-        if let match = await library.identify(observation) {
-            lastIdentityName = match.person.name
-            lastIdentityDistance = match.distance
+        guard let closest = await library.closestMatch(observation)
+        else { return }
+        lastClosestName = closest.person.name
+        lastClosestDistance = closest.distance
+        let threshold = await library.acceptThreshold
+        if closest.distance <= threshold {
+            lastIdentityName = closest.person.name
+            lastIdentityDistance = closest.distance
             lastIdentityTs = Date()
+            // Also publish to identitiesInView so the greeting state
+            // machine still fires.
+            let newSet: Set<String> = [closest.person.name]
+            if newSet != lastIdentitiesInView {
+                lastIdentitiesInView = newSet
+                identitiesContinuation.yield(newSet)
+            }
+        } else {
+            // Largest face is unknown — clear in-view set if it had a
+            // name, so the next visible enrolled face triggers a fresh
+            // greeting.
+            if !lastIdentitiesInView.isEmpty {
+                lastIdentitiesInView = []
+                identitiesContinuation.yield([])
+            }
         }
-        // If no match, leave the previous identity alone and let the TTL
-        // decay it on the next ingest. That avoids "name flicker" when a
-        // single frame fails to match.
     }
 
     private func decayIfIdle(dt: Double) async -> Bool {

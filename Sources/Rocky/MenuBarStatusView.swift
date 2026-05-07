@@ -88,8 +88,14 @@ struct MenuBarStatusView: View {
     private var stateLabel: String {
         switch services.rockyState {
         case .sleeping: "asleep"
-        case .waking: "waking up…"
+        case .waking: "waking up\u{2026}"
         case .idle: "idle"
+        case .tracking:
+            if let name = services.lastFaceDetection?.identity {
+                "watching \(name)"
+            } else {
+                "watching you"
+            }
         case .listening: "listening"
         case .thinking: "thinking"
         case .speaking: "speaking"
@@ -123,6 +129,10 @@ private struct StateBadge: View {
                     .symbolEffect(.pulse, options: .repeating)
             case .idle:
                 Circle().fill(color).frame(width: 7, height: 7)
+            case .tracking:
+                Image(systemName: "viewfinder")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(color)
             case .listening:
                 Circle()
                     .strokeBorder(color, lineWidth: 1.2)
@@ -163,6 +173,7 @@ private struct StateBadge: View {
         case .sleeping:   .gray
         case .waking:     .yellow
         case .idle:       .secondary
+        case .tracking:   .accentColor
         case .listening:  .green
         case .thinking:   .orange
         case .speaking:   .blue

@@ -145,9 +145,19 @@ private struct FacePreview: View {
                         ctx.stroke(Path(roundedRect: r, cornerRadius: 8),
                                    with: .color(strokeColor),
                                    style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                        // Three label modes:
+                        //   identified → "Alice 0.34"
+                        //   in library but above threshold → "? Alice 0.92"
+                        //   no library match → "73%" confidence fallback
                         let labelString: String
                         if let identity = det.identity {
-                            labelString = identity
+                            if let d = det.identityDistance {
+                                labelString = String(format: "%@ %.2f", identity, d)
+                            } else {
+                                labelString = identity
+                            }
+                        } else if let name = det.closestName, let d = det.closestDistance {
+                            labelString = String(format: "? %@ %.2f", name, d)
                         } else {
                             labelString = String(format: "%.0f%%", det.confidence * 100)
                         }

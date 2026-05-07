@@ -51,6 +51,7 @@ private struct MenuBarLabel: View {
         case .sleeping:   "moon.fill"
         case .waking:     "sun.max"
         case .idle:       "circle.fill"
+        case .tracking:   "viewfinder"
         case .listening:  "ear"
         case .thinking:   "circle.dotted"
         case .speaking:   "waveform"

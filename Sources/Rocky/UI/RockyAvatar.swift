@@ -76,6 +76,7 @@ struct RockyAvatar: View {
         case .sleeping:   return .gray
         case .waking:     return .yellow
         case .idle:       return .gray
+        case .tracking:   return .accentColor
         case .listening:  return .green
         case .thinking:   return .orange
         case .speaking:   return .blue
@@ -86,7 +87,8 @@ struct RockyAvatar: View {
     private var stateKey: String {
         switch state {
         case .sleeping: "sleeping"; case .waking: "waking"
-        case .idle: "idle"; case .listening: "listening"
+        case .idle: "idle"; case .tracking: "tracking"
+        case .listening: "listening"
         case .thinking: "thinking"; case .speaking: "speaking"
         case .error: "error"
         }
@@ -224,8 +226,9 @@ private struct MouthShape: Shape {
             p.move(to: CGPoint(x: rect.width * 0.15, y: rect.midY))
             p.addQuadCurve(to: CGPoint(x: rect.width * 0.85, y: rect.midY),
                            control: CGPoint(x: rect.midX, y: rect.midY + rect.height * 0.5))
-        case .idle:
-            // Subtle, slightly-smiling line.
+        case .idle, .tracking:
+            // Subtle, slightly-smiling line. Tracking shares the idle
+            // mouth — the eyes/halo already convey the difference.
             p.move(to: CGPoint(x: 0, y: rect.midY))
             p.addQuadCurve(to: CGPoint(x: rect.width, y: rect.midY),
                            control: CGPoint(x: rect.midX, y: rect.midY + rect.height * 0.4))

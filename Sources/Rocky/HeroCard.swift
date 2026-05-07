@@ -15,12 +15,13 @@ struct HeroCard: View {
             EmptyView()
         } content: {
             HStack(alignment: .center, spacing: 24) {
-                RockyAvatar(
+                ReachyHead3D(
                     state: state,
                     pose: services.lastRobotState?.headPose,
-                    antennas: services.lastRobotState?.antennasPosition,
-                    size: 140
+                    antennas: services.lastRobotState?.antennasPosition
                 )
+                // 280 makes the head genuinely heroic in the wide card.
+                .frame(width: 280, height: 280)
                 .padding(.leading, 4)
 
                 VStack(alignment: .leading, spacing: 8) {
@@ -144,6 +145,12 @@ struct HeroCard: View {
         case .sleeping:            "Asleep \u{2014} tap Wake to bring him up"
         case .waking:              "Waking up\u{2026}"
         case .idle:                "Ready. Say \u{201C}Rocky\u{2026}\u{201D} or use the chat."
+        case .tracking:
+            if let name = services.lastFaceDetection?.identity {
+                "Watching \(name)"
+            } else {
+                "Watching you"
+            }
         case .listening:           "Listening\u{2026}"
         case .thinking:            "Thinking\u{2026}"
         case .speaking:            "Speaking"
@@ -156,6 +163,7 @@ struct HeroCard: View {
         case .sleeping:   .secondary
         case .waking:     .yellow
         case .idle:       .secondary
+        case .tracking:   .accentColor
         case .listening:  .green
         case .thinking:   .orange
         case .speaking:   .blue

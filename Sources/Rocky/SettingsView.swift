@@ -175,6 +175,8 @@ struct SettingsView: View {
 
                 EnrollFaceForm()
 
+                FaceMatchThresholdSlider()
+
                 if !people.isEmpty {
                     Divider().padding(.vertical, 4)
                     EnrolledFacesList(people: people)
@@ -510,8 +512,55 @@ private struct EnrollFaceForm: View {
     }
 }
 
-/// Reads `services.removeFace` only inside the row's onRemove closure,
-/// never in body — so the list itself doesn't churn with services.
+/// Match-threshold slider with a live distance readout. Drags apply
+/// instantly to `services.faceLibrary` so the user can tune by watching
+/// the live bbox label in the Vision card flip from `?` to the name.
+private struct FaceMatchThresholdSlider: View {
+    @Environment(AppServices.self) private var services
+
+    var body: some View {
+        let threshold = services.settings.faceMatchThreshold
+        let live = services.lastFaceDetection?.closestDistance
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline) {
+                SectionLabel(text: "Match threshold")
+                Spacer()
+                Text(String(format: "%.2f", threshold))
+                    .font(.caption.monospacedDigit().weight(.medium))
+                    .foregroundStyle(.primary)
+                if let liveD = live {
+                    Text(String(format: "live %.2f", liveD))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(liveD <= threshold ? .green : .secondary)
+                }
+            }
+            Slider(
+                value: Binding(
+                    get: { services.settings.faceMatchThreshold },
+                    set: { newValue in
+                        services.settings.faceMatchThreshold = newValue
+                        Task { await services.faceLibrary.setAcceptThreshold(newValue) }
+                    }
+                ),
+                in: 0.4...1.5,
+                step: 0.05
+            ) {
+                Text("Threshold")
+            } minimumValueLabel: {
+                Text("strict").font(.caption2).foregroundStyle(.secondary)
+            } maximumValueLabel: {
+                Text("loose").font(.caption2).foregroundStyle(.secondary)
+            }
+            Text("Lower = stricter; only very close matches accepted. Watch the \u{201C}live\u{201D} number while a face is on camera — set the threshold a touch higher than the distance you see for known people. Default 1.0.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+/// Reads `services.*` only inside the row's onRemove / onTogglePrimary
+/// closures, never in body — so the list itself doesn't churn with services.
 private struct EnrolledFacesList: View {
     @Environment(AppServices.self) private var services
     let people: [FaceLibrary.Person]
@@ -519,25 +568,46 @@ private struct EnrolledFacesList: View {
     var body: some View {
         VStack(spacing: 8) {
             ForEach(people) { person in
-                FaceRow(person: person) {
-                    let id = person.id
-                    Task { await services.removeFace(id: id) }
-                }
+                FaceRow(
+                    person: person,
+                    onTogglePrimary: {
+                        let target: UUID? = person.isPrimary ? nil : person.id
+                        Task { await services.setPrimaryFace(id: target) }
+                    },
+                    onRemove: {
+                        let id = person.id
+                        Task { await services.removeFace(id: id) }
+                    }
+                )
             }
+            Text("The starred face is the only one Rocky's head will track. Other recognised faces still get greeted when they come into view, but the head stays on the primary.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .padding(.top, 4)
         }
     }
 }
 
 private struct FaceRow: View {
     let person: FaceLibrary.Person
+    let onTogglePrimary: () -> Void
     let onRemove: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
             thumbnail
             VStack(alignment: .leading, spacing: 2) {
-                Text(person.name)
-                    .font(.callout.weight(.medium))
+                HStack(spacing: 6) {
+                    Text(person.name)
+                        .font(.callout.weight(.medium))
+                    if person.isPrimary {
+                        Text("primary")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 6).padding(.vertical, 1)
+                            .background(Capsule().fill(Color.accentColor))
+                    }
+                }
                 if !person.pronunciation.isEmpty {
                     Text("says \u{201C}\(person.pronunciation)\u{201D}")
                         .font(.caption)
@@ -548,6 +618,16 @@ private struct FaceRow: View {
                     .foregroundStyle(.tertiary)
             }
             Spacer()
+            Button {
+                onTogglePrimary()
+            } label: {
+                Image(systemName: person.isPrimary ? "star.fill" : "star")
+                    .foregroundStyle(person.isPrimary ? Color.accentColor : Color.secondary)
+            }
+            .buttonStyle(.plain)
+            .help(person.isPrimary
+                  ? "Clear primary — Rocky will fall back to tracking the largest face."
+                  : "Make \(person.name) the primary — Rocky will only track this face.")
             Button {
                 onRemove()
             } label: {

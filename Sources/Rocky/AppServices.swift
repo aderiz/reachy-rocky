@@ -65,14 +65,18 @@ final class AppServices {
     @ObservationIgnored
     private var lastGreetingIndex: Int?
     private let presenceAbsenceThreshold: TimeInterval = 30.0
+    /// Rocky-voice greetings. The LLM persona explains the rules: third
+    /// person "Rocky", no articles, base-form verbs, short clauses,
+    /// catchphrases for delight. These are spoken directly via TTS (no
+    /// LLM round-trip) so they need to be in-voice on their own.
     private static let greetingTemplates: [String] = [
-        "Hey, {name}.",
-        "Hi {name}.",
-        "Hey there, {name}.",
-        "{name}! Hey.",
-        "Welcome back, {name}.",
-        "Hello, {name}.",
-        "Oh, hey {name}.",
+        "{name}!",
+        "Rocky see {name}.",
+        "{name} back!",
+        "{name} here. Rocky happy.",
+        "Amaze amaze amaze. {name}!",
+        "Hello {name}. Fist my bump.",
+        "{name} friend.",
     ]
 
     /// Latest robot-camera frame as JPEG data (the SwiftUI side decodes it).
@@ -136,7 +140,8 @@ final class AppServices {
     enum RockyState: Sendable, Equatable {
         case sleeping        // motors disabled / gravity-comp; head slumped
         case waking          // wake_up move in flight
-        case idle
+        case idle            // awake, no face in view, no audio activity
+        case tracking        // awake + a face is currently in view
         case listening
         case thinking
         case speaking
@@ -149,6 +154,15 @@ final class AppServices {
             }
         }
     }
+
+    /// Wall-clock timestamp of the most recent face detection. The
+    /// `rockyState` computation reads this to surface a `.tracking`
+    /// status whenever a face has been visible in the last few seconds.
+    var lastFaceDetectionAt: Date?
+    /// How recent a detection must be (seconds) to count as "currently
+    /// tracking". Slightly longer than the camera frame interval so a
+    /// single dropped frame doesn't flicker the state.
+    private let trackingWindowS: TimeInterval = 1.5
 
     /// True while a wake_up / goto_sleep recorded move is in flight on the
     /// daemon. Set by `wakeRobot` / `sleepRobot` and cleared a few seconds
@@ -188,6 +202,13 @@ final class AppServices {
         }
         if micEnabled {
             return .listening
+        }
+        // Awake + a face has been in view recently → "tracking" so the
+        // user gets honest feedback that Rocky is paying attention,
+        // rather than `.idle` while the head is actively following.
+        if let last = lastFaceDetectionAt,
+           Date().timeIntervalSince(last) < trackingWindowS {
+            return .tracking
         }
         return .idle
     }
@@ -317,6 +338,7 @@ final class AppServices {
         // Load enrolled-face library from disk and hand it to the tracker
         // so identification runs against the user's known faces.
         await faceLibrary.loadFromDisk()
+        await faceLibrary.setAcceptThreshold(settings.faceMatchThreshold)
         await macFaceTracker.setLibrary(faceLibrary)
         await refreshEnrolledFaces()
         await macFaceTracker.start()
@@ -355,12 +377,30 @@ final class AppServices {
                     frameWidth: det.frameWidth,
                     frameHeight: det.frameHeight,
                     identity: det.identity,
-                    identityDistance: det.identityDistance
+                    identityDistance: det.identityDistance,
+                    closestName: det.closestName,
+                    closestDistance: det.closestDistance
                 )
                 let snap = counter
+                let now2 = Date()
                 await MainActor.run {
                     self.lastFaceDetection = mapped
                     self.faceDetectionCount = snap
+                    self.lastFaceDetectionAt = now2
+                }
+            }
+        }
+
+        // Greeting feed: every recognised name in view, primary or not,
+        // routes through handleIdentitySeen. The state machine's per-name
+        // 30 s absence threshold ensures a face that's been around for a
+        // while doesn't get re-greeted on every cycle.
+        let identitiesStream = await macFaceTracker.identitiesInView
+        Task { [weak self] in
+            for await names in identitiesStream {
+                guard let self else { return }
+                for name in names {
+                    await self.handleIdentitySeen(name: name)
                 }
             }
         }
@@ -532,6 +572,20 @@ final class AppServices {
             }
         }
 
+        // ONE persistent subscription to the voice coordinator's output
+        // stream. AsyncStream is single-consumer; previously we spawned a
+        // fresh subscriber inside every toggleMic enable, which left
+        // accumulating handlers racing on the same stream and producing
+        // duplicate / missed dispatches each time the user stopped and
+        // started listening.
+        let voiceOutputs = voice.outputs
+        Task { [weak self] in
+            for await output in voiceOutputs {
+                guard let self else { return }
+                await self.handleVoice(output)
+            }
+        }
+
         // Tool registry + LM Studio probe. Auto-retries every 8 s while
         // status is offline so users don't have to click "Probe" after
         // launching LM Studio.
@@ -584,7 +638,17 @@ final class AppServices {
             mic.stop()
             await robotMic.stop()
             await voice.stop()
+            // Explicitly close the wake conversation window — turning off
+            // listening is a clean signal that the next session should
+            // start from "needs to hear Rocky again" rather than carry
+            // a still-open follow-up window.
+            await voice.closeConversationWindow()
+            // Drain whatever the audio engine left in the ring buffer so
+            // the next listen session doesn't process pre-toggle audio.
+            _ = audioBuffer.drain()
             micEnabled = false
+            lastMicRMS = 0
+            lastTranscript = ""
         } else {
             do {
                 let useRobot = settings.micSource == "robot"
@@ -600,6 +664,7 @@ final class AppServices {
                 voiceErrorMessage = nil
                 // Periodic poll so the VU meter updates without
                 // bouncing through the audio thread on every frame.
+                // Captured `useRobot` snapshot for this listen session.
                 Task { [weak self] in
                     while let self, await MainActor.run(body: { self.micEnabled }) {
                         let rms: Float = useRobot
@@ -612,14 +677,10 @@ final class AppServices {
                         try? await Task.sleep(nanoseconds: 100_000_000)
                     }
                 }
-                // Pump voice outputs into observable mirrors.
-                let outputs = voice.outputs
-                Task { [weak self] in
-                    for await output in outputs {
-                        guard let self else { return }
-                        await self.handleVoice(output)
-                    }
-                }
+                // Voice outputs subscription is established ONCE in
+                // start() — see voiceSubscriptionTask. Spawning a new
+                // subscriber per toggle was creating racing handlers
+                // that double-dispatched transcripts to the LLM.
             } catch {
                 voiceErrorMessage = "\(error)"
             }
@@ -636,6 +697,23 @@ final class AppServices {
                 if dispatched { self.lastDispatched = text }
             }
             if dispatched {
+                // Echo gate: drop any "user transcript" that was captured
+                // while Rocky was speaking (or in the 0.8 s tail after).
+                // Without this the robot speaker bleeds into the mic, the
+                // STT transcribes Rocky's own voice as user input, and
+                // every reply triggers another reply — feedback loop.
+                let now = Date()
+                let inEcho = ttsBusyUntil.map {
+                    now < $0.addingTimeInterval(0.8)
+                } ?? false
+                if inEcho {
+                    await logBus.publish(.sidecarLog(
+                        sidecar: "voice", level: .info,
+                        message: "echo gate dropped \"\(text)\"",
+                        fields: [:]
+                    ))
+                    return
+                }
                 await sendUserText(text)
             }
         case .windowOpened(let until):
@@ -762,6 +840,101 @@ final class AppServices {
         }
     }
 
+    /// Plays a short scripted head-pose gesture. Replaces the audio-bundled
+    /// Pollen `play_emotion` with motion-only sequences so emotional
+    /// reactions don't fire built-in sound effects. Face tracking is
+    /// suppressed for the duration so the streamer doesn't fight the
+    /// playback.
+    ///
+    /// Movement profile: deliberately slow and small. The previous pass
+    /// used 0.22–0.30 s `goto` durations stacked back-to-back which read
+    /// as aggressive — when a new `goto` arrives mid-motion the daemon
+    /// abandons the previous trajectory, so chained short gotos look
+    /// like a series of jerks. Each step here uses a generous duration
+    /// AND an explicit `Task.sleep` of the same length so the motion
+    /// actually completes before the next one starts.
+    func playExpression(_ name: String) async throws {
+        let robot = robotLink
+        let neutral = RPYPose(roll: 0, pitch: 0, yaw: 0)
+
+        /// Issue a goto and wait for the motion to actually complete
+        /// before returning. A small tail (60 ms) lets the daemon
+        /// settle so consecutive gotos blend rather than chain-stop.
+        func step(_ pose: RPYPose, _ seconds: Double) async throws {
+            try await robot.goto(headPose: pose, durationS: seconds)
+            let total = UInt64((seconds + 0.06) * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: total)
+        }
+
+        // Suppress face tracking + flag the avatar's "transitioning"
+        // state for slightly longer than the gesture's actual length.
+        let nominalDuration: TimeInterval = {
+            switch name {
+            case "scared":      return 1.8
+            case "agree":       return 2.1
+            case "disagree":    return 2.4
+            case "excited":     return 2.2
+            case "sad":         return 3.0
+            case "curious":     return 2.0
+            case "look_around": return 2.6
+            case "shy":         return 2.4
+            default:            return 2.0
+            }
+        }()
+        await MainActor.run {
+            self.transitioningUntil = Date().addingTimeInterval(nominalDuration + 0.3)
+        }
+        defer {
+            Task { @MainActor in self.transitioningUntil = nil }
+        }
+
+        switch name {
+        case "scared":
+            // Mild pitch-back + small roll. Smaller angle and longer
+            // duration than the previous "jolt" version; reads as
+            // surprised rather than alarmed.
+            try await step(RPYPose(roll: 0.05, pitch: -0.20, yaw: 0), 0.55)
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            try await step(neutral, 0.80)
+        case "agree":
+            // One slow nod.
+            try await step(RPYPose(roll: 0, pitch: 0.18, yaw: 0), 0.70)
+            try await step(neutral, 0.70)
+        case "disagree":
+            // Single calm shake L-R-centre.
+            try await step(RPYPose(roll: 0, pitch: 0, yaw: 0.20), 0.70)
+            try await step(RPYPose(roll: 0, pitch: 0, yaw: -0.20), 0.80)
+            try await step(neutral, 0.60)
+        case "excited":
+            // Slower up-and-down bob.
+            try await step(RPYPose(roll: 0, pitch: -0.12, yaw: 0), 0.60)
+            try await step(RPYPose(roll: 0, pitch: 0.10, yaw: 0), 0.60)
+            try await step(neutral, 0.60)
+        case "sad":
+            // Slow droop, hold, slow recovery.
+            try await step(RPYPose(roll: 0, pitch: 0.30, yaw: -0.05), 1.00)
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            try await step(neutral, 1.00)
+        case "curious":
+            // Soft head tilt with a slight upward look.
+            try await step(RPYPose(roll: 0.18, pitch: -0.08, yaw: 0.08), 0.80)
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            try await step(neutral, 0.80)
+        case "look_around":
+            try await step(RPYPose(roll: 0, pitch: 0, yaw: 0.30), 0.85)
+            try await step(RPYPose(roll: 0, pitch: 0, yaw: -0.30), 1.00)
+            try await step(neutral, 0.75)
+        case "shy":
+            try await step(RPYPose(roll: -0.10, pitch: 0.18, yaw: 0.15), 0.85)
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            try await step(neutral, 0.85)
+        default:
+            throw NSError(domain: "express", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "unknown expression: \(name)"
+            ])
+        }
+    }
+
     /// Stop face tracking from pushing target events into the streamer.
     /// Mirrored on `faceTrackingEnabled` so the menu bar and main
     /// window stay in lockstep regardless of which surface toggled it.
@@ -868,6 +1041,7 @@ final class AppServices {
     func applySettings() async {
         await llm.setConfig(settings.lmStudioConfig())
         await cognition.setConfig(.init(systemPrompt: settings.persona))
+        await faceLibrary.setAcceptThreshold(settings.faceMatchThreshold)
         await probeLMStudio()
     }
 
@@ -879,7 +1053,7 @@ final class AppServices {
 
         await toolRegistry.register(
             name: "look_at",
-            description: "Make Rocky orient his head toward a yaw/pitch in degrees. Yaw: -180..180 (positive = left). Pitch: -40..40 (positive = down). Smooth.",
+            description: "Make Rocky orient his head toward a yaw/pitch in degrees. Yaw: -180..180 (positive = left). Pitch: -40..40 (positive = down). The default duration_s is deliberately slow (1.2s) for a calm, deliberate look — only specify shorter durations if the user explicitly asks for a quick glance.",
             parameters: .object([
                 "type": .string("object"),
                 "properties": .object([
@@ -892,7 +1066,11 @@ final class AppServices {
             handler: { args in
                 let yaw = (args.asObject?["yaw_deg"]?.asNumber ?? 0) * .pi / 180
                 let pitch = (args.asObject?["pitch_deg"]?.asNumber ?? 0) * .pi / 180
-                let duration = args.asObject?["duration_s"]?.asNumber ?? 0.6
+                // 1.2s default — calmer than the previous 0.6s, which the
+                // LLM was producing during every response and felt jerky.
+                // Floor at 0.5s so the LLM can't undercut it.
+                let requested = args.asObject?["duration_s"]?.asNumber ?? 1.2
+                let duration = max(0.5, requested)
                 let pose = RPYPose(roll: 0, pitch: pitch, yaw: yaw)
                 try await robot.goto(headPose: pose, durationS: duration)
                 await bus.publish(.motorCommand(
@@ -974,36 +1152,48 @@ final class AppServices {
             "understanding1", "welcoming1", "yes1", "yes_sad1",
         ]
 
+        _ = emotions  // kept for future reference; not used by `express`
+
+        // The Pollen `play_emotion` tool was removed because it plays
+        // recorded moves with audio baked in, which fired during normal
+        // turns. `express` is its silent replacement: scripted head-pose
+        // sequences via `goto`, no audio, ~1–1.5 s each. Face tracking
+        // is suppressed for the duration so the streamer doesn't fight
+        // the playback.
+        let exprNames: [String] = [
+            "scared", "agree", "disagree", "excited",
+            "sad", "curious", "look_around", "shy",
+        ]
         await toolRegistry.register(
-            name: "play_emotion",
+            name: "express",
             description: """
-            Play a recorded emotion from the Pollen Robotics library on the robot's body.
-            Use sparingly — these are full-body gestures (~1-3s) that take over the head and antennas.
+            Make Rocky perform a short physical expression with the head only \
+            (no audio). Use when the user asks for a feeling/reaction or when \
+            it strengthens what Rocky is saying. Each gesture takes 1–1.5 s. \
+            Available expressions: scared, agree, disagree, excited, sad, \
+            curious, look_around, shy.
             """,
             parameters: .object([
                 "type": .string("object"),
                 "properties": .object([
                     "name": .object([
                         "type": .string("string"),
-                        "enum": .array(emotions.map { .string($0) }),
-                        "description": .string("Emotion to play"),
+                        "enum": .array(exprNames.map { .string($0) }),
+                        "description": .string("Expression to play"),
                     ]),
                 ]),
                 "required": .array([.string("name")]),
             ]),
-            handler: { args in
+            handler: { [weak self] args in
                 guard let name = args.asObject?["name"]?.asString,
-                      emotions.contains(name) else {
+                      exprNames.contains(name) else {
                     return .object([
                         "ok": .bool(false),
-                        "error": .string("unknown emotion"),
+                        "error": .string("unknown expression"),
                     ])
                 }
-                try await robot.playRecordedMove(
-                    dataset: "pollen-robotics/reachy-mini-emotions-library",
-                    move: name
-                )
-                return .object(["ok": .bool(true), "emotion": .string(name)])
+                try await self?.playExpression(name)
+                return .object(["ok": .bool(true), "name": .string(name)])
             }
         )
 
@@ -1270,6 +1460,14 @@ final class AppServices {
         // next person we enroll with the same name doesn't inherit a
         // stale "recently seen" timestamp.
         personPresence.removeAll()
+    }
+
+    /// Toggle a person as the primary face Rocky tracks. Passing nil
+    /// (or the same id that's currently primary) clears the primary,
+    /// reverting tracking to "follow the largest face in view".
+    func setPrimaryFace(id: UUID?) async {
+        await faceLibrary.setPrimary(id: id)
+        await refreshEnrolledFaces()
     }
 
     /// Called from the face-detection stream whenever a recognised name

@@ -140,13 +140,25 @@ public actor WakeFilter {
         let needle = name.lowercased()
         let articles: Set<String> = ["the", "a", "an", "this", "that"]
 
+        // Apple Speech regularly mishears "rocky" as one of these spellings
+        // depending on accent and noise. Accept any of them as the wake
+        // word so a clean utterance doesn't get dropped on a transcription
+        // wobble. Only kicks in when the configured wakeName is "rocky";
+        // for any other name we stay strict.
+        let acceptables: Set<String>
+        if needle == "rocky" {
+            acceptables = ["rocky", "rockey", "rocki", "rockie", "rockee", "roque"]
+        } else {
+            acceptables = [needle]
+        }
+
         let tokens = transcript
             .lowercased()
             .components(separatedBy: CharacterSet.alphanumerics.inverted)
             .filter { !$0.isEmpty }
         let firstThree = Array(tokens.prefix(3))
         for (i, t) in firstThree.enumerated() {
-            guard t == needle else { continue }
+            guard acceptables.contains(t) else { continue }
             if i == 0 { return true }
             let prev = firstThree[i - 1]
             if articles.contains(prev) { return false }
