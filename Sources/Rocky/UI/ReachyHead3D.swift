@@ -243,15 +243,53 @@ struct ReachyHead3D: NSViewRepresentable {
         private weak var poseRig: SCNNode?
         private weak var antennaLeft: SCNNode?
         private weak var antennaRight: SCNNode?
+        // CAD-authored rest transforms (full 4x4). gltf-loaded nodes
+        // store their pose in the matrix transform, and decomposing to
+        // simdOrientation can drop information; using simdTransform
+        // preserves the rod's translation + rotation exactly. We
+        // compose extras on top so the rod's mount stays put.
+        private var restLeftTransform: simd_float4x4 = matrix_identity_float4x4
+        private var restRightTransform: simd_float4x4 = matrix_identity_float4x4
 
         func attach(to scene: SCNScene) {
             poseRig = scene.rootNode.childNode(withName: "poseRig", recursively: true)
-            antennaLeft = scene.rootNode.childNode(
-                withName: "antenna <1>", recursively: true
-            )
-            antennaRight = scene.rootNode.childNode(
-                withName: "antenna <2>", recursively: true
-            )
+            // Bind to the rod sub-nodes (`occurrence of antenna`), not
+            // the `antenna <N>` assembly groups. The assemblies have
+            // identity transforms but their rod children have non-zero
+            // translation matrices in the head's local frame — so
+            // rotating an assembly rotates the rod's offset vector
+            // around (0,0,0) and the visible rod translates away from
+            // its mount. Rotating the rod itself preserves its
+            // translation (the mount point) and only changes
+            // orientation, so it pivots in place.
+            //
+            // Both `antenna <1>` and `antenna <2>` contain a child
+            // named "occurrence of antenna", so the gltf has two such
+            // nodes. `childNode(withName:recursively:)` returns the
+            // first match — collect ALL of them and bind in CAD
+            // order (antenna <1> is authored first).
+            // GLTFKit2 disambiguates duplicate gltf node names by
+            // appending `_1` on collision: the left rod stays
+            // `occurrence of antenna`, the right one becomes
+            // `occurrence of antenna_1`. Search each assembly subtree
+            // for either name.
+            let assemblyLeft  = scene.rootNode.childNode(
+                withName: "antenna <1>", recursively: true)
+            let assemblyRight = scene.rootNode.childNode(
+                withName: "antenna <2>", recursively: true)
+            antennaLeft  = Self.findRod(in: assemblyLeft)
+            antennaRight = Self.findRod(in: assemblyRight)
+            // Snapshot the CAD-authored rest transforms exactly once.
+            if let l = antennaLeft  { restLeftTransform  = l.simdTransform }
+            if let r = antennaRight { restRightTransform = r.simdTransform }
+        }
+
+        private static func findRod(in assembly: SCNNode?) -> SCNNode? {
+            guard let assembly else { return nil }
+            return assembly.childNode(withName: "occurrence of antenna",
+                                       recursively: true)
+                ?? assembly.childNode(withName: "occurrence of antenna_1",
+                                       recursively: true)
         }
 
         func apply(
@@ -273,14 +311,68 @@ struct ReachyHead3D: NSViewRepresentable {
             //   roll  → Z axis (head-tilt sideways)
             poseRig?.eulerAngles = SCNVector3(pitch, yaw, roll)
 
-            // Antennas. Joint angles come in radians; 0.6 dampens the
-            // visible swing so it feels more like an antenna wobble than
-            // a hinge slam. Mirror the right side so they tilt outward
-            // symmetrically.
-            let aL = Double(antennas?.left ?? 0) * 0.6
-            let aR = Double(antennas?.right ?? 0) * 0.6
-            antennaLeft?.eulerAngles  = SCNVector3(aL,  0, 0)
-            antennaRight?.eulerAngles = SCNVector3(-aR, 0, 0)
+            // Antennas. Two cases:
+            //
+            // Sleeping: motors are disabled and the daemon's reported
+            // antenna positions reflect the last commanded value (0),
+            // not the physical slumped position — so following the
+            // daemon shows the antennas straight up while the head
+            // pitches forward, which looks wrong. Override with a
+            // fixed forward droop so the visual matches what the real
+            // antennas would do under gravity.
+            //
+            // Awake: track the daemon's reported angles, dampened
+            // (×0.5) and clamped (±60°) so a glitchy reading can't
+            // drive the rod into a weird pose. Rotation is around the
+            // assembly group's local X — its origin is at the mounting
+            // point on the head, which gives the right pivot.
+            // Antennas. CAD already places them at the right rest
+            // position (slightly outward V, like the real bot awake);
+            // we compose extras on top of that rather than overwrite.
+            //
+            // Awake → daemon's `antennas.left/right` clamped + halved,
+            // composed around the hinge (local X) on top of rest, so
+            // idle twitches and explicit antenna gestures show in the
+            // model. Right side is mirrored (negate) the same way the
+            // original eulerAngles code did.
+            // Sleep → 180° around the same hinge axis, putting the rod
+            // pointing down (motors-off pose on the real bot).
+            if isSleeping {
+                applySleepFold(antennaLeft,  rest: restLeftTransform)
+                applySleepFold(antennaRight, rest: restRightTransform)
+            } else {
+                let limit = Double.pi / 3
+                let scale = 0.5
+                let aL = max(-limit, min(limit, Double(antennas?.left ?? 0))) * scale
+                let aR = max(-limit, min(limit, Double(antennas?.right ?? 0))) * scale
+                applyAwakeTwitch(antennaLeft,  rest: restLeftTransform,  angle: Float(aL))
+                applyAwakeTwitch(antennaRight, rest: restRightTransform, angle: Float(-aR))
+            }
+        }
+
+        /// Compose a hinge-axis (local X) rotation on top of the CAD
+        /// rest transform. Post-multiplying by the rotation matrix
+        /// rotates in the rod's own local frame, leaving translation
+        /// alone — the rod pivots at its CAD-authored mount.
+        private func applyAwakeTwitch(_ node: SCNNode?,
+                                       rest: simd_float4x4,
+                                       angle: Float) {
+            guard let node else { return }
+            let twitch = simd_float4x4(simd_quatf(angle: angle,
+                                                   axis: SIMD3<Float>(1, 0, 0)))
+            node.simdTransform = rest * twitch
+        }
+
+        /// Half-turn the antenna around its own hinge axis (local X)
+        /// from rest. Post-multiply preserves the rod's translation
+        /// and only rotates, so the rod swings 180° at the mount —
+        /// matching how the real bot's antennas drape down when
+        /// motors disable.
+        private func applySleepFold(_ node: SCNNode?, rest: simd_float4x4) {
+            guard let node else { return }
+            let flip = simd_float4x4(simd_quatf(angle: .pi,
+                                                 axis: SIMD3<Float>(1, 0, 0)))
+            node.simdTransform = rest * flip
         }
     }
 }
