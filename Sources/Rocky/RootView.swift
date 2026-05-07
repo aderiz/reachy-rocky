@@ -3,13 +3,14 @@ import RockyKit
 
 struct RootView: View {
     @Environment(AppServices.self) private var services
-    @State private var selection: SidebarItem = .dashboard
+    @State private var selection: SidebarItem = .cockpit
 
     enum SidebarItem: Hashable, CaseIterable, Identifiable {
-        case dashboard, status, logs, settings
+        case cockpit, dashboard, status, logs, settings
         var id: Self { self }
         var label: String {
             switch self {
+            case .cockpit:   "Cockpit"
             case .dashboard: "Dashboard"
             case .status:    "Status"
             case .logs:      "Logs"
@@ -18,6 +19,7 @@ struct RootView: View {
         }
         var icon: String {
             switch self {
+            case .cockpit:   "airplane"
             case .dashboard: "rectangle.3.group"
             case .status:    "checkmark.shield"
             case .logs:      "doc.plaintext"
@@ -35,6 +37,7 @@ struct RootView: View {
                 BackgroundGradient().ignoresSafeArea()
                 Group {
                     switch selection {
+                    case .cockpit:   CockpitView()
                     case .dashboard: DashboardView()
                     case .status:    StatusView()
                     case .logs:      LogsView()
