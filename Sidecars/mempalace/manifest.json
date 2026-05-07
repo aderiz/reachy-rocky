@@ -18,6 +18,8 @@
     "*": 5,
     "recall": 8,
     "add": 8,
+    "count": 5,
+    "forget_all": 30,
     "init_palace": 60
   }
 }

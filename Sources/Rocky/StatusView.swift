@@ -67,6 +67,11 @@ struct StatusView: View {
                         subtitle: ttsDetail,
                         state: sidecarState(services.ttsSidecarState),
                         icon: "speaker.wave.2") { EmptyView() }
+                    Divider().opacity(0.06)
+                    row(title: "Memory",
+                        subtitle: memoryDetail,
+                        state: sidecarState(services.memorySidecarState),
+                        icon: "brain") { EmptyView() }
                 }
             }
             .padding(.horizontal, 24)
@@ -97,7 +102,7 @@ struct StatusView: View {
         return "Some pieces need attention."
     }
 
-    private var totalCount: Int { 6 }
+    private var totalCount: Int { 7 }
 
     private var healthyCount: Int {
         var n = 0
@@ -107,6 +112,7 @@ struct StatusView: View {
         if sttState == .ok { n += 1 }
         if sidecarState(services.faceTrackerSidecarState) == .ok { n += 1 }
         if sidecarState(services.ttsSidecarState) == .ok { n += 1 }
+        if sidecarState(services.memorySidecarState) == .ok { n += 1 }
         return n
     }
 
@@ -273,6 +279,21 @@ struct StatusView: View {
         case .stopped:                 return "stopped"
         case .starting:                return "starting…"
         case .ready:                   return "ready"
+        case .failing(let reason):     return "failing · \(reason)"
+        case .circuitOpen(let until):
+            let s = max(0, Int(until.timeIntervalSinceNow))
+            return "cooldown · \(s)s"
+        }
+    }
+
+    private var memoryDetail: String {
+        let count = services.memoryDrawerCount
+        let countText = count < 0 ? "—"
+            : (count == 1 ? "1 drawer" : "\(count) drawers")
+        switch services.memorySidecarState {
+        case .stopped:                 return "stopped · run Sidecars/mempalace/setup.sh"
+        case .starting:                return "starting…"
+        case .ready:                   return "ready · " + countText
         case .failing(let reason):     return "failing · \(reason)"
         case .circuitOpen(let until):
             let s = max(0, Int(until.timeIntervalSinceNow))

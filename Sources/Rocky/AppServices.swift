@@ -132,6 +132,12 @@ final class AppServices {
     /// without poking actors on every redraw.
     var faceTrackerSidecarState: SidecarState = .stopped
     var ttsSidecarState: SidecarState = .stopped
+    var memorySidecarState: SidecarState = .stopped
+
+    /// Total drawers in Rocky's palace. Polled lazily — see
+    /// `refreshMemoryCount()`. `-1` means "haven't asked yet" so the
+    /// UI can show a neutral placeholder rather than a misleading 0.
+    var memoryDrawerCount: Int = -1
 
     enum Reachability: Sendable, Equatable {
         case unknown, online, offline(reason: String)
@@ -369,7 +375,11 @@ final class AppServices {
             registry: self.toolRegistry,
             memory: self.memory,
             logBus: bus,
-            config: .init(systemPrompt: settings.persona)
+            config: .init(
+                systemPrompt: settings.persona,
+                memoryRecallEnabled: settings.memoryRecallEnabled,
+                memoryTopK: settings.memoryTopK
+            )
         )
     }
 
@@ -592,6 +602,22 @@ final class AppServices {
             for await event in ttsEvents {
                 if case .state(let s) = event {
                     await MainActor.run { self?.ttsSidecarState = s }
+                }
+            }
+        }
+        let memoryEvents = memory.sidecar.events
+        Task { [weak self] in
+            for await event in memoryEvents {
+                if case .state(let s) = event {
+                    await MainActor.run {
+                        self?.memorySidecarState = s
+                        // Refresh the count whenever the sidecar
+                        // transitions to ready so the status panel
+                        // catches up automatically.
+                        if case .ready = s {
+                            Task { @MainActor in await self?.refreshMemoryCount() }
+                        }
+                    }
                 }
             }
         }
@@ -1320,9 +1346,44 @@ final class AppServices {
     /// Apply the latest values from the SettingsStore. The endpoint can't be
     /// changed at runtime without a relaunch (URLSession sockets, sidecars,
     /// etc. all hold the original); we update what's safe (LM Studio + persona).
+    /// Probe the memory sidecar for its drawer count and update the
+    /// observable mirror. Surfaced in Status + Settings; safe to call
+    /// at any cadence (sidecar's `count` handler is cheap).
+    func refreshMemoryCount() async {
+        do {
+            let n = try await memory.count()
+            self.memoryDrawerCount = n
+        } catch {
+            await logBus.publish(.error(scope: "app/memory.count",
+                                         message: "\(error)",
+                                         recoverable: true))
+        }
+    }
+
+    /// Wipe every drawer in Rocky's palace. Wired to the destructive
+    /// "Forget everything" button in Settings — call only after a
+    /// confirmation dialog. Updates the observable count on success.
+    @discardableResult
+    func forgetAllMemory() async -> Int {
+        do {
+            let n = try await memory.forgetAll()
+            self.memoryDrawerCount = 0
+            return n
+        } catch {
+            await logBus.publish(.error(scope: "app/memory.forget",
+                                         message: "\(error)",
+                                         recoverable: true))
+            return 0
+        }
+    }
+
     func applySettings() async {
         await llm.setConfig(settings.lmStudioConfig())
-        await cognition.setConfig(.init(systemPrompt: settings.persona))
+        await cognition.setConfig(.init(
+            systemPrompt: settings.persona,
+            memoryRecallEnabled: settings.memoryRecallEnabled,
+            memoryTopK: settings.memoryTopK
+        ))
         await faceLibrary.setAcceptThreshold(settings.faceMatchThreshold)
         await robotTTS.setVolume(settings.audioVolume)
         await probeLMStudio()

@@ -210,11 +210,57 @@ def handle_health(_params: dict) -> dict:
     return {"ok": True, "palace": PALACE_PATH, "wing": WING, "room": ROOM}
 
 
+def handle_count(_params: dict) -> dict:
+    """Return the drawer count for our wing/room. Surfaces in the
+    Status view so the user can see how much history Rocky has.
+    """
+    try:
+        result = _mcp.tool_list_drawers(wing=WING, room=ROOM, limit=1, offset=0)
+    except Exception as exc:  # noqa: BLE001
+        return {"count": 0, "error": f"list_drawers failed: {exc}"}
+    if not isinstance(result, dict):
+        return {"count": 0}
+    # tool_list_drawers returns either {"total": N, "drawers": [...]} or
+    # {"count": N, ...}; accept either.
+    n = result.get("total") or result.get("count") or 0
+    return {"count": int(n)}
+
+
+def handle_forget_all(_params: dict) -> dict:
+    """Delete every drawer in the wing/room. Wired to the destructive
+    'Forget everything' button in Settings. Idempotent — safe to call
+    on an already-empty palace.
+    """
+    try:
+        listing = _mcp.tool_list_drawers(wing=WING, room=ROOM,
+                                          limit=10_000, offset=0)
+    except Exception as exc:  # noqa: BLE001
+        return {"deleted": 0, "error": f"list_drawers failed: {exc}"}
+    drawers = []
+    if isinstance(listing, dict):
+        drawers = listing.get("drawers") or listing.get("results") or []
+    deleted = 0
+    for d in drawers:
+        if not isinstance(d, dict):
+            continue
+        drawer_id = d.get("id") or d.get("drawer_id")
+        if not drawer_id:
+            continue
+        try:
+            _mcp.tool_delete_drawer(drawer_id=drawer_id)
+            deleted += 1
+        except Exception:  # noqa: BLE001
+            continue
+    return {"deleted": deleted, "wing": WING, "room": ROOM}
+
+
 HANDLERS = {
     "init_palace": handle_init_palace,
     "add": handle_add,
     "recall": handle_recall,
     "health": handle_health,
+    "count": handle_count,
+    "forget_all": handle_forget_all,
 }
 
 

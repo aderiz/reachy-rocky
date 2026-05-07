@@ -81,6 +81,28 @@ public actor MemoryService {
         return resp.hits
     }
 
+    /// Total drawer count for the configured wing/room. Cheap probe;
+    /// surfaced in Settings so the user can see how much history Rocky
+    /// has accumulated.
+    public func count() async throws -> Int {
+        struct P: Encodable, Sendable {}
+        let resp: CountResponse = try await sidecar.send(
+            method: "count", params: P()
+        )
+        return resp.count
+    }
+
+    /// Delete every drawer in the configured wing/room. Destructive;
+    /// the Settings UI confirms before calling.
+    @discardableResult
+    public func forgetAll() async throws -> Int {
+        struct P: Encodable, Sendable {}
+        let resp: ForgetAllResponse = try await sidecar.send(
+            method: "forget_all", params: P()
+        )
+        return resp.deleted
+    }
+
     /// Fire-and-forget variants for callsites that shouldn't block on
     /// memory I/O (post-turn writes from `CognitionEngine`). Failures
     /// surface in the LogBus rather than propagating up.
@@ -119,6 +141,18 @@ public actor MemoryService {
     private struct RecallResponse: Decodable, Sendable {
         let hits: [Hit]
         let count: Int?
+        let error: String?
+    }
+
+    private struct CountResponse: Decodable, Sendable {
+        let count: Int
+        let error: String?
+    }
+
+    private struct ForgetAllResponse: Decodable, Sendable {
+        let deleted: Int
+        let wing: String?
+        let room: String?
         let error: String?
     }
 }

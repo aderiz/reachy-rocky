@@ -27,6 +27,7 @@ struct SettingsView: View {
                 micCard
                 ttsCard
                 facesCard
+                memoryCard
                 personaCard
                 applyBar
             }
@@ -192,6 +193,32 @@ struct SettingsView: View {
                     Divider().padding(.vertical, 4)
                     EnrolledFacesList(people: people)
                 }
+            }
+        }
+    }
+
+    private var memoryCard: some View {
+        Card {
+            CardHeader("Memory", icon: "brain") {
+                if services.memoryDrawerCount >= 0 {
+                    Text("\(services.memoryDrawerCount) drawer\(services.memoryDrawerCount == 1 ? "" : "s")")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+        } content: {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Rocky stores every user and assistant utterance verbatim, then pulls the most relevant snippets into the next reply. Storage is local — see ~/Library/Application Support/Rocky/Memory.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                MemoryStatusLine()
+
+                MemoryRecallToggle()
+
+                MemoryTopKSlider()
+
+                MemoryForgetButton()
             }
         }
     }
@@ -719,6 +746,176 @@ private struct FaceRow: View {
                     Image(systemName: "person.fill")
                         .foregroundStyle(.secondary)
                 )
+        }
+    }
+}
+
+// MARK: - Memory subviews
+
+/// Read-only summary of the memory sidecar's state + drawer count.
+private struct MemoryStatusLine: View {
+    @Environment(AppServices.self) private var services
+
+    var body: some View {
+        let detail = stateDetail()
+        HStack(spacing: 8) {
+            Image(systemName: detail.icon)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(detail.tint)
+            Text(detail.text)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button {
+                Task { await services.refreshMemoryCount() }
+            } label: {
+                Image(systemName: "arrow.clockwise")
+            }
+            .buttonStyle(.borderless)
+            .controlSize(.small)
+            .help("Re-poll the sidecar for the current drawer count.")
+        }
+    }
+
+    private func stateDetail() -> (icon: String, tint: Color, text: String) {
+        switch services.memorySidecarState {
+        case .stopped:
+            return ("xmark.circle.fill", .gray,
+                    "stopped — run Sidecars/mempalace/setup.sh")
+        case .starting:
+            return ("hourglass", .orange, "starting…")
+        case .ready:
+            let n = services.memoryDrawerCount
+            let countText = n < 0
+                ? "drawer count pending"
+                : (n == 1 ? "1 drawer stored" : "\(n) drawers stored")
+            return ("checkmark.circle.fill", .green, "online · " + countText)
+        case .failing(let reason):
+            return ("exclamationmark.triangle.fill", .red, "failing — " + reason)
+        case .circuitOpen(let until):
+            let s = max(0, Int(until.timeIntervalSinceNow))
+            return ("exclamationmark.triangle.fill", .red, "cooldown · \(s)s")
+        }
+    }
+}
+
+/// "Recall prior conversations" toggle. When off, post-turn writes
+/// still happen so a future re-enable has full history; only the
+/// pre-turn recall step is skipped.
+private struct MemoryRecallToggle: View {
+    @Environment(AppServices.self) private var services
+
+    var body: some View {
+        Toggle(isOn: Binding(
+            get: { services.settings.memoryRecallEnabled },
+            set: { newValue in
+                services.settings.memoryRecallEnabled = newValue
+                Task { await services.applySettings() }
+            }
+        )) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Recall prior conversations").font(.callout.weight(.medium))
+                Text("Inject the top-K most relevant snippets into each LLM turn. Writes always happen regardless.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .toggleStyle(.switch)
+    }
+}
+
+/// Top-K slider — how many drawers to pull per recall.
+private struct MemoryTopKSlider: View {
+    @Environment(AppServices.self) private var services
+
+    var body: some View {
+        let value = services.settings.memoryTopK
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline) {
+                SectionLabel(text: "Snippets per recall (top-K)")
+                Spacer()
+                Text("\(value)")
+                    .font(.caption.monospacedDigit().weight(.medium))
+            }
+            Slider(
+                value: Binding(
+                    get: { Double(services.settings.memoryTopK) },
+                    set: { newValue in
+                        let clamped = max(1, min(10, Int(newValue.rounded())))
+                        if clamped != services.settings.memoryTopK {
+                            services.settings.memoryTopK = clamped
+                            Task { await services.applySettings() }
+                        }
+                    }
+                ),
+                in: 1...10,
+                step: 1
+            ) {
+                Text("Top-K")
+            } minimumValueLabel: {
+                Text("1").font(.caption2).foregroundStyle(.secondary)
+            } maximumValueLabel: {
+                Text("10").font(.caption2).foregroundStyle(.secondary)
+            }
+            Text("Lower keeps the prompt focused; higher gives more context at the cost of tokens and noise.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .disabled(!services.settings.memoryRecallEnabled)
+        .opacity(services.settings.memoryRecallEnabled ? 1 : 0.45)
+        .padding(.vertical, 4)
+    }
+}
+
+/// Destructive "Forget everything" button. Confirms before wiping every
+/// drawer in Rocky's wing/room. Disabled when memory is offline or empty.
+private struct MemoryForgetButton: View {
+    @Environment(AppServices.self) private var services
+    @State private var confirming: Bool = false
+    @State private var working: Bool = false
+    @State private var lastResult: String?
+
+    var body: some View {
+        let isReady = services.memorySidecarState == .ready
+        let isEmpty = services.memoryDrawerCount == 0
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Button(role: .destructive) {
+                    confirming = true
+                } label: {
+                    Label("Forget everything", systemImage: "trash")
+                }
+                .buttonStyle(.bordered)
+                .disabled(working || !isReady || isEmpty)
+
+                if working {
+                    ProgressView().controlSize(.small)
+                }
+                if let lastResult {
+                    Text(lastResult)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Text("Removes every stored drawer for the rocky / conversation room. Cannot be undone.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .alert("Forget every memory?",
+               isPresented: $confirming) {
+            Button("Cancel", role: .cancel) {}
+            Button("Forget everything", role: .destructive) {
+                working = true
+                Task {
+                    let n = await services.forgetAllMemory()
+                    await MainActor.run {
+                        working = false
+                        lastResult = "deleted \(n)"
+                    }
+                }
+            }
+        } message: {
+            Text("This deletes every stored drawer in Rocky's palace. He won't remember any prior conversations after this.")
         }
     }
 }

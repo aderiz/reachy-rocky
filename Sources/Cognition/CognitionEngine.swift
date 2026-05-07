@@ -10,13 +10,19 @@ public actor CognitionEngine {
     public struct Config: Sendable {
         public var systemPrompt: String
         public var maxToolRounds: Int
+        public var memoryRecallEnabled: Bool
+        public var memoryTopK: Int
 
         public init(
             systemPrompt: String = Self.defaultSystemPrompt,
-            maxToolRounds: Int = 4
+            maxToolRounds: Int = 4,
+            memoryRecallEnabled: Bool = true,
+            memoryTopK: Int = 5
         ) {
             self.systemPrompt = systemPrompt
             self.maxToolRounds = maxToolRounds
+            self.memoryRecallEnabled = memoryRecallEnabled
+            self.memoryTopK = memoryTopK
         }
 
         public static let defaultSystemPrompt = """
@@ -115,10 +121,18 @@ public actor CognitionEngine {
         // messages we send the LLM as a temporary system message. Not
         // appended to the persistent transcript — fresh per turn so old
         // recalls don't pile up. Failures are non-fatal: if the sidecar
-        // is offline or slow, we proceed without memory.
-        let recallEnvelope = await Self.fetchRecallEnvelope(
-            memory: memory, query: userText, logBus: logBus
-        )
+        // is offline or slow, we proceed without memory. The user can
+        // disable recall (but keep writes) via the Memory settings
+        // toggle — useful for A/B comparing replies.
+        let recallEnvelope: ChatMessage?
+        if config.memoryRecallEnabled {
+            recallEnvelope = await Self.fetchRecallEnvelope(
+                memory: memory, query: userText,
+                k: config.memoryTopK, logBus: logBus
+            )
+        } else {
+            recallEnvelope = nil
+        }
 
         var rounds = 0
 
@@ -252,20 +266,21 @@ public actor CognitionEngine {
     /// no hits come back. Recall is bounded by `recallTimeoutS` so the
     /// LLM call isn't held up by a slow sidecar.
     private static let recallTimeoutS: Double = 1.5
-    private static let recallTopK: Int = 5
 
     private static func fetchRecallEnvelope(
         memory: MemoryService?,
         query: String,
+        k: Int,
         logBus: LogBus
     ) async -> ChatMessage? {
         guard let memory else { return nil }
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count >= 3 else { return nil }
+        let topK = max(1, min(k, 20))
         let hits: [MemoryService.Hit]? = await withTaskGroup(
             of: [MemoryService.Hit]?.self
         ) { group in
-            group.addTask { try? await memory.recall(query: trimmed, k: recallTopK) }
+            group.addTask { try? await memory.recall(query: trimmed, k: topK) }
             group.addTask {
                 try? await Task.sleep(
                     nanoseconds: UInt64(recallTimeoutS * 1_000_000_000)
@@ -278,7 +293,7 @@ public actor CognitionEngine {
         }
         guard let hits, !hits.isEmpty else { return nil }
         let formatted = hits
-            .prefix(recallTopK)
+            .prefix(topK)
             .map { "- " + $0.text.replacingOccurrences(of: "\n", with: " ") }
             .joined(separator: "\n")
         let body = """

@@ -38,6 +38,18 @@ final class SettingsStore {
     /// PCM samples of the synthesized WAV before upload.
     var audioVolume: Double { didSet { save() } }
 
+    /// Whether the cognition engine should fetch top-K relevant memories
+    /// from mempalace before each LLM turn and inject them as a system
+    /// message. When false, memory writes still happen (so a future
+    /// re-enable has full history) but recall is skipped — useful for
+    /// A/B-comparing replies with vs. without memory.
+    var memoryRecallEnabled: Bool { didSet { save() } }
+
+    /// Number of drawers pulled per recall. 3–10 is sane; lower keeps
+    /// the prompt focused, higher gives more context at the cost of
+    /// noise + tokens.
+    var memoryTopK: Int { didSet { save() } }
+
     init() {
         let d = UserDefaults.standard
         self.robotHost = d.string(forKey: Keys.robotHost) ?? "reachy-mini.local"
@@ -63,6 +75,8 @@ final class SettingsStore {
         self.micSource = d.string(forKey: Keys.micSource) ?? Self.detectDefaultMicSource()
         self.faceMatchThreshold = (d.object(forKey: Keys.faceMatchThreshold) as? Double) ?? 1.0
         self.audioVolume = (d.object(forKey: Keys.audioVolume) as? Double) ?? 0.85
+        self.memoryRecallEnabled = (d.object(forKey: Keys.memoryRecallEnabled) as? Bool) ?? true
+        self.memoryTopK = (d.object(forKey: Keys.memoryTopK) as? Int) ?? 5
     }
 
     /// Pick robot if the robot-mic sidecar venv has been built; otherwise mac.
@@ -102,6 +116,8 @@ final class SettingsStore {
         d.set(micSource, forKey: Keys.micSource)
         d.set(faceMatchThreshold, forKey: Keys.faceMatchThreshold)
         d.set(audioVolume, forKey: Keys.audioVolume)
+        d.set(memoryRecallEnabled, forKey: Keys.memoryRecallEnabled)
+        d.set(memoryTopK, forKey: Keys.memoryTopK)
     }
 
     func robotEndpoint() -> RobotEndpoint {
@@ -199,5 +215,7 @@ final class SettingsStore {
         static let faceMatchThreshold = "rocky.face.match.threshold"
         static let audioVolume = "rocky.audio.volume"
         static let personaVersion = "rocky.persona.version"
+        static let memoryRecallEnabled = "rocky.memory.recall.enabled"
+        static let memoryTopK = "rocky.memory.topk"
     }
 }
