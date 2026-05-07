@@ -26,6 +26,20 @@ struct RootView: View {
                 InspectorView()
                     .inspectorColumnWidth(min: 320, ideal: 380, max: 520)
             }
+            .overlay {
+                // First-run overlay — shows when the user has never
+                // completed (or explicitly skipped) the introductory
+                // flow. The overlay sits on top of the live cockpit
+                // (rather than blocking it) so the avatar's animation
+                // is visible behind the dim, giving a sense that
+                // Rocky is *there* during onboarding.
+                if !services.settings.firstRunCompleted {
+                    FirstRunOverlay()
+                        .transition(.opacity)
+                }
+            }
+            .animation(.easeInOut(duration: 0.25),
+                       value: services.settings.firstRunCompleted)
     }
 
     @ToolbarContentBuilder

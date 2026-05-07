@@ -47,6 +47,18 @@ struct RockyApp: App {
                 }
                 .keyboardShortcut("r", modifiers: [.option, .command])
             }
+            // Help menu: re-trigger the first-run flow on demand. The
+            // overlay shows whenever firstRunCompleted is false and
+            // disappears the moment it's set true; toggling here is
+            // the recovery path for "I want to revisit setup."
+            CommandGroup(replacing: .help) {
+                Button("Show First Run") {
+                    services.settings.firstRunCompleted = false
+                    NSApp.activate(ignoringOtherApps: true)
+                    NSApp.windows.first(where: { $0.title == "Rocky" })?
+                        .makeKeyAndOrderFront(nil)
+                }
+            }
         }
 
         // Per the cockpit design (`docs/concepts/cockpit-design.md`),
