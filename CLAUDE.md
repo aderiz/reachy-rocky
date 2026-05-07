@@ -6,7 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Rocky** — a native macOS app that acts as the *nervous system* for a **Reachy Mini Wireless** robot. Cognition (LM Studio brain), perception (face tracking), audition (mic + STT), voice (cloned-voice TTS via Chatterbox FP16), and observability all run on the Mac; the robot is reduced to a clean network endpoint over REST + WebSocket.
 
-Robot variant: **Wireless** (CM4 onboard, WiFi). The robot daemon listens at `http://reachy-mini.local:8000` (live OpenAPI snapshot at `docs/sources/daemon-openapi-1.7.1.md`).
+- **OS target**: macOS 15+, Apple Silicon. Swift 6, SwiftUI.
+- **Bundle ID**: `ai.amplified.Rocky` (drives TCC, `defaults read/write`, Console.app filtering).
+- **Robot variant**: Wireless (CM4 onboard, WiFi). Daemon at `http://reachy-mini.local:8000` — live OpenAPI snapshot in `docs/sources/daemon-openapi-1.7.1.md`.
+- **LLM**: LM Studio (OpenAI-compatible at `localhost:1234/v1`). Default model: `gemma-4-e4b-it-mlx`.
 
 The implementation plan lives at `~/.claude/plans/i-d-like-this-to-swirling-octopus.md`. Always read it for the rationale behind a structural choice before changing one.
 
@@ -33,6 +36,12 @@ These are easy to get wrong. Source of truth: `docs/sources/daemon-openapi-1.7.1
 - `GET /api/state/full` returns `control_mode` (NOT `motor_mode`), `head_pose` as **RPY object** (NOT a 16-element matrix), `antennas_position` (NOT `antennas`).
 - `is_move_running` is NOT in `state/full`; derive from `/api/move/running` being non-empty.
 - The state WebSocket lives at `ws://reachy-mini.local:8000/api/state/ws/full` despite not being advertised in OpenAPI.
+
+### LLM tool-call format (Gemma fallback)
+
+Some models — Gemma 4 in particular — don't reliably emit OpenAI `tool_calls`. They wrap invocations in markdown ` ```json ` fences instead. `CognitionEngine.extractFencedToolCalls` recovers these as real tool calls and `stripFencedJSONBlocks` keeps the displayed transcript clean. The persona prompt (`SettingsStore.defaultPersona`) documents both formats. **Don't remove either path** without verifying the active model emits native `tool_calls`.
+
+For models with strong native tool calling (e.g., `qwen3.6-27b@4bit`), the fenced path is a no-op fallback.
 
 ## Build, run, test
 
@@ -71,7 +80,21 @@ FT_EXTRAS=mlx ./Sidecars/mlx-tts/setup.sh       # Chatterbox FP16 via mlx-audio
 ./Sidecars/robot-mic/setup.sh                   # reachy_mini SDK over WebRTC
 ```
 
-Venvs are written to `~/Library/Application Support/Rocky/sidecars/<name>/.venv/`. AppServices auto-detects venv presence to pick defaults: robot mic when `robot-mic/.venv` exists, Chatterbox TTS when `mlx-tts/.venv` exists.
+Venvs are written to `~/Library/Application Support/Rocky/sidecars/<name>/.venv/`. AppServices auto-detects venv presence to pick defaults: robot mic when `robot-mic/.venv` exists, Chatterbox TTS when `mlx-tts/.venv` exists. **The face-tracker sidecar defaults to `synthetic` mode** — set `ROCKY_FT_MODE=sam` in its manifest (or env) to switch to SAM 3.1 once the `[sam]` extras are installed.
+
+### Resetting state
+
+```bash
+# Reset all UserDefaults (settings, persona, model, mic source, TTS backend)
+defaults delete ai.amplified.Rocky
+
+# If TCC permission prompts get stuck, reset and re-prompt
+tccutil reset Microphone           ai.amplified.Rocky
+tccutil reset SpeechRecognition    ai.amplified.Rocky
+
+# Nuke a sidecar venv to force a fresh setup.sh
+rm -rf "$HOME/Library/Application Support/Rocky/sidecars/<name>/.venv"
+```
 
 ## Conventions
 
