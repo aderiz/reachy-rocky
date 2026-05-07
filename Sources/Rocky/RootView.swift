@@ -31,19 +31,19 @@ struct RootView: View {
             SidebarView(selection: $selection)
                 .navigationSplitViewColumnWidth(min: 200, ideal: 220)
         } detail: {
-            switch selection {
-            case .dashboard: DashboardView()
-            case .status:    StatusView()
-            case .logs:      LogsView()
-            case .settings:  SettingsView()
+            ZStack {
+                BackgroundGradient().ignoresSafeArea()
+                Group {
+                    switch selection {
+                    case .dashboard: DashboardView()
+                    case .status:    StatusView()
+                    case .logs:      LogsView()
+                    case .settings:  SettingsView()
+                    }
+                }
             }
         }
-        .navigationTitle("Rocky")
-        .toolbar {
-            ToolbarItem(placement: .navigation) {
-                ConnectionBadge(reachability: services.daemonReachability)
-            }
-        }
+        .navigationTitle("")
     }
 }
 
@@ -60,48 +60,85 @@ private struct SidebarView: View {
     }
 }
 
+private struct BackgroundGradient: View {
+    var body: some View {
+        LinearGradient(
+            colors: [
+                Color(red: 0.04, green: 0.05, blue: 0.07),
+                Color(red: 0.08, green: 0.09, blue: 0.13),
+            ],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
+    }
+}
+
 private struct DashboardView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
+                DashboardHeader()
                 HeroCard()
                 BrainCard()
                 VoiceCard()
                 MotionCard()
                 VisionCard()
             }
-            .padding(20)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 22)
+            .frame(maxWidth: 980, alignment: .topLeading)
+            .frame(maxWidth: .infinity)
         }
     }
 }
 
-private struct ConnectionBadge: View {
-    let reachability: AppServices.Reachability
+private struct DashboardHeader: View {
+    @Environment(AppServices.self) private var services
 
     var body: some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(color)
-                .frame(width: 8, height: 8)
-            Text(label)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+        HStack(spacing: 14) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Rocky")
+                    .font(.system(size: 28, weight: .bold, design: .rounded))
+                Text("Your virtual coworker")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            connectionBadge
+            modelBadge
+        }
+        .padding(.bottom, 4)
+    }
+
+    @ViewBuilder
+    private var connectionBadge: some View {
+        switch services.daemonReachability {
+        case .unknown:
+            StatusPill(text: "robot · checking",
+                       tint: .secondary, systemImage: "antenna.radiowaves.left.and.right")
+        case .online:
+            StatusPill(text: "robot · online",
+                       tint: .green, systemImage: "antenna.radiowaves.left.and.right")
+        case .offline(let reason):
+            StatusPill(text: "robot · offline",
+                       tint: .red, systemImage: "antenna.radiowaves.left.and.right.slash")
+                .help(reason)
         }
     }
 
-    private var color: Color {
-        switch reachability {
-        case .unknown:  .gray
-        case .online:   .green
-        case .offline:  .red
-        }
-    }
-
-    private var label: String {
-        switch reachability {
-        case .unknown:           "checking…"
-        case .online:            "online"
-        case .offline(let why):  "offline · \(why)"
+    @ViewBuilder
+    private var modelBadge: some View {
+        switch services.llmStatus {
+        case .unknown:
+            StatusPill(text: "brain · checking",
+                       tint: .secondary, systemImage: "brain")
+        case .online(let model):
+            StatusPill(text: "brain · \(model)",
+                       tint: .accentColor, systemImage: "brain")
+        case .offline:
+            StatusPill(text: "brain · offline",
+                       tint: .red, systemImage: "brain")
         }
     }
 }

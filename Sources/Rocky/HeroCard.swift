@@ -1,83 +1,99 @@
 import SwiftUI
 
-/// Hero card. Five visual states tied to `AppServices.rockyState`:
-///   .idle      — slow breathing dot, "Idle"
-///   .listening — concentric ring pulse, "Listening"
-///   .thinking  — circular spinner, "Thinking"
-///   .speaking  — staggered four-bar VU animation, "Speaking"
-///   .error     — red ring, message
-///
-/// Three latency pills surface honest TTFT/STT/TTS-first-chunk timings
-/// when known (per the plan's "latency-honest" UX principle).
+/// Hero card — Rocky's presence. A real avatar that physically tracks the
+/// live head pose + antenna joints, with state-driven facial expressions
+/// (eyes open / blink / mouth animation per `RockyState`). Latency pills
+/// summarise the loop's honesty (LLM TTFT, STT, TTS first chunk).
 struct HeroCard: View {
     @Environment(AppServices.self) private var services
 
     var body: some View {
         let state = services.rockyState
 
-        HStack(alignment: .top, spacing: 16) {
-            HeroIcon(state: state)
-                .frame(width: 72, height: 72)
+        Card {
+            // No header — Rocky himself is the header.
+            EmptyView()
+        } content: {
+            HStack(alignment: .center, spacing: 24) {
+                RockyAvatar(
+                    state: state,
+                    pose: services.lastRobotState?.headPose,
+                    antennas: services.lastRobotState?.antennasPosition,
+                    size: 140
+                )
+                .padding(.leading, 4)
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Rocky")
-                    .font(.title2.weight(.semibold))
-
-                Text(label(for: state))
-                    .font(.subheadline)
-                    .foregroundStyle(color(for: state))
-
-                HStack(spacing: 6) {
-                    if let llm = lastLLMTotalMs {
-                        Pill(label: "LLM", ms: llm, tint: .accentColor)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Rocky")
+                        .font(.system(size: 30, weight: .semibold, design: .rounded))
+                    Text(label(for: state))
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(color(for: state))
+                    HStack(spacing: 6) {
+                        if let llm = lastLLMTotalMs {
+                            StatusPill(text: "LLM \(Int(llm))ms", tint: .accentColor)
+                        }
+                        if let tts = lastTTSFirstChunkMs {
+                            StatusPill(text: "TTS \(Int(tts))ms", tint: .indigo)
+                        }
                     }
-                    if let stt = lastSTTMs {
-                        Pill(label: "STT", ms: stt, tint: .teal)
-                    }
-                    if let tts = lastTTSFirstChunkMs {
-                        Pill(label: "TTS", ms: tts, tint: .indigo)
+                    if case .error(let message) = state {
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .lineLimit(2)
+                            .padding(.top, 2)
                     }
                 }
-                .padding(.top, 2)
-            }
-            Spacer()
 
-            VStack(alignment: .trailing, spacing: 6) {
-                actionRow
-                if case .error(let message) = state {
-                    Text(message)
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                        .lineLimit(2)
-                        .multilineTextAlignment(.trailing)
-                        .frame(maxWidth: 220, alignment: .trailing)
+                Spacer()
+
+                VStack(spacing: 10) {
+                    iconButton(
+                        services.micEnabled ? "mic.slash.fill" : "mic.fill",
+                        active: services.micEnabled,
+                        tint: .green
+                    ) { Task { await services.toggleMic() } }
+                    iconButton(
+                        services.ttsMuted ? "speaker.slash.fill" : "speaker.wave.2.fill",
+                        active: !services.ttsMuted,
+                        tint: .blue
+                    ) { Task { await services.toggleTTSMute() } }
                 }
+                .padding(.trailing, 4)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(20)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
     }
 
-    private var actionRow: some View {
-        HStack(spacing: 6) {
-            ActionChip(systemImage: services.micEnabled ? "mic.slash.fill" : "mic.fill",
-                       label: services.micEnabled ? "Mute mic" : "Listen") {
-                Task { await services.toggleMic() }
-            }
-            ActionChip(systemImage: services.ttsMuted ? "speaker.slash.fill" : "speaker.wave.2.fill",
-                       label: services.ttsMuted ? "Unmute" : "Mute voice") {
-                Task { await services.toggleTTSMute() }
-            }
+    @ViewBuilder
+    private func iconButton(_ name: String,
+                            active: Bool,
+                            tint: Color,
+                            action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: name)
+                .font(.system(size: 16, weight: .semibold))
+                .frame(width: 38, height: 38)
+                .background(
+                    Circle().fill(active ? tint.opacity(0.18) : .gray.opacity(0.08))
+                )
+                .overlay(
+                    Circle().stroke(active ? tint.opacity(0.5) : .gray.opacity(0.25),
+                                    lineWidth: 1)
+                )
+                .foregroundStyle(active ? tint : .secondary)
         }
+        .buttonStyle(.plain)
     }
 
     private func label(for state: AppServices.RockyState) -> String {
         switch state {
-        case .idle:                "Idle"
-        case .listening:           "Listening"
-        case .thinking:            "Thinking"
+        case .idle:                "Sitting quietly. Say \u{201C}Rocky\u{201D} to start."
+        case .listening:           "Listening\u{2026}"
+        case .thinking:            "Thinking\u{2026}"
         case .speaking:            "Speaking"
-        case .error:               "Error"
+        case .error:               "Something needs attention"
         }
     }
 
@@ -95,152 +111,5 @@ struct HeroCard: View {
         services.brainTurns.reversed().first(where: { $0.role == "assistant" })?.totalMs
     }
 
-    private var lastSTTMs: Double? {
-        // We don't store STT latency directly on AppServices yet; return nil
-        // until we lift it through the VoiceCoordinator. Pill is hidden.
-        nil
-    }
-
-    private var lastTTSFirstChunkMs: Double? {
-        // RobotTTS.lastStats.synthMs is on the actor; we mirror it via the
-        // `ttsBusyUntil` setter, but for now keep this empty so we don't lie.
-        nil
-    }
-}
-
-private struct HeroIcon: View {
-    let state: AppServices.RockyState
-    @State private var phase: Double = 0
-
-    var body: some View {
-        ZStack {
-            Circle()
-                .strokeBorder(borderColor, lineWidth: 2)
-            switch state {
-            case .idle:
-                Circle()
-                    .fill(.thinMaterial)
-                    .frame(width: 24 + breath * 12, height: 24 + breath * 12)
-            case .listening:
-                ListeningPulse()
-            case .thinking:
-                ProgressView()
-                    .progressViewStyle(.circular)
-                    .controlSize(.regular)
-            case .speaking:
-                SpeakingBars()
-            case .error:
-                Image(systemName: "exclamationmark")
-                    .font(.system(size: 28, weight: .bold))
-                    .foregroundStyle(.red)
-            }
-        }
-        .animation(.easeInOut(duration: 0.25), value: stateKey)
-        .onAppear { animateBreathing() }
-    }
-
-    private var stateKey: String {
-        switch state {
-        case .idle: "idle"
-        case .listening: "listening"
-        case .thinking: "thinking"
-        case .speaking: "speaking"
-        case .error: "error"
-        }
-    }
-
-    private var borderColor: Color {
-        switch state {
-        case .idle:      .gray.opacity(0.6)
-        case .listening: .green
-        case .thinking:  .orange
-        case .speaking:  .blue
-        case .error:     .red
-        }
-    }
-
-    private var breath: Double {
-        // Slow breathing in idle.
-        (sin(phase) + 1) / 2
-    }
-
-    private func animateBreathing() {
-        withAnimation(.easeInOut(duration: 3).repeatForever(autoreverses: true)) {
-            phase = .pi
-        }
-    }
-}
-
-private struct ListeningPulse: View {
-    @State private var scale: Double = 0.5
-
-    var body: some View {
-        ZStack {
-            Circle()
-                .strokeBorder(.green, lineWidth: 1.5)
-                .scaleEffect(scale)
-                .opacity(2 - scale)
-            Circle()
-                .fill(.green.opacity(0.15))
-                .frame(width: 18, height: 18)
-        }
-        .onAppear {
-            withAnimation(.easeOut(duration: 1.4).repeatForever(autoreverses: false)) {
-                scale = 1.5
-            }
-        }
-    }
-}
-
-private struct SpeakingBars: View {
-    @State private var heights: [Double] = [0.3, 0.6, 0.9, 0.5]
-
-    var body: some View {
-        HStack(spacing: 3) {
-            ForEach(0..<4, id: \.self) { i in
-                Capsule()
-                    .fill(.blue)
-                    .frame(width: 4, height: max(6, heights[i] * 24))
-            }
-        }
-        .frame(height: 28)
-        .onAppear {
-            withAnimation(.easeInOut(duration: 0.4).repeatForever(autoreverses: true)) {
-                heights = [0.9, 0.4, 0.7, 1.0]
-            }
-        }
-    }
-}
-
-private struct ActionChip: View {
-    let systemImage: String
-    let label: String
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            Label(label, systemImage: systemImage)
-                .labelStyle(.iconOnly)
-                .frame(width: 24, height: 24)
-        }
-        .buttonStyle(.bordered)
-        .controlSize(.small)
-        .help(label)
-    }
-}
-
-private struct Pill: View {
-    let label: String
-    let ms: Double
-    let tint: Color
-
-    var body: some View {
-        HStack(spacing: 4) {
-            Circle().fill(tint).frame(width: 5, height: 5)
-            Text("\(label) \(Int(ms))ms")
-                .font(.caption2.monospacedDigit())
-        }
-        .padding(.horizontal, 6).padding(.vertical, 2)
-        .background(.ultraThinMaterial, in: Capsule())
-    }
+    private var lastTTSFirstChunkMs: Double? { nil }
 }

@@ -4,103 +4,118 @@ struct VoiceCard: View {
     @Environment(AppServices.self) private var services
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 12) {
-                Label("Voice", systemImage: "waveform")
-                    .font(.headline)
-                Spacer()
-                Text("STT: \(services.sttBackendName)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        Card {
+            CardHeader("Voice", icon: "waveform") {
+                if !services.sttBackendName.isEmpty {
+                    Text(services.sttBackendName)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                }
                 conversationPill
                 Button {
                     Task { await services.toggleMic() }
                 } label: {
-                    Label(
-                        services.micEnabled ? "Stop listening" : "Start listening",
-                        systemImage: services.micEnabled
-                            ? "mic.slash.fill" : "mic.fill"
-                    )
-                    .labelStyle(.titleAndIcon)
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-            }
-
-            HStack(alignment: .top, spacing: 16) {
-                VUMeter(level: CGFloat(min(1, services.lastMicRMS * 8)))
-                    .frame(width: 96, height: 64)
-
-                VStack(alignment: .leading, spacing: 4) {
-                    if let err = services.voiceErrorMessage {
-                        Label(err, systemImage: "exclamationmark.triangle")
-                            .font(.caption).foregroundStyle(.red)
+                    HStack(spacing: 6) {
+                        Image(systemName: services.micEnabled ? "stop.fill" : "mic.fill")
+                        Text(services.micEnabled ? "Stop" : "Listen")
+                            .fontWeight(.medium)
                     }
-                    Text("Last transcript")
-                        .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                    Text(services.lastTranscript.isEmpty
-                         ? "—"
-                         : "\u{201C}\(services.lastTranscript)\u{201D}")
-                        .font(.body)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(
+                        Capsule().fill(services.micEnabled
+                                       ? Color.red.opacity(0.18)
+                                       : Color.green.opacity(0.18))
+                    )
+                    .foregroundStyle(services.micEnabled ? .red : .green)
+                }
+                .buttonStyle(.plain)
+            }
+        } content: {
+            VStack(alignment: .leading, spacing: 14) {
+                VUMeter(level: CGFloat(min(1, services.lastMicRMS * 8)),
+                        active: services.micEnabled)
+                    .frame(height: 22)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    SectionLabel(text: "Last transcript")
+                    Text(transcriptText)
+                        .font(.callout)
+                        .foregroundStyle(transcriptStyle)
                         .textSelection(.enabled)
-                        .lineLimit(2)
+                        .frame(maxWidth: .infinity, minHeight: 38, alignment: .leading)
+                        .padding(12)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(Color.gray.opacity(0.06))
+                        )
 
                     if !services.lastTranscript.isEmpty {
                         if services.lastDispatched == services.lastTranscript {
-                            Text("→ dispatched to brain")
-                                .font(.caption.monospaced())
+                            Label("Routed to brain", systemImage: "arrow.right.circle.fill")
+                                .font(.caption.weight(.medium))
                                 .foregroundStyle(.green)
                         } else {
-                            Text("(no wake word \u{2014} say \u{201C}Rocky, \u{2026}\u{201D})")
+                            Label("Not dispatched — say \u{201C}Rocky, \u{2026}\u{201D}",
+                                  systemImage: "info.circle")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
                     }
+
+                    if let err = services.voiceErrorMessage {
+                        Label(err, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
                 }
-                Spacer()
             }
         }
-        .padding(16)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
+    }
+
+    private var transcriptText: String {
+        services.lastTranscript.isEmpty
+            ? "\u{2014}"   // em dash placeholder
+            : "\u{201C}\(services.lastTranscript)\u{201D}"
+    }
+
+    private var transcriptStyle: Color {
+        services.lastTranscript.isEmpty ? .secondary : .primary
     }
 
     @ViewBuilder
     private var conversationPill: some View {
         if let until = services.conversationOpenUntil {
             let secs = max(0, Int(until.timeIntervalSinceNow))
-            HStack(spacing: 4) {
-                Circle().fill(.green).frame(width: 6, height: 6)
-                Text("listening · \(secs)s")
-                    .font(.caption.monospaced())
-            }
-            .padding(.horizontal, 8).padding(.vertical, 3)
-            .background(.ultraThinMaterial, in: Capsule())
+            StatusPill(text: "listening · \(secs)s", tint: .green,
+                       systemImage: "mic.fill")
+        } else if services.micEnabled {
+            StatusPill(text: "waiting for wake word", tint: .secondary,
+                       systemImage: "ear")
         } else {
-            HStack(spacing: 4) {
-                Circle().fill(.gray).frame(width: 6, height: 6)
-                Text("waiting for wake word")
-                    .font(.caption)
-            }
-            .padding(.horizontal, 8).padding(.vertical, 3)
-            .background(.ultraThinMaterial, in: Capsule())
+            EmptyView()
         }
     }
 }
 
 private struct VUMeter: View {
-    let level: CGFloat        // 0 .. 1
+    let level: CGFloat            // 0...1
+    let active: Bool
 
     var body: some View {
         GeometryReader { geo in
-            ZStack(alignment: .bottom) {
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(.gray.opacity(0.15))
-                LinearGradient(
-                    colors: [.green, .yellow, .red],
-                    startPoint: .bottom, endPoint: .top
-                )
-                .frame(height: max(2, level * geo.size.height))
-                .clipShape(RoundedRectangle(cornerRadius: 6))
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(.gray.opacity(0.10))
+                if active {
+                    LinearGradient(
+                        colors: [.green, .yellow, .red],
+                        startPoint: .leading, endPoint: .trailing
+                    )
+                    .frame(width: max(4, level * geo.size.width))
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .animation(.easeOut(duration: 0.06), value: level)
+                }
             }
         }
     }

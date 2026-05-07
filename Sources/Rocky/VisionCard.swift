@@ -1,56 +1,73 @@
 import SwiftUI
 import Vision
 
+/// VisionCard — what Rocky sees. Shows the (synthetic or real) face-tracker
+/// preview with a face bbox overlay + the controller's commanded gaze
+/// direction. Info row shows yaw/pitch + counters.
 struct VisionCard: View {
     @Environment(AppServices.self) private var services
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Label("Vision", systemImage: "eye")
-                    .font(.headline)
-                Spacer()
-                StatusPill(active: services.lastFaceDetection != nil,
-                           label: services.lastFaceDetection != nil ? "tracking" : "no face")
+        Card {
+            CardHeader("Vision", icon: "eye") {
+                StatusPill(
+                    text: services.lastFaceDetection != nil ? "tracking" : "idle",
+                    tint: services.lastFaceDetection != nil ? .green : .secondary,
+                    systemImage: services.lastFaceDetection != nil ? "viewfinder" : "circle"
+                )
             }
-
-            HStack(alignment: .top, spacing: 16) {
-                FaceCanvas(
+        } content: {
+            HStack(alignment: .top, spacing: 18) {
+                FacePreview(
                     detection: services.lastFaceDetection,
                     target: services.lastFaceTarget
                 )
-                .frame(width: 240, height: 135)
+                .frame(width: 360, height: 200)
 
-                VStack(alignment: .leading, spacing: 6) {
-                    metric("yaw target", value: services.lastFaceTarget?.yawRad,
-                           degrees: true)
-                    metric("pitch target", value: services.lastFaceTarget?.pitchRad,
-                           degrees: true)
-                    Divider()
-                    Text("\(services.faceTargetCount) target events · \(services.faceDetectionCount) detections")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 14) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        SectionLabel(text: "World target")
+                        HStack(spacing: 14) {
+                            metric("yaw",
+                                   value: services.lastFaceTarget?.yawRad,
+                                   degrees: true)
+                            metric("pitch",
+                                   value: services.lastFaceTarget?.pitchRad,
+                                   degrees: true)
+                        }
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        SectionLabel(text: "Counters")
+                        Text("\(services.faceTargetCount.formatted()) targets")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                        Text("\(services.faceDetectionCount.formatted()) detections")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+
                     if services.lastFaceTarget?.decayActive == true {
-                        Label("idle decay", systemImage: "leaf")
-                            .font(.caption)
+                        Label("Idle decay → home", systemImage: "house.circle")
+                            .font(.caption.weight(.medium))
                             .foregroundStyle(.orange)
                     }
+                    Spacer()
                 }
-                Spacer()
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(16)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
     }
 
     @ViewBuilder
     private func metric(_ label: String, value: Double?, degrees: Bool) -> some View {
-        HStack(spacing: 6) {
-            Text(label)
-                .font(.caption)
+        VStack(alignment: .leading, spacing: 1) {
+            Text(label.uppercased())
+                .font(.caption2.weight(.medium))
+                .tracking(0.4)
                 .foregroundStyle(.secondary)
             Text(format(value, degrees: degrees))
-                .font(.caption.monospacedDigit())
+                .font(.body.monospacedDigit().weight(.medium))
         }
     }
 
@@ -61,38 +78,43 @@ struct VisionCard: View {
     }
 }
 
-private struct StatusPill: View {
-    let active: Bool
-    let label: String
-    var body: some View {
-        HStack(spacing: 4) {
-            Circle()
-                .fill(active ? Color.green : Color.gray)
-                .frame(width: 6, height: 6)
-            Text(label).font(.caption.weight(.medium))
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 3)
-        .background(.ultraThinMaterial, in: Capsule())
-    }
-}
-
-private struct FaceCanvas: View {
+private struct FacePreview: View {
     let detection: Vision.FaceTrackerService.Detection?
     let target: Vision.FaceTrackerService.Target?
 
     var body: some View {
         Canvas { ctx, size in
-            // Frame outline.
-            let frame = CGRect(origin: .zero, size: size).insetBy(dx: 1, dy: 1)
-            ctx.stroke(
-                Path(roundedRect: frame, cornerRadius: 8),
-                with: .color(.gray.opacity(0.5)),
-                lineWidth: 1
+            // Cinematic background gradient
+            let bg = LinearGradient(
+                colors: [
+                    Color(red: 0.06, green: 0.07, blue: 0.10),
+                    Color(red: 0.10, green: 0.12, blue: 0.16),
+                ],
+                startPoint: .topLeading, endPoint: .bottomTrailing
             )
+            ctx.fill(Path(roundedRect: CGRect(origin: .zero, size: size),
+                          cornerRadius: 12),
+                     with: .linearGradient(
+                        Gradient(colors: [
+                            Color(red: 0.06, green: 0.07, blue: 0.10),
+                            Color(red: 0.10, green: 0.12, blue: 0.16),
+                        ]),
+                        startPoint: .zero, endPoint: CGPoint(x: size.width, y: size.height)))
+            _ = bg
+            // Subtle horizon line
+            var hpath = Path()
+            hpath.move(to: CGPoint(x: 0, y: size.height / 2))
+            hpath.addLine(to: CGPoint(x: size.width, y: size.height / 2))
+            ctx.stroke(hpath, with: .color(.white.opacity(0.07)),
+                       style: StrokeStyle(lineWidth: 1, dash: [3, 4]))
+            var vpath = Path()
+            vpath.move(to: CGPoint(x: size.width / 2, y: 0))
+            vpath.addLine(to: CGPoint(x: size.width / 2, y: size.height))
+            ctx.stroke(vpath, with: .color(.white.opacity(0.07)),
+                       style: StrokeStyle(lineWidth: 1, dash: [3, 4]))
 
+            // Detection bbox (if any)
             if let det = detection {
-                // Map normalized bbox → canvas coords.
                 let scaleX = size.width / CGFloat(det.frameWidth)
                 let scaleY = size.height / CGFloat(det.frameHeight)
                 let r = CGRect(
@@ -101,31 +123,49 @@ private struct FaceCanvas: View {
                     width: det.bbox.width * scaleX,
                     height: det.bbox.height * scaleY
                 )
-                ctx.stroke(
-                    Path(roundedRect: r, cornerRadius: 4),
-                    with: .color(.green),
-                    lineWidth: 2
-                )
+                // Soft fill + green frame
+                ctx.fill(Path(roundedRect: r, cornerRadius: 8),
+                         with: .color(.green.opacity(0.10)))
+                ctx.stroke(Path(roundedRect: r, cornerRadius: 8),
+                           with: .color(.green),
+                           style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                // Confidence label
+                let confText = Text(String(format: "%.0f%%", det.confidence * 100))
+                    .font(.caption.monospacedDigit().bold())
+                    .foregroundColor(.white)
+                ctx.draw(confText,
+                         at: CGPoint(x: r.minX + 6, y: r.minY + 10),
+                         anchor: .leading)
             }
 
-            // Target arrow at the canvas center.
+            // Target arrow (yaw, pitch) projected from frame center
             let center = CGPoint(x: size.width / 2, y: size.height / 2)
             let yaw = target?.yawRad ?? 0
             let pitch = target?.pitchRad ?? 0
-            // Visual scale: ~1 rad = 60 px (for a tiny preview pane).
-            let dx = -CGFloat(yaw) * 60
-            let dy = CGFloat(pitch) * 60
+            let dx = -CGFloat(yaw) * size.width * 0.45
+            let dy = CGFloat(pitch) * size.height * 0.45
             let tip = CGPoint(x: center.x + dx, y: center.y + dy)
 
-            var path = Path()
-            path.move(to: center)
-            path.addLine(to: tip)
-            ctx.stroke(path, with: .color(.accentColor), lineWidth: 2)
+            var arrow = Path()
+            arrow.move(to: center)
+            arrow.addLine(to: tip)
+            ctx.stroke(arrow, with: .color(.accentColor),
+                       style: StrokeStyle(lineWidth: 3, lineCap: .round))
             ctx.fill(
-                Path(ellipseIn: CGRect(x: tip.x - 3, y: tip.y - 3, width: 6, height: 6)),
+                Path(ellipseIn: CGRect(x: tip.x - 5, y: tip.y - 5,
+                                       width: 10, height: 10)),
                 with: .color(.accentColor)
             )
+            ctx.fill(
+                Path(ellipseIn: CGRect(x: center.x - 3, y: center.y - 3,
+                                       width: 6, height: 6)),
+                with: .color(.white.opacity(0.8))
+            )
         }
-        .background(Color.black.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(.white.opacity(0.08), lineWidth: 1)
+        )
     }
 }

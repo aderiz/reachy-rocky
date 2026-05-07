@@ -18,7 +18,8 @@ let package = Package(
         .executableTarget(
             name: "Rocky",
             dependencies: ["RockyKit", "Telemetry", "SidecarHost", "RobotLink", "Vision", "Voice", "Cognition"],
-            path: "Sources/Rocky"
+            path: "Sources/Rocky",
+            exclude: []
         ),
         .target(
             name: "RockyKit",
