@@ -304,6 +304,9 @@ final class AppServices {
                     self.lastFaceDetection = mapped
                     self.faceDetectionCount &+= 1
                 }
+                // A face was just detected — if Rocky is asleep, wake him
+                // so the targets we're computing can actually move the head.
+                await self.maybeAutoWake()
             }
         }
         let macTargets = await macFaceTracker.targets
@@ -399,37 +402,14 @@ final class AppServices {
         }
 
         // Pump face-tracker events into observable mirrors.
-        // Face-tracker target events arrive at 50 Hz. Mirroring every one
-        // into Observable state thrashes SwiftUI redraws (TextField focus
-        // loss, jittery layout). Coalesce to 10 Hz max for the UI; the
-        // 50 Hz robot command stream still happens via TargetStreamer.
-        let targets = faceTracker.targets
-        let detections = faceTracker.detections
-        Task { [weak self] in
-            var lastUpdate = Date.distantPast
-            var counter: Int = 0
-            for await t in targets {
-                guard let self else { return }
-                counter += 1
-                let now = Date()
-                if now.timeIntervalSince(lastUpdate) < 0.1 { continue }
-                lastUpdate = now
-                let snapshot = counter
-                await MainActor.run {
-                    self.lastFaceTarget = t
-                    self.faceTargetCount = snapshot
-                }
-            }
-        }
-        Task { [weak self] in
-            for await d in detections {
-                guard let self else { return }
-                await MainActor.run {
-                    self.lastFaceDetection = d
-                    self.faceDetectionCount &+= 1
-                }
-            }
-        }
+        // The Python face-tracker sidecar is still running in synthetic
+        // mode but is no longer the source of truth — Mac face tracker is.
+        // Drain its streams to keep them from blocking but discard the
+        // events so they don't overwrite the real Mac data in the UI.
+        let pyTargets = faceTracker.targets
+        let pyDetections = faceTracker.detections
+        Task { for await _ in pyTargets {} }
+        Task { for await _ in pyDetections {} }
 
         // First daemon health probe. Failure is expected when the robot is off.
         Task { [weak self] in
@@ -698,8 +678,8 @@ final class AppServices {
         }
     }
 
-    /// Has the auto-wake-on-connect logic already fired this session?
-    private var hasAutoWokenThisSession = false
+    /// Tracks the last successful auto-wake so we don't spam the daemon.
+    private var lastAutoWakeAt: Date?
 
     func wakeRobot() async {
         // The wake_up recorded move runs ~2-3s; give the avatar a small
@@ -732,23 +712,24 @@ final class AppServices {
         }
     }
 
-    /// Auto-wake Rocky if (a) we just confirmed the daemon is online, (b) the
-    /// reported motor mode is disabled / gravity-comp, and (c) we haven't
-    /// already triggered an auto-wake this session. Called from the state
-    /// stream loop; no-ops most of the time.
+    /// Auto-wake Rocky if (a) the daemon is online and (b) Rocky is reported
+    /// asleep. Rate-limited to once every 30 s so we don't spam if a wake
+    /// fails or the user explicitly puts him back to sleep. Called from
+    /// both the state stream and from the face-tracker pump (so detecting
+    /// a face wakes Rocky).
     fileprivate func maybeAutoWake() async {
-        guard !hasAutoWokenThisSession else { return }
         guard case .online = daemonReachability else { return }
-        guard isAsleep else {
-            // Already awake on connect — count it as "auto-handled" so we
-            // don't unnecessarily wake on a subsequent state blip.
-            hasAutoWokenThisSession = true
+        guard isAsleep else { return }
+        if let last = lastAutoWakeAt, Date().timeIntervalSince(last) < 30 {
             return
         }
-        hasAutoWokenThisSession = true
+        // If a wake/sleep transition is already in flight, leave it alone.
+        if let until = transitioningUntil, Date() < until { return }
+        lastAutoWakeAt = Date()
         await logBus.publish(.sidecarLog(
             sidecar: "app", level: .info,
-            message: "auto-waking robot on connect", fields: [:]
+            message: "auto-waking robot",
+            fields: ["reason": "asleep"]
         ))
         await wakeRobot()
     }
@@ -1126,9 +1107,9 @@ final class AppServices {
                 "PYTHONPATH": dir,
                 "ROCKY_ROBOT_HOST": "reachy-mini.local",
                 "ROCKY_ROBOT_PORT": "8000",
-                "ROCKY_CAM_FPS": "10",
-                "ROCKY_CAM_WIDTH": "480",
-                "ROCKY_CAM_QUALITY": "65",
+                "ROCKY_CAM_FPS": "30",
+                "ROCKY_CAM_WIDTH": "384",
+                "ROCKY_CAM_QUALITY": "55",
             ],
             readyTimeoutS: 30,
             shutdownGraceS: 3,
