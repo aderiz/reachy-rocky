@@ -285,8 +285,7 @@ final class AppServices {
         // we don't attach faceTargetBridge to its stream by default.
         await targetStreamer.start()
         await macFaceTracker.setStreamer(targetStreamer)
-        let frames = robotCamera.frames
-        await macFaceTracker.start(framesStream: frames)
+        await macFaceTracker.start()
 
         // Mirror Mac face tracker detections + targets into observable state
         // so the dashboard reflects what the Mac detector saw.
@@ -352,7 +351,10 @@ final class AppServices {
                 ))
             }
         }
-        // Mirror frames into observable state for SwiftUI.
+        // SINGLE consumer of the camera frame stream. Forwards each frame
+        // to both the SwiftUI mirror AND the Mac face tracker. AsyncStream
+        // is single-consumer; if the dashboard and the face tracker both
+        // subscribed independently, one of them would starve.
         let cameraFrames = robotCamera.frames
         Task { [weak self] in
             for await frame in cameraFrames {
@@ -361,6 +363,7 @@ final class AppServices {
                     self.lastCameraFrame = frame
                     self.cameraFrameCount &+= 1
                 }
+                await self.macFaceTracker.ingestFrame(frame)
             }
         }
 

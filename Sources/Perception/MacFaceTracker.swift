@@ -96,27 +96,23 @@ public actor MacFaceTracker {
         self.commandedPitch = pitchRad
     }
 
-    /// Start ingesting frames and the 50 Hz command tick.
-    public func start(framesStream: AsyncStream<RobotCameraService.Frame>) {
-        detectorTask?.cancel()
+    /// Start the 50 Hz command tick. Caller pushes frames in via `ingest(_:)`.
+    public func start() {
         commandTask?.cancel()
-
-        let fs = framesStream
-        detectorTask = Task { [weak self] in
-            for await frame in fs {
-                guard let self else { return }
-                await self.ingest(frame)
-                if Task.isCancelled { break }
-            }
-        }
         commandTask = Task { [weak self] in
             await self?.commandLoop()
         }
     }
 
     public func stop() {
-        detectorTask?.cancel(); detectorTask = nil
         commandTask?.cancel(); commandTask = nil
+    }
+
+    /// Public entry point — caller (AppServices) owns the camera frame
+    /// stream and forwards each frame here so we don't fight the UI mirror
+    /// for the single-consumer AsyncStream.
+    public func ingestFrame(_ frame: RobotCameraService.Frame) async {
+        await ingest(frame)
     }
 
     // MARK: - Ingest
