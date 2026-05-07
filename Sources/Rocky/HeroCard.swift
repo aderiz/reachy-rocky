@@ -26,7 +26,7 @@ struct HeroCard: View {
 
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Rocky")
-                        .font(.system(size: 30, weight: .semibold, design: .rounded))
+                        .font(.title.weight(.semibold))
                     HStack(spacing: 8) {
                         BotModeBadge(mode: services.botMode)
                         Text(label(for: state))
@@ -129,7 +129,7 @@ struct HeroCard: View {
                             action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: name)
-                .font(.system(size: 16, weight: .semibold))
+                .font(.headline)
                 .frame(width: 38, height: 38)
                 .background(
                     Circle().fill(active ? tint.opacity(0.18) : .gray.opacity(0.08))

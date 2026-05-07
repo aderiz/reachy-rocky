@@ -87,8 +87,7 @@ private struct AngleDial: View {
                     .rotationEffect(.degrees(180 + (normalized < 0 ? 0 : -90 * normalized)))
 
                 Text(String(format: "%+.1f°", displayDeg))
-                    .font(.system(size: 13, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
+                    .font(.body.monospacedDigit().weight(.semibold))
                     .offset(y: 4)
             }
             .frame(width: 78, height: 60)

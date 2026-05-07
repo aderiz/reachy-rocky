@@ -66,7 +66,7 @@ struct CockpitView: View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Cockpit")
-                    .font(.system(size: 24, weight: .bold, design: .rounded))
+                    .font(.title2.weight(.semibold))
                 Text(presenceLine)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
@@ -368,7 +368,7 @@ private struct TranscriptArea: View {
     private var emptyState: some View {
         VStack(spacing: 8) {
             Image(systemName: "bubble.left.and.bubble.right")
-                .font(.system(size: 32))
+                .font(.largeTitle)
                 .foregroundStyle(.secondary.opacity(0.6))
             Text("Nothing yet. Say Rocky's name, or type below.")
                 .font(.callout)

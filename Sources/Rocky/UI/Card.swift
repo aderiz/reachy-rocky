@@ -1,8 +1,16 @@
 import SwiftUI
 
-/// Unified container for every dashboard card. Establishes the chrome
-/// (radius, padding, material, title weight, divider rhythm) so the cards
-/// stop looking like seven independent rectangles.
+/// Unified container for grouping. Per `docs/concepts/cockpit-design.md`
+/// §4.3, cards are now the exception, not the rule — the cockpit's
+/// stage, hearing strip, and moment feed are not cards. Cards return
+/// only inside the inspector and Settings, where the grouping itself is
+/// meaningful.
+///
+/// Chrome simplified to system materials: `.regularMaterial` with a
+/// rounded clip, no shadow, no manual stroke. Materials adapt to
+/// light/dark + Reduce Transparency automatically; the stacked shadows
+/// the previous chrome carried fought the system materials and flattened
+/// hierarchy.
 struct Card<Header: View, Content: View>: View {
     let header: Header
     let content: Content
@@ -19,15 +27,8 @@ struct Card<Header: View, Content: View>: View {
         }
         .padding(20)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(.background.opacity(0.4))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(.white.opacity(0.06), lineWidth: 1)
-        )
-        .shadow(color: .black.opacity(0.20), radius: 16, x: 0, y: 6)
+        .background(.regularMaterial,
+                    in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
 

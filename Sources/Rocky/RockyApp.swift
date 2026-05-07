@@ -21,6 +21,9 @@ struct RockyApp: App {
         // identically — useful while iterating in Xcode's debugger.
         NSApplication.shared.setActivationPolicy(.regular)
         NSApplication.shared.activate(ignoringOtherApps: true)
+        // Install the ⌥⌘R "summon Rocky" hotkey — works from anywhere
+        // on the system. See docs/concepts/cockpit-design.md §3.5.
+        HotkeyMonitor.shared.install()
     }
 
     var body: some Scene {
@@ -31,6 +34,20 @@ struct RockyApp: App {
                 .task { await services.start() }
         }
         .windowResizability(.contentMinSize)
+        .commands {
+            // Surface the summon shortcut in the standard Help menu so
+            // users discover it. The hotkey itself is installed globally
+            // by HotkeyMonitor; the menu command also fires when the app
+            // is foregrounded.
+            CommandGroup(after: .windowArrangement) {
+                Button("Show Rocky") {
+                    NSApp.activate(ignoringOtherApps: true)
+                    NSApp.windows.first(where: { $0.title == "Rocky" })?
+                        .makeKeyAndOrderFront(nil)
+                }
+                .keyboardShortcut("r", modifiers: [.option, .command])
+            }
+        }
 
         // Per the cockpit design (`docs/concepts/cockpit-design.md`),
         // Settings lives in a real macOS Settings scene, not as a tab in

@@ -54,7 +54,7 @@ struct LogsView: View {
         HStack(alignment: .firstTextBaseline) {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Logs")
-                    .font(.system(size: 28, weight: .bold, design: .rounded))
+                    .font(.title.weight(.semibold))
                 Text("Every event Rocky published, in arrival order.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)

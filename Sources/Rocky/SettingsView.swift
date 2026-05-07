@@ -44,7 +44,7 @@ struct SettingsView: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Settings")
-                .font(.system(size: 28, weight: .bold, design: .rounded))
+                .font(.title.weight(.semibold))
             Text("Tune Rocky's connections and personality.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)

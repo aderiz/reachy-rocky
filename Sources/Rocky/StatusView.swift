@@ -86,7 +86,7 @@ struct StatusView: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Status")
-                .font(.system(size: 28, weight: .bold, design: .rounded))
+                .font(.title.weight(.semibold))
             HStack(spacing: 10) {
                 Text(summaryText).foregroundStyle(.secondary)
                 StatusPill(text: "\(healthyCount) / \(totalCount) healthy",
@@ -157,7 +157,7 @@ struct StatusView: View {
                     .fill(state.color.opacity(0.14))
                     .frame(width: 32, height: 32)
                 Image(systemName: icon)
-                    .font(.system(size: 14, weight: .semibold))
+                    .font(.callout.weight(.semibold))
                     .foregroundStyle(state.color)
             }
             VStack(alignment: .leading, spacing: 2) {
