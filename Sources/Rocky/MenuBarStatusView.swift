@@ -74,6 +74,8 @@ struct MenuBarStatusView: View {
 
     private var stateLabel: String {
         switch services.rockyState {
+        case .sleeping: "asleep"
+        case .waking: "waking up…"
         case .idle: "idle"
         case .listening: "listening"
         case .thinking: "thinking"
@@ -97,6 +99,15 @@ private struct StateBadge: View {
                 .strokeBorder(color, lineWidth: 1.6)
 
             switch state {
+            case .sleeping:
+                Image(systemName: "moon.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(color)
+            case .waking:
+                Image(systemName: "sun.max.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(color)
+                    .symbolEffect(.pulse, options: .repeating)
             case .idle:
                 Circle().fill(color).frame(width: 7, height: 7)
             case .listening:
@@ -136,6 +147,8 @@ private struct StateBadge: View {
 
     private var color: Color {
         switch state {
+        case .sleeping:   .gray
+        case .waking:     .yellow
         case .idle:       .secondary
         case .listening:  .green
         case .thinking:   .orange

@@ -97,11 +97,33 @@ final class AppServices {
     /// Coarse, glanceable state Rocky communicates from the menu bar and
     /// hero card. Computed from sub-states so the UI is honest.
     enum RockyState: Sendable, Equatable {
+        case sleeping        // motors disabled / gravity-comp; head slumped
+        case waking          // wake_up move in flight
         case idle
         case listening
         case thinking
         case speaking
         case error(String)
+
+        var isAwake: Bool {
+            switch self {
+            case .sleeping, .waking, .error: false
+            default: true
+            }
+        }
+    }
+
+    /// True while a wake_up / goto_sleep recorded move is in flight on the
+    /// daemon. Set by `wakeRobot` / `sleepRobot` and cleared a few seconds
+    /// later (the daemon doesn't send a "move-finished" signal we can
+    /// reliably poll, so we use a duration heuristic).
+    var transitioningUntil: Date?
+
+    /// True if Rocky is currently asleep (motors disabled / gravity-comp).
+    /// Read from the live state stream.
+    var isAsleep: Bool {
+        guard let mode = lastRobotState?.controlMode else { return false }
+        return mode == .disabled || mode == .gravityCompensation
     }
 
     var rockyState: RockyState {
@@ -109,15 +131,15 @@ final class AppServices {
         if case .offline(let reason) = daemonReachability {
             return .error("robot offline · \(reason)")
         }
-        if case .offline(let reason) = llmStatus {
-            // LM Studio off is yellow-but-not-red elsewhere; surface as error
-            // here only so the user sees something is wrong.
-            _ = reason
-        }
         if let voiceError = voiceErrorMessage, !voiceError.isEmpty {
             return .error(voiceError)
         }
-
+        if let until = transitioningUntil, Date() < until {
+            return .waking
+        }
+        if isAsleep {
+            return .sleeping
+        }
         if let until = ttsBusyUntil, Date() < until {
             return .speaking
         }
@@ -125,7 +147,6 @@ final class AppServices {
             return .thinking
         }
         if let until = conversationOpenUntil, Date() > until.addingTimeInterval(-60) {
-            // Window-open OR mic-on count as listening.
             if Date() < until { return .listening }
         }
         if micEnabled {
@@ -309,6 +330,8 @@ final class AppServices {
                         self.daemonReachability = .online
                     }
                 }
+                // Try to auto-wake if Rocky is slumped on first connect.
+                await self.maybeAutoWake()
             }
         }
 
@@ -555,9 +578,17 @@ final class AppServices {
         }
     }
 
+    /// Has the auto-wake-on-connect logic already fired this session?
+    private var hasAutoWokenThisSession = false
+
     func wakeRobot() async {
+        // Mark transition window so the UI can show "waking…" state.
+        await MainActor.run {
+            self.transitioningUntil = Date().addingTimeInterval(3.0)
+        }
         do { try await robotLink.wakeUp() }
         catch {
+            await MainActor.run { self.transitioningUntil = nil }
             await logBus.publish(.error(
                 scope: "app/wake", message: "\(error)", recoverable: true
             ))
@@ -565,12 +596,37 @@ final class AppServices {
     }
 
     func sleepRobot() async {
+        await MainActor.run {
+            self.transitioningUntil = Date().addingTimeInterval(3.0)
+        }
         do { try await robotLink.goToSleep() }
         catch {
+            await MainActor.run { self.transitioningUntil = nil }
             await logBus.publish(.error(
                 scope: "app/sleep", message: "\(error)", recoverable: true
             ))
         }
+    }
+
+    /// Auto-wake Rocky if (a) we just confirmed the daemon is online, (b) the
+    /// reported motor mode is disabled / gravity-comp, and (c) we haven't
+    /// already triggered an auto-wake this session. Called from the state
+    /// stream loop; no-ops most of the time.
+    fileprivate func maybeAutoWake() async {
+        guard !hasAutoWokenThisSession else { return }
+        guard case .online = daemonReachability else { return }
+        guard isAsleep else {
+            // Already awake on connect — count it as "auto-handled" so we
+            // don't unnecessarily wake on a subsequent state blip.
+            hasAutoWokenThisSession = true
+            return
+        }
+        hasAutoWokenThisSession = true
+        await logBus.publish(.sidecarLog(
+            sidecar: "app", level: .info,
+            message: "auto-waking robot on connect", fields: [:]
+        ))
+        await wakeRobot()
     }
 
     private func probeLMStudio() async {

@@ -33,6 +33,8 @@ private struct MenuBarLabel: View {
     var body: some View {
         // SF Symbol that subtly conveys the current state in the menu bar.
         let symbol: String = switch services.rockyState {
+        case .sleeping:   "moon.fill"
+        case .waking:     "sun.max"
         case .idle:       "circle.fill"
         case .listening:  "ear"
         case .thinking:   "circle.dotted"

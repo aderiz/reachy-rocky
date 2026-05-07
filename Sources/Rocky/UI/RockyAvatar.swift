@@ -13,8 +13,11 @@ struct RockyAvatar: View {
     var size: CGFloat = 140
 
     var body: some View {
+        // When sleeping, force a slumped-forward pose regardless of the
+        // last-reported live values (the daemon may still report 0).
+        let isSleeping = state == .sleeping
         let yaw = pose?.yaw ?? 0
-        let pitch = pose?.pitch ?? 0
+        let pitch = isSleeping ? 0.55 : (pose?.pitch ?? 0)
         let roll = pose?.roll ?? 0
 
         ZStack {
@@ -70,6 +73,8 @@ struct RockyAvatar: View {
 
     private var stateColor: Color {
         switch state {
+        case .sleeping:   return .gray
+        case .waking:     return .yellow
         case .idle:       return .gray
         case .listening:  return .green
         case .thinking:   return .orange
@@ -80,6 +85,7 @@ struct RockyAvatar: View {
 
     private var stateKey: String {
         switch state {
+        case .sleeping: "sleeping"; case .waking: "waking"
         case .idle: "idle"; case .listening: "listening"
         case .thinking: "thinking"; case .speaking: "speaking"
         case .error: "error"
@@ -192,15 +198,18 @@ private struct Face: View {
 
     @ViewBuilder
     private func eye(at point: CGPoint, radius: CGFloat) -> some View {
-        // Eye is a vertically-squashed rounded rectangle (Reachy LCD-style)
-        // that closes when blinking.
-        let height: CGFloat = blink ? radius * 0.15 : radius * 1.4
+        // Eye is a vertically-squashed rounded rectangle (Reachy LCD-style).
+        // Sleeping → fully closed (thin slit). Blink → momentarily closed.
+        let isSleeping = (state == .sleeping)
+        let height: CGFloat = isSleeping
+            ? radius * 0.10
+            : (blink ? radius * 0.15 : radius * 1.4)
         let width: CGFloat = radius * 1.4
         RoundedRectangle(cornerRadius: radius * 0.55, style: .continuous)
-            .fill(color)
+            .fill(isSleeping ? color.opacity(0.55) : color)
             .frame(width: width, height: height)
             .position(point)
-            .shadow(color: color.opacity(0.6), radius: 4)
+            .shadow(color: color.opacity(isSleeping ? 0.0 : 0.6), radius: 4)
     }
 }
 
@@ -212,6 +221,18 @@ private struct MouthShape: Shape {
     func path(in rect: CGRect) -> Path {
         var p = Path()
         switch state {
+        case .sleeping:
+            // No mouth shape when sleeping; render a tiny "z" off to the side.
+            let z = rect.height * 0.5
+            p.move(to: CGPoint(x: rect.maxX - z, y: rect.minY))
+            p.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+            p.addLine(to: CGPoint(x: rect.maxX - z, y: rect.minY + z))
+            p.addLine(to: CGPoint(x: rect.maxX, y: rect.minY + z))
+        case .waking:
+            // Slight smile, like just-awakened.
+            p.move(to: CGPoint(x: rect.width * 0.15, y: rect.midY))
+            p.addQuadCurve(to: CGPoint(x: rect.width * 0.85, y: rect.midY),
+                           control: CGPoint(x: rect.midX, y: rect.midY + rect.height * 0.5))
         case .idle:
             // Subtle, slightly-smiling line.
             p.move(to: CGPoint(x: 0, y: rect.midY))

@@ -49,21 +49,73 @@ struct HeroCard: View {
                 Spacer()
 
                 VStack(spacing: 10) {
-                    iconButton(
-                        services.micEnabled ? "mic.slash.fill" : "mic.fill",
-                        active: services.micEnabled,
-                        tint: .green
-                    ) { Task { await services.toggleMic() } }
-                    iconButton(
-                        services.ttsMuted ? "speaker.slash.fill" : "speaker.wave.2.fill",
-                        active: !services.ttsMuted,
-                        tint: .blue
-                    ) { Task { await services.toggleTTSMute() } }
+                    wakeSleepButton(state: state)
+                    HStack(spacing: 10) {
+                        iconButton(
+                            services.micEnabled ? "mic.slash.fill" : "mic.fill",
+                            active: services.micEnabled,
+                            tint: .green
+                        ) { Task { await services.toggleMic() } }
+                        iconButton(
+                            services.ttsMuted ? "speaker.slash.fill" : "speaker.wave.2.fill",
+                            active: !services.ttsMuted,
+                            tint: .blue
+                        ) { Task { await services.toggleTTSMute() } }
+                    }
                 }
                 .padding(.trailing, 4)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+
+    /// Big primary affordance — flips between "Wake Rocky" (when asleep)
+    /// and a smaller "Sleep" action (when awake). Disabled while a wake/
+    /// sleep transition is in flight.
+    @ViewBuilder
+    private func wakeSleepButton(state: AppServices.RockyState) -> some View {
+        let isAsleep = (state == .sleeping)
+        let isTransitioning = (state == .waking)
+        Button {
+            Task {
+                if isAsleep {
+                    await services.wakeRobot()
+                } else {
+                    await services.sleepRobot()
+                }
+            }
+        } label: {
+            HStack(spacing: 8) {
+                if isTransitioning {
+                    ProgressView().controlSize(.small).tint(.white)
+                    Text("Waking\u{2026}")
+                } else if isAsleep {
+                    Image(systemName: "sun.max.fill")
+                        .font(.body.weight(.semibold))
+                    Text("Wake Rocky").fontWeight(.semibold)
+                } else {
+                    Image(systemName: "moon.fill")
+                    Text("Sleep").fontWeight(.medium)
+                }
+            }
+            .foregroundStyle(isAsleep ? Color.white : Color.primary)
+            .padding(.horizontal, isAsleep ? 18 : 14)
+            .padding(.vertical, isAsleep ? 11 : 8)
+            .background(
+                Capsule().fill(
+                    isAsleep ? AnyShapeStyle(LinearGradient(
+                        colors: [.orange, .yellow],
+                        startPoint: .leading, endPoint: .trailing))
+                    : AnyShapeStyle(Color.gray.opacity(0.12))
+                )
+            )
+            .overlay(
+                Capsule().stroke(isAsleep ? .orange.opacity(0.5) : .gray.opacity(0.25),
+                                 lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(isTransitioning)
     }
 
     @ViewBuilder
@@ -89,7 +141,9 @@ struct HeroCard: View {
 
     private func label(for state: AppServices.RockyState) -> String {
         switch state {
-        case .idle:                "Sitting quietly. Say \u{201C}Rocky\u{201D} to start."
+        case .sleeping:            "Asleep \u{2014} tap Wake to bring him up"
+        case .waking:              "Waking up\u{2026}"
+        case .idle:                "Ready. Say \u{201C}Rocky\u{2026}\u{201D} or use the chat."
         case .listening:           "Listening\u{2026}"
         case .thinking:            "Thinking\u{2026}"
         case .speaking:            "Speaking"
@@ -99,6 +153,8 @@ struct HeroCard: View {
 
     private func color(for state: AppServices.RockyState) -> Color {
         switch state {
+        case .sleeping:   .secondary
+        case .waking:     .yellow
         case .idle:       .secondary
         case .listening:  .green
         case .thinking:   .orange
