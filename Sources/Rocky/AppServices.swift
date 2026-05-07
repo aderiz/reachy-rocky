@@ -8,6 +8,7 @@ import Telemetry
 import RockyVision
 import Voice
 import Perception
+import Memory
 
 /// One owner for every long-lived service Rocky uses. Injected via `.environment(...)`.
 @Observable
@@ -40,6 +41,7 @@ final class AppServices {
     let llm: LMStudioClient
     let toolRegistry: ToolRegistry
     let cognition: CognitionEngine
+    let memory: MemoryService
 
     /// Most recent reachability check for the daemon.
     var daemonReachability: Reachability = .unknown
@@ -341,12 +343,31 @@ final class AppServices {
         )
         self.robotTTS = RobotTTS(sidecar: ttsRuntime, media: self.mediaClient, logBus: bus)
 
-        // Cognition: LM Studio client + tool registry.
+        // Memory sidecar (mempalace). Verbatim conversation drawers +
+        // semantic recall — gives Rocky a persistent memory across
+        // sessions instead of starting cold every launch. Optional:
+        // if the venv hasn't been built yet we still hand a runtime to
+        // CognitionEngine, which simply skips memory calls when the
+        // sidecar fails to start.
+        let memoryManifest = Self.devMempalaceManifest()
+        let memoryDir = Self.locateSidecarDir(named: "mempalace")
+            ?? URL(fileURLWithPath: "/")
+        let memoryResolver = ManifestPathResolver(
+            sidecarDir: memoryDir,
+            venvDir: SidecarSupervisor.defaultVenvDir(for: "mempalace")
+        )
+        let memoryRuntime = SidecarRuntime(
+            manifest: memoryManifest, resolver: memoryResolver, logBus: bus
+        )
+        self.memory = MemoryService(sidecar: memoryRuntime, logBus: bus)
+
+        // Cognition: LM Studio client + tool registry + memory.
         self.llm = LMStudioClient(config: settings.lmStudioConfig(), logBus: bus)
         self.toolRegistry = ToolRegistry(logBus: bus)
         self.cognition = CognitionEngine(
             llm: self.llm,
             registry: self.toolRegistry,
+            memory: self.memory,
             logBus: bus,
             config: .init(systemPrompt: settings.persona)
         )
@@ -360,6 +381,18 @@ final class AppServices {
         } catch {
             await logBus.publish(.error(scope: "app/face-tracker",
                                         message: "\(error)",
+                                        recoverable: true))
+        }
+
+        // Memory sidecar is best-effort: if the venv hasn't been built
+        // (Sidecars/mempalace/setup.sh not run), the start fails cleanly
+        // and CognitionEngine just skips recall + record on subsequent
+        // turns. No need to block boot on it.
+        do {
+            try await memory.start()
+        } catch {
+            await logBus.publish(.error(scope: "app/memory",
+                                        message: "\(error) — run Sidecars/mempalace/setup.sh",
                                         recoverable: true))
         }
 
@@ -1694,6 +1727,40 @@ final class AppServices {
             readyTimeoutS: 30,
             shutdownGraceS: 3,
             timeouts: ["*": 10]
+        )
+    }
+
+    private nonisolated static func devMempalaceManifest() -> SidecarManifest {
+        let venvPython = SidecarSupervisor.defaultVenvDir(for: "mempalace")
+            .appendingPathComponent("bin/python")
+        let dir = locateSidecarDir(named: "mempalace")?
+            .path(percentEncoded: false) ?? "."
+        let palacePath = (FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first?
+            .appendingPathComponent("Rocky/Memory")
+            .path(percentEncoded: false))
+            ?? "~/Library/Application Support/Rocky/Memory"
+        return SidecarManifest(
+            name: "mempalace",
+            version: "0.1.0-dev",
+            binary: venvPython.path,
+            args: ["-u", "-m", "rocky_mempalace.runner"],
+            workingDir: dir,
+            env: [
+                "PYTHONPATH": dir,
+                "MEMPALACE_PALACE_PATH": palacePath,
+                "ROCKY_MEMORY_WING": "rocky",
+                "ROCKY_MEMORY_ROOM": "conversation",
+            ],
+            readyTimeoutS: 60,
+            shutdownGraceS: 3,
+            timeouts: [
+                "*": 5,
+                "recall": 8,
+                "add": 8,
+                "init_palace": 60,
+            ]
         )
     }
 

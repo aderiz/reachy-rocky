@@ -1,0 +1,15 @@
+[project]
+name = "rocky-mempalace"
+version = "0.1.0"
+description = "Rocky memory sidecar — verbatim conversation drawers + semantic recall via MemPalace"
+requires-python = ">=3.10"
+dependencies = [
+    "mempalace>=0.10",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["rocky_mempalace"]

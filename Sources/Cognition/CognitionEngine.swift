@@ -1,4 +1,5 @@
 import Foundation
+import Memory
 import Telemetry
 
 /// High-level orchestrator: takes a user transcript, runs an LLM turn against
@@ -54,6 +55,7 @@ public actor CognitionEngine {
 
     public let llm: LMStudioClient
     public let registry: ToolRegistry
+    public let memory: MemoryService?
     private let logBus: LogBus
     public private(set) var config: Config
     private var transcript: [ChatMessage]
@@ -61,11 +63,13 @@ public actor CognitionEngine {
     public init(
         llm: LMStudioClient,
         registry: ToolRegistry,
+        memory: MemoryService? = nil,
         logBus: LogBus,
         config: Config = Config()
     ) {
         self.llm = llm
         self.registry = registry
+        self.memory = memory
         self.logBus = logBus
         self.config = config
         self.transcript = [.init(role: .system, content: config.systemPrompt)]
@@ -105,6 +109,17 @@ public actor CognitionEngine {
         continuation: AsyncThrowingStream<Output, Error>.Continuation
     ) async throws {
         transcript.append(.init(role: .user, content: userText))
+
+        // Pre-turn recall: ask the memory sidecar for the top-K drawers
+        // most relevant to this user utterance and stitch them into the
+        // messages we send the LLM as a temporary system message. Not
+        // appended to the persistent transcript — fresh per turn so old
+        // recalls don't pile up. Failures are non-fatal: if the sidecar
+        // is offline or slow, we proceed without memory.
+        let recallEnvelope = await Self.fetchRecallEnvelope(
+            memory: memory, query: userText, logBus: logBus
+        )
+
         var rounds = 0
 
         while rounds < config.maxToolRounds {
@@ -118,7 +133,10 @@ public actor CognitionEngine {
             var sawToolCalls = false
 
             let tools = await registry.schemas
-            let stream = llm.chatStream(messages: transcript, tools: tools.isEmpty ? nil : tools)
+            let messagesForLLM = Self.injectRecall(
+                envelope: recallEnvelope, into: transcript
+            )
+            let stream = llm.chatStream(messages: messagesForLLM, tools: tools.isEmpty ? nil : tools)
 
             for try await chunk in stream {
                 if firstChunkMs == nil {
@@ -168,6 +186,16 @@ public actor CognitionEngine {
                     if !assistantText.isEmpty {
                         transcript.append(.init(role: .assistant, content: assistantText))
                     }
+                    // Post-turn write: append both sides of this exchange
+                    // to the palace as verbatim drawers. Fire-and-forget
+                    // so the user-facing latency is unaffected.
+                    if let memory {
+                        memory.recordDetached(role: .user, text: userText)
+                        if !assistantText.isEmpty {
+                            memory.recordDetached(role: .assistant,
+                                                   text: assistantText)
+                        }
+                    }
                     return
                 }
             }
@@ -215,6 +243,72 @@ public actor CognitionEngine {
 
         // Hit max rounds — surface a soft warning rather than hanging.
         continuation.yield(.error("hit max tool rounds (\(config.maxToolRounds))"))
+    }
+
+    // MARK: - Memory injection
+
+    /// Fetch top-K relevant memories and format them as a single system
+    /// message. Returns `nil` when memory is offline, recall fails, or
+    /// no hits come back. Recall is bounded by `recallTimeoutS` so the
+    /// LLM call isn't held up by a slow sidecar.
+    private static let recallTimeoutS: Double = 1.5
+    private static let recallTopK: Int = 5
+
+    private static func fetchRecallEnvelope(
+        memory: MemoryService?,
+        query: String,
+        logBus: LogBus
+    ) async -> ChatMessage? {
+        guard let memory else { return nil }
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 3 else { return nil }
+        let hits: [MemoryService.Hit]? = await withTaskGroup(
+            of: [MemoryService.Hit]?.self
+        ) { group in
+            group.addTask { try? await memory.recall(query: trimmed, k: recallTopK) }
+            group.addTask {
+                try? await Task.sleep(
+                    nanoseconds: UInt64(recallTimeoutS * 1_000_000_000)
+                )
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+        guard let hits, !hits.isEmpty else { return nil }
+        let formatted = hits
+            .prefix(recallTopK)
+            .map { "- " + $0.text.replacingOccurrences(of: "\n", with: " ") }
+            .joined(separator: "\n")
+        let body = """
+        Relevant snippets recalled from prior conversations with the user. \
+        Use them as background context only — do NOT quote them verbatim, \
+        do NOT mention that you 'remember', do NOT cite them. Just let the \
+        knowledge inform your reply naturally.
+
+        \(formatted)
+        """
+        Task { await logBus.publish(.error(
+            scope: "memory.recall",
+            message: "injected \(hits.count) hit(s)",
+            recoverable: true
+        )) }
+        return ChatMessage(role: .system, content: body)
+    }
+
+    /// Insert the recall envelope right after the persona system prompt
+    /// (index 0) and before the conversation history. Keeps the
+    /// persistent transcript untouched — the envelope is only for this
+    /// LLM call.
+    private static func injectRecall(
+        envelope: ChatMessage?, into transcript: [ChatMessage]
+    ) -> [ChatMessage] {
+        guard let envelope else { return transcript }
+        var msgs = transcript
+        let insertAt = msgs.first?.role == .system ? 1 : 0
+        msgs.insert(envelope, at: insertAt)
+        return msgs
     }
 
     // MARK: - Markdown tool-call recovery

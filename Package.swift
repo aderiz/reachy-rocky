@@ -14,6 +14,7 @@ let package = Package(
         .library(name: "Voice", targets: ["Voice"]),
         .library(name: "Cognition", targets: ["Cognition"]),
         .library(name: "Perception", targets: ["Perception"]),
+        .library(name: "Memory", targets: ["Memory"]),
     ],
     dependencies: [
         // Loads .gltf models for SceneKit. Used by ReachyHead3D to drive
@@ -26,7 +27,7 @@ let package = Package(
             name: "Rocky",
             dependencies: [
                 "RockyKit", "Telemetry", "SidecarHost", "RobotLink",
-                "RockyVision", "Voice", "Cognition", "Perception",
+                "RockyVision", "Voice", "Cognition", "Perception", "Memory",
                 .product(name: "GLTFKit2", package: "GLTFKit2"),
             ],
             path: "Sources/Rocky",
@@ -66,8 +67,13 @@ let package = Package(
         ),
         .target(
             name: "Cognition",
-            dependencies: ["RockyKit", "Telemetry"],
+            dependencies: ["RockyKit", "Telemetry", "Memory"],
             path: "Sources/Cognition"
+        ),
+        .target(
+            name: "Memory",
+            dependencies: ["RockyKit", "Telemetry", "SidecarHost"],
+            path: "Sources/Memory"
         ),
         .target(
             name: "Perception",
