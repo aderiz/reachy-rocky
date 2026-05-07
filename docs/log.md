@@ -2,6 +2,29 @@
 
 Append-only chronological record. Each entry: `## [YYYY-MM-DD] <op> | <subject>`. Run `grep "^## \[" log.md | tail -20` for the recent timeline.
 
+## [2026-05-07] doc | Cockpit design — UI design contract
+
+A HIG-grounded design pass for Rocky's user-facing surface, after multiple
+rejected directions (engineer NOC, virtual-employee profile,
+menu-bar-first, ASCII-box pseudo-design). Authored via the
+`swift-ui-design` specialist; refined to elevate the menu bar as the
+**persistent** surface (Rocky is active when the window is closed).
+
+The thesis: the window has a stage (portrait + conversation), a margin
+(moment feed strip), a drawer (`.inspector` with Health / Activity /
+Memory / Motion / Vision / Raw tabs), and a real `.toolbar` (Wake/Sleep,
+Mic, Voice, health glance, inspector toggle, Settings). Settings becomes
+a separate `Settings { TabView }` scene. The menu bar gets a full
+popover with presence + last 3 moments + last exchange + ask Rocky input
++ quick controls; `⌥⌘R` summons it from anywhere.
+
+Six implementation waves, each independently shippable; nothing in the
+existing UI is deleted, only relocated.
+
+- `docs/concepts/cockpit-design.md` — the full design.
+- `docs/index.md` — entry added.
+- Branch `cockpit-wave1` off `cockpit-centre` is where the work happens.
+
 ## [2026-05-05] code | Rocky M1 — workspace + foundational packages
 
 Plan approved (`/Users/amplifiedai/.claude/plans/i-d-like-this-to-swirling-octopus.md`). M1 first-pass scaffold landed:
