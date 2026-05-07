@@ -2,7 +2,7 @@ import Testing
 import Foundation
 import SidecarHost
 import Telemetry
-import Vision
+import RockyVision
 
 /// End-to-end test of `FaceTrackerService` against the real synthetic sidecar.
 @Suite("FaceTrackerService — synthetic")

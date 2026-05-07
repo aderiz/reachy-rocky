@@ -17,12 +17,27 @@ public actor FaceTrackerService {
         public let promptId: String
         public let frameWidth: Int
         public let frameHeight: Int
+
+        public init(bbox: CGRect, confidence: Double, promptId: String,
+                    frameWidth: Int, frameHeight: Int) {
+            self.bbox = bbox
+            self.confidence = confidence
+            self.promptId = promptId
+            self.frameWidth = frameWidth
+            self.frameHeight = frameHeight
+        }
     }
 
     public struct Target: Sendable, Equatable {
         public let yawRad: Double
         public let pitchRad: Double
         public let decayActive: Bool
+
+        public init(yawRad: Double, pitchRad: Double, decayActive: Bool) {
+            self.yawRad = yawRad
+            self.pitchRad = pitchRad
+            self.decayActive = decayActive
+        }
     }
 
     // MARK: - Public

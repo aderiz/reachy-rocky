@@ -10,14 +10,18 @@ let package = Package(
         .library(name: "Telemetry", targets: ["Telemetry"]),
         .library(name: "SidecarHost", targets: ["SidecarHost"]),
         .library(name: "RobotLink", targets: ["RobotLink"]),
-        .library(name: "Vision", targets: ["Vision"]),
+        .library(name: "RockyVision", targets: ["RockyVision"]),
         .library(name: "Voice", targets: ["Voice"]),
         .library(name: "Cognition", targets: ["Cognition"]),
+        .library(name: "Perception", targets: ["Perception"]),
     ],
     targets: [
         .executableTarget(
             name: "Rocky",
-            dependencies: ["RockyKit", "Telemetry", "SidecarHost", "RobotLink", "Vision", "Voice", "Cognition"],
+            dependencies: [
+                "RockyKit", "Telemetry", "SidecarHost", "RobotLink",
+                "RockyVision", "Voice", "Cognition", "Perception",
+            ],
             path: "Sources/Rocky",
             exclude: []
         ),
@@ -41,7 +45,7 @@ let package = Package(
             path: "Sources/RobotLink"
         ),
         .target(
-            name: "Vision",
+            name: "RockyVision",
             dependencies: ["RockyKit", "Telemetry", "SidecarHost", "RobotLink"],
             path: "Sources/Vision"
         ),
@@ -54,6 +58,11 @@ let package = Package(
             name: "Cognition",
             dependencies: ["RockyKit", "Telemetry"],
             path: "Sources/Cognition"
+        ),
+        .target(
+            name: "Perception",
+            dependencies: ["RockyKit", "Telemetry", "RobotLink", "RockyVision"],
+            path: "Sources/Perception"
         ),
         .testTarget(
             name: "RockyKitTests",
@@ -72,7 +81,7 @@ let package = Package(
         ),
         .testTarget(
             name: "VisionTests",
-            dependencies: ["Vision", "SidecarHost", "Telemetry", "RockyKit"],
+            dependencies: ["RockyVision", "SidecarHost", "Telemetry", "RockyKit"],
             path: "Tests/VisionTests"
         ),
         .testTarget(

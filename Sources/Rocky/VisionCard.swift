@@ -1,6 +1,6 @@
 import SwiftUI
 import AppKit
-import Vision
+import RockyVision
 
 /// VisionCard — what Rocky sees through the actual robot camera. Live JPEG
 /// frames stream in from the `robot-camera` sidecar; the face-tracker
@@ -99,8 +99,8 @@ struct VisionCard: View {
 
 private struct FacePreview: View {
     let frame: RobotCameraService.Frame?
-    let detection: Vision.FaceTrackerService.Detection?
-    let target: Vision.FaceTrackerService.Target?
+    let detection: RockyVision.FaceTrackerService.Detection?
+    let target: RockyVision.FaceTrackerService.Target?
 
     var body: some View {
         ZStack {

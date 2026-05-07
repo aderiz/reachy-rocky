@@ -5,8 +5,9 @@ import RobotLink
 import RockyKit
 import SidecarHost
 import Telemetry
-import Vision
+import RockyVision
 import Voice
+import Perception
 
 /// One owner for every long-lived service Rocky uses. Injected via `.environment(...)`.
 @Observable
@@ -21,6 +22,7 @@ final class AppServices {
     let faceTargetBridge: FaceTargetBridge
     let targetStreamer: TargetStreamer
     let robotCamera: RobotCameraService
+    let macFaceTracker: MacFaceTracker
     let stateSubscriber: StateSubscriber
 
     // Voice
@@ -206,6 +208,10 @@ final class AppServices {
         )
         self.robotCamera = RobotCameraService(sidecar: cameraRuntime, logBus: bus)
 
+        // On-Mac face tracker — runs Apple's Vision face detection over the
+        // camera frames and drives the TargetStreamer directly.
+        self.macFaceTracker = MacFaceTracker(logBus: bus)
+
         // Voice pipeline. Mac mic + robot mic both write into a SHARED
         // AudioRingBuffer; VoiceCoordinator pulls from it without caring
         // which source produced the bytes.
@@ -274,10 +280,67 @@ final class AppServices {
                                         recoverable: true))
         }
 
-        // Wire face-tracker targets into the 50 Hz set_target streamer
-        // so detected faces actually move the robot.
+        // Mac-side face tracker is the source of truth for set_target now;
+        // the synthetic Python detector emits useless Lissajous targets, so
+        // we don't attach faceTargetBridge to its stream by default.
         await targetStreamer.start()
-        await faceTargetBridge.attach(to: faceTracker.targets)
+        await macFaceTracker.setStreamer(targetStreamer)
+        let frames = robotCamera.frames
+        await macFaceTracker.start(framesStream: frames)
+
+        // Mirror Mac face tracker detections + targets into observable state
+        // so the dashboard reflects what the Mac detector saw.
+        let macDetections = await macFaceTracker.detections
+        Task { [weak self] in
+            for await det in macDetections {
+                guard let self else { return }
+                let mapped = RockyVision.FaceTrackerService.Detection(
+                    bbox: det.bbox,
+                    confidence: det.confidence,
+                    promptId: "vision-face",
+                    frameWidth: det.frameWidth,
+                    frameHeight: det.frameHeight
+                )
+                await MainActor.run {
+                    self.lastFaceDetection = mapped
+                    self.faceDetectionCount &+= 1
+                }
+            }
+        }
+        let macTargets = await macFaceTracker.targets
+        Task { [weak self] in
+            var lastUpdate = Date.distantPast
+            var counter = 0
+            for await t in macTargets {
+                guard let self else { return }
+                counter += 1
+                let now = Date()
+                if now.timeIntervalSince(lastUpdate) < 0.1 { continue }
+                lastUpdate = now
+                let mapped = RockyVision.FaceTrackerService.Target(
+                    yawRad: t.yawRad,
+                    pitchRad: t.pitchRad,
+                    decayActive: t.decay
+                )
+                let snap = counter
+                await MainActor.run {
+                    self.lastFaceTarget = mapped
+                    self.faceTargetCount = snap
+                }
+            }
+        }
+
+        // Update the Mac face tracker's "commanded pose" knob from live
+        // robot state so world-frame angles stay sane.
+        let statesForFaceTracker = stateSubscriber.states
+        Task { [weak self] in
+            for await s in statesForFaceTracker {
+                guard let self else { return }
+                await self.macFaceTracker.updateCommandedPose(
+                    yawRad: s.headPose.yaw, pitchRad: s.headPose.pitch
+                )
+            }
+        }
 
         // Bring up the robot-camera sidecar (best-effort — failure means
         // the Vision card stays placeholder until next attempt).
