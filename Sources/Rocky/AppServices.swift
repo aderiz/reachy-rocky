@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import SwiftUI
 import Cognition
 import RobotLink
 import RockyKit
@@ -138,6 +139,104 @@ final class AppServices {
     /// `refreshMemoryCount()`. `-1` means "haven't asked yet" so the
     /// UI can show a neutral placeholder rather than a misleading 0.
     var memoryDrawerCount: Int = -1
+
+    /// Quiet mode. When set to a future date, Rocky stops dispatching
+    /// the wake-word pipeline (mic stays warm but user utterances aren't
+    /// routed to the brain) and TTS playback is held. Wired by the
+    /// menu-bar popover's "pause Rocky for X" control. Cleared
+    /// automatically when the date passes; UI watchers should redraw on
+    /// mutation.
+    var dndUntil: Date?
+
+    /// True iff `dndUntil` is in the future. Used by the wake/STT/TTS
+    /// pipelines as a single gate.
+    var isDoNotDisturb: Bool {
+        guard let until = dndUntil else { return false }
+        if Date() >= until {
+            // Lazy clear: avoid stale state if a UI consumer reads us
+            // long after the timer should have expired.
+            dndUntil = nil
+            return false
+        }
+        return true
+    }
+
+    /// Mute Rocky for `minutes`. Pass nil to clear.
+    func pauseFor(minutes: Int?) {
+        if let m = minutes, m > 0 {
+            dndUntil = Date().addingTimeInterval(TimeInterval(m * 60))
+        } else {
+            dndUntil = nil
+        }
+    }
+
+    /// Toolbar-level health summary. Three states: ok (green-ish, quiet),
+    /// warning (orange, something needs attention), critical (red, robot
+    /// offline). Per the cockpit design, this is the *only* always-visible
+    /// status indicator on the main window; the seven-pill detail lives
+    /// in the Inspector → Health tab.
+    struct HealthGlance: Sendable, Equatable {
+        let label: String
+        let symbol: String
+        let tint: Color
+        /// Human-readable description of the *worst* current issue, for
+        /// the toolbar tooltip. `nil` means everything is fine.
+        let tooltip: String?
+    }
+
+    var healthGlance: HealthGlance {
+        // Robot reachability is the most-fatal failure: if Rocky's body
+        // is unreachable, surface that first.
+        if case .offline(let reason) = daemonReachability {
+            return HealthGlance(
+                label: "Robot offline",
+                symbol: "wifi.exclamationmark",
+                tint: .red,
+                tooltip: "Robot offline — \(reason)"
+            )
+        }
+        // LM Studio offline isn't fatal but is amber.
+        if case .offline(let reason) = llmStatus {
+            return HealthGlance(
+                label: "Brain offline",
+                symbol: "exclamationmark.triangle.fill",
+                tint: .orange,
+                tooltip: "LM Studio offline — \(reason)"
+            )
+        }
+        // Sidecar lifecycle issues.
+        if let bad = firstUnhealthySidecar() {
+            return HealthGlance(
+                label: bad,
+                symbol: "exclamationmark.triangle.fill",
+                tint: .orange,
+                tooltip: "\(bad) needs attention."
+            )
+        }
+        // Otherwise: quiet glyph, no tooltip.
+        return HealthGlance(
+            label: "Healthy",
+            symbol: "checkmark.circle.fill",
+            tint: .green,
+            tooltip: nil
+        )
+    }
+
+    private func firstUnhealthySidecar() -> String? {
+        for (name, state) in [
+            ("Face tracker", faceTrackerSidecarState),
+            ("Voice", ttsSidecarState),
+            ("Memory", memorySidecarState),
+        ] {
+            switch state {
+            case .ready, .stopped, .starting:
+                continue
+            case .failing, .circuitOpen:
+                return "\(name) sidecar"
+            }
+        }
+        return nil
+    }
 
     enum Reachability: Sendable, Equatable {
         case unknown, online, offline(reason: String)

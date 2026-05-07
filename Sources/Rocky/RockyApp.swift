@@ -32,6 +32,20 @@ struct RockyApp: App {
         }
         .windowResizability(.contentMinSize)
 
+        // Per the cockpit design (`docs/concepts/cockpit-design.md`),
+        // Settings lives in a real macOS Settings scene, not as a tab in
+        // the main window. ⌘, opens it from anywhere; the Settings entry
+        // disappears from the sidebar in a follow-up step.
+        //
+        // Wave 1 ships the scene wrapping the existing SettingsView
+        // verbatim — no content changes. Wave 5 splits it into six
+        // tabs (Robot, Brain, Voice, Memory, Faces, Persona).
+        Settings {
+            SettingsView()
+                .environment(services)
+                .frame(minWidth: 720, minHeight: 540)
+        }
+
         MenuBarExtra {
             MenuBarStatusView()
                 .environment(services)
@@ -46,15 +60,20 @@ struct RockyApp: App {
 private struct MenuBarLabel: View {
     @Environment(AppServices.self) private var services
     var body: some View {
-        // Drive the menu bar from the four-state BotMode so the icon
-        // matches the prominent dashboard pill rather than diverging
-        // through finer sub-states.
-        let symbol: String = switch services.botMode {
-        case .sleeping: "moon.fill"
-        case .idle:     "circle.dotted"
-        case .active:   "viewfinder"
-        case .engaged:  "waveform"
-        case .error:    "exclamationmark.triangle.fill"
+        // Drive the menu bar icon from the finer-grained `rockyState`
+        // (per `docs/concepts/cockpit-design.md` §3.5) rather than the
+        // coarser BotMode, so the icon distinguishes listening / thinking
+        // / speaking / sleeping / etc. The glyph table is the design
+        // doc's table; animations are only repeating for active states.
+        let symbol: String = switch services.rockyState {
+        case .sleeping:    "moon.zzz"
+        case .waking:      "sun.max"
+        case .idle:        "circle.dotted"
+        case .tracking:    "eye"
+        case .listening:   "ear"
+        case .thinking:    "brain"
+        case .speaking:    "waveform"
+        case .error:       "exclamationmark.triangle.fill"
         }
         Image(systemName: symbol)
     }

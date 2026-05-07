@@ -1,147 +1,104 @@
 import SwiftUI
 import RockyKit
 
+/// The single window. Per `docs/concepts/cockpit-design.md` §3:
+///
+///   - The detail is the cockpit (currently the prototype centre column;
+///     Wave 3 builds the new portrait + conversation stage).
+///   - A real macOS `.toolbar` carries the global actions (Wake/Sleep,
+///     Mic, Voice, Health glance, Inspector toggle).
+///   - A trailing `.inspector` holds every diagnostic surface that used
+///     to be a sidebar peer (Status, Logs, Memory, Motion, Vision, Raw).
+///   - There is no sidebar — the cockpit is the only content the window
+///     ever shows.
+///
+/// Settings lives in a separate `Settings { ... }` scene (see RockyApp);
+/// ⌘, opens it.
 struct RootView: View {
     @Environment(AppServices.self) private var services
-    @State private var selection: SidebarItem = .cockpit
-
-    enum SidebarItem: Hashable, CaseIterable, Identifiable {
-        case cockpit, dashboard, status, logs, settings
-        var id: Self { self }
-        var label: String {
-            switch self {
-            case .cockpit:   "Cockpit"
-            case .dashboard: "Dashboard"
-            case .status:    "Status"
-            case .logs:      "Logs"
-            case .settings:  "Settings"
-            }
-        }
-        var icon: String {
-            switch self {
-            case .cockpit:   "airplane"
-            case .dashboard: "rectangle.3.group"
-            case .status:    "checkmark.shield"
-            case .logs:      "doc.plaintext"
-            case .settings:  "gear"
-            }
-        }
-    }
+    @State private var inspectorPresented: Bool = false
 
     var body: some View {
-        NavigationSplitView {
-            SidebarView(selection: $selection)
-                .navigationSplitViewColumnWidth(min: 200, ideal: 220)
-        } detail: {
-            ZStack {
-                BackgroundGradient().ignoresSafeArea()
-                Group {
-                    switch selection {
-                    case .cockpit:   CockpitView()
-                    case .dashboard: DashboardView()
-                    case .status:    StatusView()
-                    case .logs:      LogsView()
-                    case .settings:  SettingsView()
+        CockpitView()
+            .navigationTitle("Rocky")
+            .toolbar { toolbarContent }
+            .inspector(isPresented: $inspectorPresented) {
+                InspectorView()
+                    .inspectorColumnWidth(min: 320, ideal: 380, max: 520)
+            }
+    }
+
+    @ToolbarContentBuilder
+    private var toolbarContent: some ToolbarContent {
+        ToolbarItem(placement: .navigation) {
+            Button {
+                Task {
+                    if services.isAsleep {
+                        await services.wakeRobot()
+                    } else {
+                        await services.sleepRobot()
                     }
                 }
+            } label: {
+                Label(services.isAsleep ? "Wake" : "Sleep",
+                      systemImage: services.isAsleep ? "sun.max.fill" : "moon.fill")
             }
+            .help(services.isAsleep
+                  ? "Wake Rocky up — enable motors and recover the neutral pose."
+                  : "Send Rocky to sleep — disable motors after the goodbye animation.")
         }
-        .navigationTitle("")
-    }
-}
 
-private struct SidebarView: View {
-    @Binding var selection: RootView.SidebarItem
-
-    var body: some View {
-        List(RootView.SidebarItem.allCases, selection: $selection) { item in
-            NavigationLink(value: item) {
-                Label(item.label, systemImage: item.icon)
+        ToolbarItem(placement: .secondaryAction) {
+            Button {
+                Task { await services.toggleMic() }
+            } label: {
+                Label(services.micEnabled ? "Mute mic" : "Unmute mic",
+                      systemImage: services.micEnabled ? "mic.fill" : "mic.slash")
             }
+            .help(services.micEnabled
+                  ? "Stop listening (Rocky's mic is currently live)."
+                  : "Start listening so Rocky can hear you say his name.")
         }
-        .listStyle(.sidebar)
-    }
-}
 
-private struct BackgroundGradient: View {
-    var body: some View {
-        LinearGradient(
-            colors: [
-                Color(red: 0.04, green: 0.05, blue: 0.07),
-                Color(red: 0.08, green: 0.09, blue: 0.13),
-            ],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-        )
-    }
-}
-
-private struct DashboardView: View {
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                DashboardHeader()
-                HeroCard()
-                BrainCard()
-                VoiceCard()
-                MotionCard()
-                VisionCard()
+        ToolbarItem(placement: .secondaryAction) {
+            Button {
+                Task { await services.toggleTTSMute() }
+            } label: {
+                Label(services.ttsMuted ? "Unmute voice" : "Mute voice",
+                      systemImage: services.ttsMuted
+                        ? "speaker.slash.fill"
+                        : "speaker.wave.2.fill")
             }
-            .padding(.horizontal, 24)
-            .padding(.vertical, 22)
-            .frame(maxWidth: 980, alignment: .topLeading)
-            .frame(maxWidth: .infinity)
+            .help(services.ttsMuted
+                  ? "Allow Rocky to speak again."
+                  : "Mute Rocky's voice — replies still appear in the conversation.")
         }
-    }
-}
 
-private struct DashboardHeader: View {
-    @Environment(AppServices.self) private var services
+        ToolbarItem(placement: .principal) { Spacer() }
 
-    var body: some View {
-        HStack(spacing: 14) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Rocky")
-                    .font(.system(size: 28, weight: .bold, design: .rounded))
-                Text("Your virtual coworker")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+        ToolbarItem(placement: .primaryAction) {
+            Button {
+                if let until = services.healthGlance.tooltip {
+                    inspectorPresented = true
+                    _ = until  // documented intent: open inspector to Health
+                } else {
+                    inspectorPresented = true
+                }
+            } label: {
+                Label(services.healthGlance.label,
+                      systemImage: services.healthGlance.symbol)
+                    .foregroundStyle(services.healthGlance.tint)
             }
-            Spacer()
-            connectionBadge
-            modelBadge
+            .help(services.healthGlance.tooltip ?? "All systems healthy.")
         }
-        .padding(.bottom, 4)
-    }
 
-    @ViewBuilder
-    private var connectionBadge: some View {
-        switch services.daemonReachability {
-        case .unknown:
-            StatusPill(text: "robot · checking",
-                       tint: .secondary, systemImage: "antenna.radiowaves.left.and.right")
-        case .online:
-            StatusPill(text: "robot · online",
-                       tint: .green, systemImage: "antenna.radiowaves.left.and.right")
-        case .offline(let reason):
-            StatusPill(text: "robot · offline",
-                       tint: .red, systemImage: "antenna.radiowaves.left.and.right.slash")
-                .help(reason)
-        }
-    }
-
-    @ViewBuilder
-    private var modelBadge: some View {
-        switch services.llmStatus {
-        case .unknown:
-            StatusPill(text: "brain · checking",
-                       tint: .secondary, systemImage: "brain")
-        case .online(let model):
-            StatusPill(text: "brain · \(model)",
-                       tint: .accentColor, systemImage: "brain")
-        case .offline:
-            StatusPill(text: "brain · offline",
-                       tint: .red, systemImage: "brain")
+        ToolbarItem(placement: .primaryAction) {
+            Button {
+                inspectorPresented.toggle()
+            } label: {
+                Label("Inspector", systemImage: "sidebar.right")
+            }
+            .help("Open the engineering drawer: status, activity, memory, motion, vision, raw events.")
         }
     }
 }
