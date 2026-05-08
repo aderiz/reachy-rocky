@@ -67,10 +67,11 @@ struct MotionCard: View {
     // MARK: - Preview
 
     private var preview: some View {
-        ReachyHead3D(
+        ReachyMiniAvatar(
             state: services.rockyState,
             pose: services.lastRobotState?.headPose,
-            antennas: services.lastRobotState?.antennasPosition
+            antennas: services.lastRobotState?.antennasPosition,
+            bodyYaw: services.lastRobotState?.bodyYaw
         )
         .aspectRatio(1, contentMode: .fit)
         .frame(maxWidth: 280)

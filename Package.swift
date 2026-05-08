@@ -16,24 +16,18 @@ let package = Package(
         .library(name: "Perception", targets: ["Perception"]),
         .library(name: "Memory", targets: ["Memory"]),
     ],
-    dependencies: [
-        // Loads .gltf models for SceneKit. Used by ReachyHead3D to drive
-        // the live robot-pose avatar. Maintained by Warren Moore.
-        .package(url: "https://github.com/warrenm/GLTFKit2.git",
-                 from: "0.5.0"),
-    ],
+    dependencies: [],
     targets: [
         .executableTarget(
             name: "Rocky",
             dependencies: [
                 "RockyKit", "Telemetry", "SidecarHost", "RobotLink",
                 "RockyVision", "Voice", "Cognition", "Perception", "Memory",
-                .product(name: "GLTFKit2", package: "GLTFKit2"),
             ],
             path: "Sources/Rocky",
             exclude: [],
             resources: [
-                .copy("Resources/Reachy_head.gltf"),
+                .copy("Resources/ReachyMini"),
             ]
         ),
         .target(

@@ -40,10 +40,11 @@ struct PortraitView: View {
     // MARK: - Head
 
     private var head: some View {
-        ReachyHead3D(
+        ReachyMiniAvatar(
             state: services.rockyState,
             pose: services.lastRobotState?.headPose,
-            antennas: services.lastRobotState?.antennasPosition
+            antennas: services.lastRobotState?.antennasPosition,
+            bodyYaw: services.lastRobotState?.bodyYaw
         )
         .aspectRatio(1, contentMode: .fit)
         .frame(maxWidth: 360, maxHeight: 360)
