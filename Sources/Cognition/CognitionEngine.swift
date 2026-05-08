@@ -142,6 +142,15 @@ public actor CognitionEngine {
         // pair fire twice in one turn, abort the loop and force the
         // model to actually speak instead of cascading.
         var dispatchedSignatures: Set<String> = []
+        // Track whether `say` fired anywhere in this turn. Small LLMs
+        // routinely forget to call `say` after tool results — they
+        // generate natural-language text in the assistant message
+        // content, expecting that to reach the user. It doesn't:
+        // text alone is rendered to the chat, but TTS only fires
+        // when `say` is dispatched. If we end a turn with non-empty
+        // text and no `say`, auto-dispatch the text so the user
+        // actually hears Rocky.
+        var spokeThisTurn = false
 
         while rounds < config.maxToolRounds {
             rounds += 1
@@ -200,21 +209,49 @@ public actor CognitionEngine {
                         "\u{2009}"  // hairspace marker, no-op visually
                     ))
                 } else {
+                    // Clean up cosmetic quote-wrapping for both the
+                    // chat and TTS — the persona prompt forbids it
+                    // but small models keep doing it. Strip at the
+                    // boundary so the transcript and the spoken
+                    // audio agree.
+                    let cleanedText = Self.cleanupForTTS(assistantText)
                     let totalMs = Date().timeIntervalSince(started) * 1000
                     continuation.yield(.assistantFinal(
-                        assistantText, latencyMs: totalMs, firstChunkMs: firstChunkMs
+                        cleanedText, latencyMs: totalMs, firstChunkMs: firstChunkMs
                     ))
-                    if !assistantText.isEmpty {
-                        transcript.append(.init(role: .assistant, content: assistantText))
+                    if !cleanedText.isEmpty {
+                        transcript.append(.init(role: .assistant, content: cleanedText))
+                    }
+                    // Auto-dispatch text content to `say` if the model
+                    // forgot to. Small LLMs routinely emit prose into
+                    // the assistant message instead of calling the
+                    // tool, leaving Rocky silent while the chat shows
+                    // text.
+                    let toSpeak = cleanedText
+                    if !spokeThisTurn, !toSpeak.isEmpty {
+                        struct SayArgs: Encodable { let text: String }
+                        let args = (try? JSONEncoder().encode(SayArgs(text: toSpeak)))
+                            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+                        let result = await registry.invoke(
+                            name: "say",
+                            argumentsJSON: args,
+                            llmMessageId: "auto-say"
+                        )
+                        continuation.yield(.toolCallDispatched(
+                            name: "say",
+                            argumentsJSON: args,
+                            id: "auto-say"
+                        ))
+                        continuation.yield(.toolCallResult(result))
                     }
                     // Post-turn write: append both sides of this exchange
                     // to the palace as verbatim drawers. Fire-and-forget
                     // so the user-facing latency is unaffected.
                     if let memory {
                         memory.recordDetached(role: .user, text: userText)
-                        if !assistantText.isEmpty {
+                        if !cleanedText.isEmpty {
                             memory.recordDetached(role: .assistant,
-                                                   text: assistantText)
+                                                   text: cleanedText)
                         }
                     }
                     return
@@ -266,6 +303,9 @@ public actor CognitionEngine {
                     name: call.function.name,
                     toolCallId: call.id
                 ))
+                if call.function.name == "say" {
+                    spokeThisTurn = true
+                }
             }
             for sig in signatures { dispatchedSignatures.insert(sig) }
 
@@ -434,6 +474,34 @@ public actor CognitionEngine {
     /// legitimate `bash` / `python` code blocks the assistant might
     /// emit when explaining code — the user would type "show me a
     /// Bash one-liner" and the rendered chat showed nothing.
+    /// Strip cosmetic quote-wrapping the LLM adds around spoken
+    /// phrases (`"Rocky check weather." "17 degrees today."`).
+    /// Quote characters in the synthesized audio sound wrong (TTS
+    /// engines pronounce literal quote marks as pauses or skip
+    /// them awkwardly). The persona prompt tries to forbid this
+    /// but small models ignore it; cleanup at the boundary is the
+    /// reliable fix.
+    public static func cleanupForTTS(_ text: String) -> String {
+        // Drop straight + curly quote characters. We keep the
+        // punctuation between phrases (the period at the end of
+        // each quoted segment), so the resulting prose still has
+        // sentence breaks: `"Foo." "Bar."` → `Foo. Bar.`.
+        let stripped = text
+            .replacingOccurrences(of: "\"", with: "")
+            .replacingOccurrences(of: "\u{201C}", with: "") // U+201C left "
+            .replacingOccurrences(of: "\u{201D}", with: "") // U+201D right "
+            .replacingOccurrences(of: "\u{2018}", with: "") // U+2018 left '
+            .replacingOccurrences(of: "\u{2019}", with: "") // U+2019 right '
+        // Collapse runs of whitespace that the strip can produce.
+        let collapsed = stripped
+            .replacingOccurrences(
+                of: "\\s+",
+                with: " ",
+                options: .regularExpression
+            )
+        return collapsed.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     public static func stripFencedJSONBlocks(from text: String) -> String {
         var out = text
         let range = NSRange(out.startIndex..., in: out)
