@@ -90,13 +90,33 @@ cat > "$CONTENTS/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-echo "==> Ad-hoc signing"
-# Hardened runtime (--options runtime) is for notarised distribution.
-# With ad-hoc signing + hardened runtime + no entitlements file,
-# macOS Sequoia silently refuses Calendar / EventKit prompts —
-# `requestFullAccessToEvents()` returns false without ever showing
-# the system dialog. Plain ad-hoc is what local dev needs.
-codesign --force --sign - --timestamp=none "$APP" >/dev/null
+# Sign with the first available code-signing identity, preferring
+# Developer ID > Apple Development > ad-hoc. macOS Sequoia's TCC
+# keys grants for sensitive permissions (Calendar, Location,
+# Camera) by Bundle ID + Team ID — with ad-hoc signing the Team
+# ID is empty, so a different CDHash on each rebuild made TCC
+# re-prompt every cycle. A real cert (even the free "Apple
+# Development" cert Xcode auto-generates from an Apple ID)
+# supplies a stable Team ID, so granted permissions persist
+# across rebuilds.
+SIGN_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
+    | grep -E "Developer ID Application|Apple Development" \
+    | head -1 \
+    | awk -F'"' '{print $2}')
+
+if [[ -n "$SIGN_IDENTITY" ]]; then
+    echo "==> Signing with: $SIGN_IDENTITY"
+    codesign --force --sign "$SIGN_IDENTITY" --timestamp=none "$APP" >/dev/null
+else
+    # Hardened runtime (--options runtime) is for notarised distribution.
+    # With ad-hoc signing + hardened runtime + no entitlements file,
+    # macOS Sequoia silently refuses Calendar / EventKit prompts —
+    # `requestFullAccessToEvents()` returns false without ever
+    # showing the system dialog. Plain ad-hoc is what local dev
+    # falls back to when no signing identity is available.
+    echo "==> Ad-hoc signing (no Developer ID / Apple Development cert found)"
+    codesign --force --sign - --timestamp=none "$APP" >/dev/null
+fi
 
 echo
 echo "Built: $APP"
