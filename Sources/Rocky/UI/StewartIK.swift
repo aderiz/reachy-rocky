@@ -243,7 +243,16 @@ final class StewartIK {
     /// Construct a zero-copy Uint8Array in the JS context backed by a
     /// malloc'd copy of the data. The deallocator hands the buffer
     /// back to free() when JSC GCs the array.
-    private static func makeUint8Array(
+    ///
+    /// `nonisolated` is load-bearing here: the deallocator block is
+    /// invoked by JSC's heap collector on a dedicated thread, NOT
+    /// the main actor. Without this annotation, Swift 6 runtime
+    /// isolation checks fire `swift_task_checkIsolatedSwift` from
+    /// the GC thread, fail the assertion, and the process traps.
+    /// The closure itself touches no actor-isolated state — it just
+    /// calls `free` on a raw pointer — so running off the main
+    /// actor is safe.
+    private nonisolated static func makeUint8Array(
         from data: Data, in context: JSContext
     ) -> JSValue {
         let count = data.count
