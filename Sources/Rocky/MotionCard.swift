@@ -1,66 +1,45 @@
 import SwiftUI
 import RockyKit
 
-/// Inspector → Motion. Rocky's body angles, in numbers and a calm
-/// horizontal bar per axis.
+/// Inspector → Motion. Rocky's body angles as a macOS info panel.
 ///
-/// Replaced the hand-rolled crescent arc dials with centered fill
-/// bars: each row shows a thin horizontal track with a tick at neutral
-/// (zero) and a colored capsule that grows from the tick toward the
-/// current value. The bar's length communicates "how far from neutral
-/// relative to the safety limit"; the colour tells you which axis;
-/// the trailing label gives the precise reading. Layout is the same
-/// row pattern across head pose, body, and antennas — easier to scan
-/// than three different visual styles.
+/// The cockpit's 3D head is the visual motion display. This tab is the
+/// data sheet next to it — numbers, factual, dense, scan-friendly.
+/// Every row is a `LabeledContent` (the same control macOS uses in
+/// System Settings, Get Info, etc.) so the values right-align under
+/// each other and the eye reads down a column instead of bouncing
+/// between gauge and label.
 ///
-/// Per `docs/concepts/cockpit-design.md` Inspector principles: leading
-/// section labels in `.caption2.weight(.semibold).tracking(0.6)`, no
-/// pills, only Health keeps them. Status pills replaced by a quiet
-/// caption row in the header.
+/// Per `docs/concepts/cockpit-design.md` Inspector principles: no
+/// pills, only Health keeps them; section labels in
+/// `.caption2.weight(.semibold).tracking(0.6)`; no card chrome (the
+/// inspector tab is already the container); monospaced digits on
+/// every angle so they don't jitter as values change.
 struct MotionCard: View {
     @Environment(AppServices.self) private var services
+    @State private var showLimits: Bool = false
 
-    /// Antenna angle range used for visualisation. SafetyLimits doesn't
-    /// declare an antenna max yet (the daemon enforces its own); ~60°
-    /// matches the existing twitch clamp in MacFaceTracker and reads
-    /// well on the bar.
-    private let antennaMaxRad: Double = .pi / 3   // 60°
+    /// SafetyLimits doesn't currently declare an antenna max; the
+    /// twitch clamp inside MacFaceTracker uses ~60°. Used only for the
+    /// "Limits" reference section, not for visualisation.
+    private let antennaLimitDeg: Int = 60
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             header
             section("Head pose") {
-                AxisRow(label: "Yaw",
-                        angleRad: services.lastRobotState?.headPose.yaw ?? 0,
-                        maxRad: SafetyLimits.headYawMax,
-                        tint: .accentColor)
-                AxisRow(label: "Pitch",
-                        angleRad: services.lastRobotState?.headPose.pitch ?? 0,
-                        maxRad: SafetyLimits.headPitchMax,
-                        tint: .indigo)
-                AxisRow(label: "Roll",
-                        angleRad: services.lastRobotState?.headPose.roll ?? 0,
-                        maxRad: SafetyLimits.headRollMax,
-                        tint: .teal)
+                row("Yaw",   services.lastRobotState?.headPose.yaw)
+                row("Pitch", services.lastRobotState?.headPose.pitch)
+                row("Roll",  services.lastRobotState?.headPose.roll)
             }
             section("Body") {
-                AxisRow(label: "Yaw",
-                        angleRad: services.lastRobotState?.bodyYaw ?? 0,
-                        maxRad: SafetyLimits.bodyYawMax,
-                        tint: .orange)
+                row("Yaw", services.lastRobotState?.bodyYaw)
             }
             section("Antennas") {
-                AxisRow(label: "Right",
-                        angleRad: services.lastRobotState?
-                                    .antennasPosition.right ?? 0,
-                        maxRad: antennaMaxRad,
-                        tint: .green)
-                AxisRow(label: "Left",
-                        angleRad: services.lastRobotState?
-                                    .antennasPosition.left ?? 0,
-                        maxRad: antennaMaxRad,
-                        tint: .green)
+                row("Right", services.lastRobotState?.antennasPosition.right)
+                row("Left",  services.lastRobotState?.antennasPosition.left)
             }
+            limitsSection
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -76,11 +55,11 @@ struct MotionCard: View {
                 if let mode = services.lastRobotState?.controlMode {
                     Label(mode.rawValue,
                           systemImage: mode == .enabled
-                            ? "bolt.fill" : "pause.circle")
+                              ? "bolt.fill" : "pause.circle")
                         .font(.caption.weight(.medium))
                         .foregroundStyle(mode == .enabled
-                                          ? AnyShapeStyle(.green)
-                                          : AnyShapeStyle(.secondary))
+                                            ? AnyShapeStyle(.green)
+                                            : AnyShapeStyle(.secondary))
                         .labelStyle(.titleAndIcon)
                 }
                 Text("\(services.stateUpdateCount.formatted()) frames")
@@ -90,101 +69,88 @@ struct MotionCard: View {
         }
     }
 
+    // MARK: - Sections
+
     @ViewBuilder
     private func section<Content: View>(
         _ title: String,
         @ViewBuilder _ content: () -> Content
     ) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 6) {
             Text(title.uppercased())
                 .font(.caption2.weight(.semibold))
                 .tracking(0.6)
                 .foregroundStyle(.secondary)
-            VStack(spacing: 8) { content() }
+            VStack(spacing: 2) { content() }
         }
     }
-}
 
-// MARK: - Axis row
-
-/// One row per axis: label · centered bar (grows from neutral toward
-/// the current value) · signed degrees · range. Reads cleanly down
-/// to the inspector's 320pt minimum width.
-private struct AxisRow: View {
-    let label: String
-    let angleRad: Double
-    let maxRad: Double
-    let tint: Color
-
-    private var clamped: Double { max(-maxRad, min(maxRad, angleRad)) }
-    /// −1 (full negative limit) ... +1 (full positive limit)
-    private var normalized: Double { clamped / max(0.0001, maxRad) }
-    private var displayDeg: Double { angleRad * 180.0 / .pi }
-    private var rangeDeg: Int { Int((maxRad * 180.0 / .pi).rounded()) }
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Text(label)
-                .font(.callout.weight(.medium))
-                .frame(width: 50, alignment: .leading)
-                .foregroundStyle(.primary)
-
-            CenteredFillBar(value: normalized, tint: tint)
-                .frame(height: 12)
-                .frame(maxWidth: .infinity)
-
-            Text(String(format: "%+.1f°", displayDeg))
-                .font(.callout.monospacedDigit().weight(.semibold))
-                .foregroundStyle(.primary)
-                .frame(width: 60, alignment: .trailing)
-
-            Text("±\(rangeDeg)°")
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.tertiary)
-                .frame(width: 44, alignment: .trailing)
+    @ViewBuilder
+    private func row(_ label: String, _ angleRad: Double?) -> some View {
+        LabeledContent(label) {
+            Text(format(angleRad))
+                .font(.body.monospacedDigit().weight(.medium))
+                .foregroundStyle(angleRad == nil
+                                  ? AnyShapeStyle(.tertiary)
+                                  : AnyShapeStyle(.primary))
         }
-        .animation(.easeOut(duration: 0.2), value: normalized)
     }
-}
 
-/// Horizontal track with a tick at neutral and a coloured capsule that
-/// grows from the tick toward the current value. Negative values fill
-/// to the left, positive to the right. The fill width visualises
-/// magnitude relative to the joint's safety limit (`abs(normalized)`),
-/// so a bar that's near the edge means "near the limit" regardless
-/// of whether the limit is 40° or 180°.
-private struct CenteredFillBar: View {
-    /// −1 ... +1
-    let value: Double
-    let tint: Color
+    private func format(_ angleRad: Double?) -> String {
+        guard let angleRad else { return "—" }
+        return String(format: "%+.1f°", angleRad * 180.0 / .pi)
+    }
 
-    var body: some View {
-        GeometryReader { geo in
-            let width = geo.size.width
-            let halfWidth = width / 2
-            let clamped = max(-1, min(1, value))
-            let fillWidth = halfWidth * abs(clamped)
+    // MARK: - Limits
 
-            ZStack(alignment: .leading) {
-                // Track
-                Capsule()
-                    .fill(.tertiary)
-                    .frame(height: 4)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-                // Centered fill: positive → right of the tick;
-                // negative → left of the tick.
-                Capsule()
-                    .fill(tint)
-                    .frame(width: fillWidth, height: 4)
-                    .offset(x: clamped >= 0 ? halfWidth : halfWidth - fillWidth)
-
-                // Neutral tick
-                Capsule()
-                    .fill(.secondary)
-                    .frame(width: 2, height: 10)
-                    .offset(x: halfWidth - 1)
+    /// Collapsed by default — most of the time the user doesn't care
+    /// what the safety ceiling is, only what the current value is.
+    /// Open it when triaging "is Rocky near a limit?" and the numbers
+    /// above don't tell the story.
+    private var limitsSection: some View {
+        DisclosureGroup(isExpanded: $showLimits) {
+            VStack(spacing: 2) {
+                LabeledContent("Head yaw") {
+                    Text("±\(deg(SafetyLimits.headYawMax))°")
+                        .font(.body.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                LabeledContent("Head pitch") {
+                    Text("±\(deg(SafetyLimits.headPitchMax))°")
+                        .font(.body.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                LabeledContent("Head roll") {
+                    Text("±\(deg(SafetyLimits.headRollMax))°")
+                        .font(.body.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                LabeledContent("Body yaw") {
+                    Text("±\(deg(SafetyLimits.bodyYawMax))°")
+                        .font(.body.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                LabeledContent("Antennas") {
+                    Text("±\(antennaLimitDeg)°")
+                        .font(.body.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                LabeledContent("Yaw delta") {
+                    Text("≤\(deg(SafetyLimits.yawDeltaMax))°")
+                        .font(.body.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
             }
+            .padding(.top, 6)
+        } label: {
+            Text("Safety limits")
+                .font(.caption2.weight(.semibold))
+                .tracking(0.6)
+                .foregroundStyle(.secondary)
         }
+    }
+
+    private func deg(_ rad: Double) -> Int {
+        Int((rad * 180.0 / .pi).rounded())
     }
 }
