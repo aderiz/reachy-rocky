@@ -438,17 +438,37 @@ struct StatusView: View {
     }
 
     private var sttRow: HealthRow {
+        // Read TCC state directly each render so the row reflects the
+        // authorization grant immediately after the user resolves the
+        // system prompt — `services.sttBackendName` is set once in
+        // `warmUpSTT` at launch and would otherwise stay "pending"
+        // forever after a granted permission.
+        let auth = SFSpeechRecognizer.authorizationStatus()
         let state: HealthState
-        switch services.sttBackendName {
-        case let n where n.contains("Apple Speech"): state = .ok
-        case "unauthorized": state = .warn
-        case "unavailable":  state = .bad
-        default:             state = .unknown
+        let subtitle: String
+        switch auth {
+        case .authorized:
+            state = .ok
+            subtitle = services.sttBackendName.contains("Apple Speech")
+                ? services.sttBackendName
+                : "Apple Speech"
+        case .notDetermined:
+            state = .warn
+            subtitle = "permission pending"
+        case .denied:
+            state = .warn
+            subtitle = "permission denied"
+        case .restricted:
+            state = .bad
+            subtitle = "restricted"
+        @unknown default:
+            state = .unknown
+            subtitle = "unknown"
         }
         return HealthRow(
             id: "stt",
             title: "Speech recognition",
-            subtitle: services.sttBackendName,
+            subtitle: subtitle,
             icon: "waveform.badge.mic",
             state: state,
             action: state == .warn
