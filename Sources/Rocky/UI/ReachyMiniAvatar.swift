@@ -63,13 +63,15 @@ struct ReachyMiniAvatar: NSViewRepresentable {
 
         // Wrap the URDF root in a "presentation" node so we can apply
         // a yaw without fighting the URDF's own Z-up → Y-up correction
-        // (which sits on `robot.rootNode.simdOrientation`). The URDF
-        // imports facing away from the camera; a 180° yaw around the
-        // world Y axis turns the bot to face us.
+        // (which sits on `robot.rootNode.simdOrientation`). The URDF's
+        // face direction (camera mount) is on its -Y axis, which after
+        // the loader's Z→Y rotation maps to world +Z by way of a -90°
+        // yaw — verified empirically: -π/2 puts the eyes toward the
+        // camera, +π/2 turns the bot 180° and shows its back.
         let presentation = SCNNode()
         presentation.name = "presentation"
         presentation.simdOrientation = simd_quatf(
-            angle: .pi, axis: SIMD3<Float>(0, 1, 0)
+            angle: -.pi / 2, axis: SIMD3<Float>(0, 1, 0)
         )
         if let robot = Self.loadRobot() {
             presentation.addChildNode(robot.rootNode)
