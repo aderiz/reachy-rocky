@@ -887,6 +887,33 @@ final class AppServices {
         mic.stop()
     }
 
+    /// Defensive shutdown for app quit. Stops the target streamer
+    /// FIRST so no more `set_target` writes go out, then disables
+    /// the daemon's motor controller so the bot doesn't keep
+    /// absorbing whatever pose was last commanded. Each step is
+    /// best-effort with a hard timeout — Rocky must exit promptly
+    /// even if the daemon is unreachable.
+    func safeShutdown() async {
+        await targetStreamer.stop()
+        do {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask { [robotLink] in
+                    try await robotLink.setMotorMode(.disabled)
+                }
+                group.addTask {
+                    try await Task.sleep(nanoseconds: 1_500_000_000)
+                    throw CancellationError()
+                }
+                try await group.next()
+                group.cancelAll()
+            }
+        } catch {
+            // Best-effort. Daemon offline / timeout is fine — the
+            // important thing is that no more writes leave Rocky.
+        }
+        await stop()
+    }
+
     // MARK: - Voice control
 
     func toggleMic() async {

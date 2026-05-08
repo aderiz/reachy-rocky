@@ -8,6 +8,7 @@ import Telemetry
 @main
 struct RockyApp: App {
     @State private var services = AppServices()
+    @NSApplicationDelegateAdaptor(SafetyDelegate.self) private var delegate
 
     init() {
         // Without this, a SwiftPM executable launched directly (e.g. ⌘R
@@ -21,9 +22,71 @@ struct RockyApp: App {
         // identically — useful while iterating in Xcode's debugger.
         NSApplication.shared.setActivationPolicy(.regular)
         NSApplication.shared.activate(ignoringOtherApps: true)
+        // Single-instance guard — runs BEFORE any AppServices wiring
+        // so we can't possibly start a second TargetStreamer / face
+        // tracker pointing at the same robot. We hit this on
+        // 2026-05-08: an Xcode Debug build and a freshly-launched
+        // build/Rocky.app were both POSTing to /api/move/set_target
+        // at 50 Hz. The daemon couldn't pick a winner and the head
+        // moved aggressively. Fail-closed: refuse to start, prompt
+        // the user, terminate the peer if they confirm.
+        Self.enforceSingleInstance()
         // Install the ⌥⌘R "summon Rocky" hotkey — works from anywhere
         // on the system. See docs/concepts/cockpit-design.md §3.5.
         HotkeyMonitor.shared.install()
+    }
+
+    /// Refuse to start if another copy of Rocky is already running.
+    /// Bundle ID match is the source of truth — peers from `swift run`
+    /// (no bundle ID) are skipped, but those don't ship a real
+    /// TargetStreamer-and-sidecars setup either. The bundled
+    /// `build/Rocky.app` is what actually drives the robot, so that's
+    /// what the guard cares about.
+    private static func enforceSingleInstance() {
+        guard let bundleID = Bundle.main.bundleIdentifier else { return }
+        let me = NSRunningApplication.current.processIdentifier
+        let peers = NSRunningApplication
+            .runningApplications(withBundleIdentifier: bundleID)
+            .filter { $0.processIdentifier != me }
+        guard !peers.isEmpty else { return }
+
+        let pids = peers.map { String($0.processIdentifier) }
+                       .joined(separator: ", ")
+        let alert = NSAlert()
+        alert.messageText = "Another Rocky is already running"
+        alert.informativeText = """
+        Two copies of Rocky writing to the same robot send racing \
+        motion commands at 50 Hz each, which causes the head to move \
+        unpredictably. Only one Rocky is allowed at a time.
+
+        Other instance: PID \(pids)
+        """
+        alert.addButton(withTitle: "Quit Other & Continue")
+        alert.addButton(withTitle: "Quit This Rocky")
+        alert.alertStyle = .critical
+
+        let response = alert.runModal()
+        guard response == .alertFirstButtonReturn else {
+            // User picked "Quit This Rocky" — exit before SwiftUI
+            // brings up a window. Use exit(0) rather than NSApp
+            // termination because NSApp.run() hasn't started yet.
+            exit(0)
+        }
+
+        // Terminate peers gracefully, then force-kill any holdouts.
+        for peer in peers { peer.terminate() }
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            let still = NSRunningApplication
+                .runningApplications(withBundleIdentifier: bundleID)
+                .filter { $0.processIdentifier != me }
+            if still.isEmpty { return }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        let stragglers = NSRunningApplication
+            .runningApplications(withBundleIdentifier: bundleID)
+            .filter { $0.processIdentifier != me }
+        for peer in stragglers { peer.forceTerminate() }
     }
 
     var body: some Scene {
@@ -31,7 +94,10 @@ struct RockyApp: App {
             RootView()
                 .environment(services)
                 .frame(minWidth: 920, minHeight: 600)
-                .task { await services.start() }
+                .task {
+                    delegate.services = services
+                    await services.start()
+                }
         }
         .windowResizability(.contentMinSize)
         .commands {
@@ -98,6 +164,29 @@ struct RockyApp: App {
                 .environment(services)
         }
         .menuBarExtraStyle(.window)
+    }
+}
+
+/// Defers `NSApp.terminate(_:)` until `AppServices.safeShutdown()`
+/// finishes — stopping the 50 Hz target streamer and disabling the
+/// daemon's motor controller before the process actually exits. We
+/// hit a hardware-safety incident on 2026-05-08 where two Rockys
+/// quitting in quick succession left the bot oscillating; this
+/// closes the loop. NSApplicationMain only invokes the delegate
+/// once and waits up to ~5 s for `reply(toApplicationShouldTerminate:)`.
+@MainActor
+final class SafetyDelegate: NSObject, NSApplicationDelegate {
+    weak var services: AppServices?
+
+    func applicationShouldTerminate(
+        _ sender: NSApplication
+    ) -> NSApplication.TerminateReply {
+        guard let services else { return .terminateNow }
+        Task { @MainActor in
+            await services.safeShutdown()
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 }
 
