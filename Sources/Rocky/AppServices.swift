@@ -89,6 +89,12 @@ final class AppServices {
 
     /// Latest robot-camera frame as JPEG data (the SwiftUI side decodes it).
     var lastCameraFrame: RobotCameraService.Frame?
+
+    /// Wall-clock timestamp of the most recent camera frame from the
+    /// robot-camera sidecar. Stamped on every frame so the Health
+    /// surface can distinguish "streaming live" from "sidecar
+    /// respawning / WebRTC dropped". Same shape as `lastMicFrameAt`.
+    var lastCameraFrameAt: Date?
     var cameraFrameCount: Int = 0
 
     // Live voice state
@@ -721,6 +727,10 @@ final class AppServices {
                 counter += 1
                 await self.macFaceTracker.ingestFrame(frame)
                 let now = Date()
+                // Stamp every frame for Health stall detection — the
+                // 5 Hz UI throttle below would let the row read green
+                // for ~200 ms after a real stall otherwise.
+                await MainActor.run { self.lastCameraFrameAt = now }
                 // 5 Hz mirror — see detection loop above. The face
                 // tracker still gets every frame; only the UI is throttled.
                 if now.timeIntervalSince(lastUiUpdate) < 0.2 { continue }

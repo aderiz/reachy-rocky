@@ -234,7 +234,8 @@ struct StatusView: View {
         [
             ("Connections", [robotRow, llmRow]),
             ("Audio",       [micRow, sttRow]),
-            ("Sidecars",    [faceSidecarRow, ttsSidecarRow, memorySidecarRow]),
+            ("Vision",      [cameraRow, faceSidecarRow]),
+            ("Sidecars",    [ttsSidecarRow, memorySidecarRow]),
         ]
     }
 
@@ -327,6 +328,43 @@ struct StatusView: View {
             action: HealthAction(label: services.micEnabled ? "Disable" : "Enable") {
                 Task { await services.toggleMic() }
             }
+        )
+    }
+
+    private var cameraRow: HealthRow {
+        // Same three-state shape as the mic row: off / live / stalled.
+        // The robot-camera sidecar's runner has multi-tier resilience
+        // (3s soft media-refresh, 20s fatal exit), so a yellow row
+        // here is a real signal — frames stopped flowing despite the
+        // sidecar's own recovery attempts.
+        let state: HealthState
+        let subtitle: String
+        let isStreaming = services.lastCameraFrame != nil
+                       || services.lastCameraFrameAt != nil
+        if !isStreaming {
+            state = .unknown
+            subtitle = "not streaming"
+        } else if let last = services.lastCameraFrameAt,
+                  Date().timeIntervalSince(last) < 3 {
+            state = .ok
+            let fps = services.cameraFrameCount
+            subtitle = "live · \(fps) frames"
+        } else {
+            state = .warn
+            if let last = services.lastCameraFrameAt {
+                let s = Int(Date().timeIntervalSince(last))
+                subtitle = "stalled · last frame \(s)s ago"
+            } else {
+                subtitle = "stalled · no frames yet"
+            }
+        }
+        return HealthRow(
+            id: "camera",
+            title: "Camera",
+            subtitle: subtitle,
+            icon: "video",
+            state: state,
+            action: nil
         )
     }
 
