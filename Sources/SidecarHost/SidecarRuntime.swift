@@ -213,13 +213,11 @@ public actor SidecarRuntime: Sidecar {
     // MARK: - Ingest
 
     private func ingestStdout(_ chunk: Data) async {
-        let envelopes: [JSONLineCodec.Envelope]
-        do {
-            envelopes = try codec.consume(chunk, into: &stdoutBuffer)
-        } catch {
-            await logBus.publish(.error(scope: "sidecar:\(name)", message: "decode: \(error)", recoverable: true))
-            return
-        }
+        // The codec now downgrades non-JSON lines into `.log`
+        // envelopes itself (Python sidecars print status to stdout,
+        // and we don't want every print() to fire a decode error
+        // that drops the rest of the batch).
+        let envelopes = codec.consume(chunk, into: &stdoutBuffer)
         for env in envelopes {
             await dispatch(env)
         }

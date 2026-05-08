@@ -10,7 +10,15 @@ public struct JSONLineCodec: Sendable {
 
     /// Append `bytes` to `buffer`, return decoded envelopes for any complete lines.
     /// Updates `buffer` in place to retain any trailing partial line.
-    public func consume(_ bytes: Data, into buffer: inout Data) throws -> [Envelope] {
+    ///
+    /// Per-line resilient: a single malformed line is downgraded to a
+    /// `.log` envelope (`stream=stdout-text`) and the remaining lines
+    /// in the same batch still decode. Python sidecars and their
+    /// dependencies routinely `print()` non-JSON status to stdout
+    /// (model loaders, MLX warmup, progress bars); throwing on the
+    /// first one used to drop the rest of the batch and spam the
+    /// activity log with `decode: ...` errors.
+    public func consume(_ bytes: Data, into buffer: inout Data) -> [Envelope] {
         buffer.append(bytes)
 
         var envelopes: [Envelope] = []
@@ -19,7 +27,17 @@ public struct JSONLineCodec: Sendable {
             buffer.removeSubrange(buffer.startIndex...newline)
             // Skip empty lines (a sidecar that prints "\n\n" shouldn't crash us).
             guard !line.isEmpty else { continue }
-            envelopes.append(try Envelope.decode(from: line))
+            do {
+                envelopes.append(try Envelope.decode(from: line))
+            } catch {
+                let text = String(data: Data(line), encoding: .utf8)
+                    ?? "<\(line.count) non-utf8 bytes>"
+                envelopes.append(.log(
+                    level: "info",
+                    message: text,
+                    fields: ["stream": "stdout-text"]
+                ))
+            }
         }
         return envelopes
     }
