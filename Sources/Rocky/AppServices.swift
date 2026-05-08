@@ -1897,6 +1897,7 @@ final class AppServices {
                 await MainActor.run { store.braveSearchAPIKey }
             }
         )
+        await RememberTool.register(in: toolRegistry, memory: memory)
     }
 
     private func probeRobot() async {
