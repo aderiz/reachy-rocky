@@ -83,6 +83,16 @@ public actor SidecarRuntime: Sidecar {
         continuation: AsyncStream<SidecarOutboundEvent>.Continuation
     ) {
         subscribers[id] = continuation
+        // Replay the current state so a late subscriber doesn't miss
+        // a `.ready` transition that fired before it connected. State
+        // is a CURRENT-VALUE concept (the sidecar is `.ready` right
+        // now), unlike `.event` / `.log` which are transient
+        // notifications — those rightly only flow forward from the
+        // moment of subscription. Without this replay, AppServices'
+        // state mirror was reading `.stopped` forever even after the
+        // sidecar reached `.ready`, because its subscription happens
+        // immediately AFTER `sidecar.start()` returns.
+        continuation.yield(.state(_state))
     }
 
     private func removeSubscriber(id: UUID) {
