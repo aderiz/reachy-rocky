@@ -1884,6 +1884,12 @@ final class AppServices {
                 ])
             }
         )
+
+        // Out-of-tree tools — each lives in `Sources/Rocky/Tools/` so
+        // this method doesn't keep growing. They register themselves
+        // against the same `ToolRegistry` so the LLM sees them in the
+        // same `tools` array as the robot-control tools above.
+        await TimeTool.register(in: toolRegistry)
     }
 
     private func probeRobot() async {
