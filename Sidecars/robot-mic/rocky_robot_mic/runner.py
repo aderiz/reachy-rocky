@@ -41,6 +41,13 @@ def respond_error(req_id: str, code: int, message: str) -> None:
 
 
 class Runner:
+    # Audio loop stall detection. If `recording` is true but no frames
+    # have flowed for this long, exit the process so the SidecarHost
+    # supervisor restarts us with a fresh WebRTC connection. This is
+    # the difference between "mic is unreliable" (silent freezes) and
+    # "mic is offline for 7 seconds and then comes back".
+    STALL_TIMEOUT_S = 5.0
+
     def __init__(self) -> None:
         self.host = os.environ.get("ROCKY_ROBOT_HOST", "reachy-mini.local")
         self.port = int(os.environ.get("ROCKY_ROBOT_PORT", "8000"))
@@ -50,6 +57,7 @@ class Runner:
         self.sample_rate: int = 16_000
         self.channels: int = 1
         self.last_doa_emit_ts: float = 0.0
+        self.last_frame_ts: float = time.monotonic()
 
         # Connect on the MAIN thread before stdin loop. GStreamer's GLib
         # main-loop integration is finicky from a background thread, which
@@ -78,6 +86,10 @@ class Runner:
 
         log("info", "recording started",
             sr=self.sample_rate, ch=self.channels)
+        # Start the stall watchdog only once recording is live.
+        self.last_frame_ts = time.monotonic()
+        threading.Thread(target=self._stall_watchdog,
+                         name="stall-watchdog", daemon=True).start()
 
         # Reachy Mini's mic array delivers float32 stereo at 16 kHz; we
         # downmix to mono and emit ~30-50 Hz worth of PCM at a time.
@@ -113,6 +125,7 @@ class Runner:
                     "rms": rms,
                 },
             })
+            self.last_frame_ts = time.monotonic()
 
             # DoA at most once per 200 ms when speech is present
             now = time.monotonic()
@@ -137,6 +150,27 @@ class Runner:
         except Exception:
             pass
         log("info", "recording stopped")
+
+    def _stall_watchdog(self) -> None:
+        """Exit the process if `recording` is true but no audio frames
+        have arrived for `STALL_TIMEOUT_S`. Triggers when the bot's
+        media has been released externally, when WebRTC silently
+        drops, or when GStreamer's pipeline deadlocks. The
+        SidecarSupervisor on the Swift side will respawn us with a
+        fresh ReachyMini connection — much faster recovery than
+        waiting for someone to notice the mic is dead."""
+        while not self.shutdown_flag.is_set():
+            time.sleep(1.0)
+            if not self.recording:
+                self.last_frame_ts = time.monotonic()
+                continue
+            stalled = time.monotonic() - self.last_frame_ts
+            if stalled > self.STALL_TIMEOUT_S:
+                log("error", "audio stalled, exiting for restart",
+                    stalled_s=f"{stalled:.1f}")
+                # Hard exit — the supervisor's restart_policy=on_failure
+                # will respawn us and audio resumes within ~1s.
+                os._exit(1)
 
     # --- request dispatch ---
 
