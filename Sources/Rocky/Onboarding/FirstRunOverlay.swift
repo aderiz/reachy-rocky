@@ -396,7 +396,7 @@ struct FirstRunOverlay: View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Grant access.")
                 .font(.title.weight(.semibold))
-            Text("Rocky needs three permissions to do his job. macOS shows a system prompt for each one — that's mandatory and Apple doesn't let apps bundle them. They're listed here so you only deal with them once.")
+            Text("Rocky needs four permissions to do his job. macOS shows a system prompt for each one — that's mandatory and Apple doesn't let apps bundle them. They're listed here so you only deal with them once.")
                 .font(.body)
                 .foregroundStyle(.primary)
 
@@ -406,6 +406,7 @@ struct FirstRunOverlay: View {
                     title: "Microphone",
                     rationale: "So Rocky can hear you say his name.",
                     status: micStatus,
+                    settingsAnchor: "Privacy_Microphone",
                     grant: { await requestMic() }
                 )
                 permissionRow(
@@ -413,6 +414,7 @@ struct FirstRunOverlay: View {
                     title: "Speech recognition",
                     rationale: "So your words become text Rocky can act on.",
                     status: speechStatus,
+                    settingsAnchor: "Privacy_SpeechRecognition",
                     grant: { await requestSpeech() }
                 )
                 permissionRow(
@@ -420,6 +422,7 @@ struct FirstRunOverlay: View {
                     title: "Calendar",
                     rationale: "So Rocky can answer \"what's on tomorrow?\" without guessing.",
                     status: calendarStatus,
+                    settingsAnchor: "Privacy_Calendars",
                     grant: { await requestCalendar() }
                 )
                 permissionRow(
@@ -427,6 +430,7 @@ struct FirstRunOverlay: View {
                     title: "Location",
                     rationale: "So \"what's the weather?\" works without you naming the city.",
                     status: locationStatus,
+                    settingsAnchor: "Privacy_LocationServices",
                     grant: { await requestLocation() }
                 )
             }
@@ -450,6 +454,14 @@ struct FirstRunOverlay: View {
             }
         }
         .onAppear { refreshStatuses() }
+        // Picks up grants made from System Settings while the user
+        // was away from Rocky — without this, a row would stay
+        // "Denied" until the next overlay cycle.
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.didBecomeActiveNotification
+        )) { _ in
+            refreshStatuses()
+        }
     }
 
     private var allGrantedHint: String {
@@ -467,6 +479,7 @@ struct FirstRunOverlay: View {
         title: String,
         rationale: String,
         status: PermissionStatus,
+        settingsAnchor: String,
         grant: @escaping @Sendable () async -> Void
     ) -> some View {
         HStack(spacing: 12) {
@@ -485,8 +498,19 @@ struct FirstRunOverlay: View {
                     Label("Granted", systemImage: "checkmark.circle.fill")
                         .foregroundStyle(.green)
                 case .denied:
-                    Label("Denied", systemImage: "xmark.circle.fill")
-                        .foregroundStyle(.orange)
+                    // macOS won't re-prompt once the user has decided.
+                    // Only path is System Settings → toggle Rocky on
+                    // (or remove the entry entirely). Deep-link to the
+                    // exact pane so the user doesn't have to dig.
+                    HStack(spacing: 6) {
+                        Label("Denied", systemImage: "xmark.circle.fill")
+                            .foregroundStyle(.orange)
+                        Button("Open Settings") {
+                            openSystemSettings(anchor: settingsAnchor)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
                 case .unknown:
                     Button("Grant") { Task { await grant() } }
                         .buttonStyle(.bordered)
@@ -498,6 +522,17 @@ struct FirstRunOverlay: View {
         .padding(.horizontal, 10)
         .background(.background.tertiary,
                     in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    /// Open the System Settings Privacy & Security pane scoped to the
+    /// given anchor (e.g. `Privacy_Microphone`). The URL scheme has
+    /// been stable since macOS Ventura; we don't need to special-case
+    /// the older `x-apple.systempreferences:` paths.
+    private func openSystemSettings(anchor: String) {
+        let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)"
+        )!
+        NSWorkspace.shared.open(url)
     }
 
     // MARK: - Permission requests
