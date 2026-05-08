@@ -41,19 +41,28 @@ def respond_error(req_id: str, code: int, message: str) -> None:
 
 
 class Runner:
-    # Two-tier stall recovery, mirroring the camera sidecar:
+    # Three-tier stall recovery. Each tier is more invasive than
+    # the last; the goal is to absorb most stalls invisibly without
+    # going to process respawn (which trips the supervisor's circuit
+    # breaker after 3 restarts/minute and locks the mic out for 60 s).
     #
-    # 1. After `STALL_REFRESH_S` of no frames, try a soft refresh:
-    #    `release_media + acquire_media`. Most WebRTC drops on the
-    #    bot side recover from this without a full process respawn.
-    # 2. After `STALL_FATAL_S` of no frames (regardless of refresh
-    #    attempts), exit the process so the SidecarHost supervisor
-    #    respawns us with a brand-new ReachyMini connection. The
-    #    cooldown between refreshes prevents hammering on a totally
-    #    broken connection.
-    STALL_REFRESH_S = 3.0
-    STALL_FATAL_S = 12.0
-    REFRESH_COOLDOWN_S = 6.0
+    # 1. T1 — soft refresh at STALL_REFRESH_S: `release_media +
+    #    acquire_media`. Most transient WebRTC hiccups recover here.
+    # 2. T2 — in-process SDK reconnect at STALL_RECONNECT_S: tear
+    #    down ReachyMini and recreate it without exiting. Fresh
+    #    WebRTC peer without supervisor involvement.
+    # 3. T3 — fatal exit at STALL_FATAL_S: release media cleanly
+    #    so the bot's WebRTC peer state is freed, then `os._exit(1)`
+    #    so the supervisor respawns us with a clean slate.
+    #
+    # Timeouts are deliberately patient. WebRTC re-negotiations can
+    # take 10–20 s to settle on their own; firing too aggressively
+    # interrupts natural recovery and compounds the problem.
+    STALL_REFRESH_S = 5.0
+    STALL_RECONNECT_S = 12.0
+    STALL_FATAL_S = 30.0
+    REFRESH_COOLDOWN_S = 8.0
+    RECONNECT_COOLDOWN_S = 15.0
 
     def __init__(self) -> None:
         self.host = os.environ.get("ROCKY_ROBOT_HOST", "reachy-mini.local")
@@ -65,6 +74,7 @@ class Runner:
         self.channels: int = 1
         self.last_doa_emit_ts: float = 0.0
         self.last_frame_ts: float = time.monotonic()
+        self._watchdog_thread: threading.Thread | None = None
 
         # Connect on the MAIN thread before stdin loop. GStreamer's GLib
         # main-loop integration is finicky from a background thread, which
@@ -93,10 +103,17 @@ class Runner:
 
         log("info", "recording started",
             sr=self.sample_rate, ch=self.channels)
-        # Start the stall watchdog only once recording is live.
         self.last_frame_ts = time.monotonic()
-        threading.Thread(target=self._stall_watchdog,
-                         name="stall-watchdog", daemon=True).start()
+        # Spawn the stall watchdog at most once per process — a
+        # reconnect-tier recovery restarts audio_loop, but we don't
+        # want a second watchdog stacking on the first.
+        if self._watchdog_thread is None or not self._watchdog_thread.is_alive():
+            self._watchdog_thread = threading.Thread(
+                target=self._stall_watchdog,
+                name="stall-watchdog",
+                daemon=True,
+            )
+            self._watchdog_thread.start()
 
         # Reachy Mini's mic array delivers float32 stereo at 16 kHz; we
         # downmix to mono and emit ~30-50 Hz worth of PCM at a time.
@@ -159,9 +176,9 @@ class Runner:
         log("info", "recording stopped")
 
     def _refresh_media(self) -> bool:
-        """Best-effort `release_media + acquire_media` on the bot.
-        Many WebRTC drops recover with a refresh and never need a
-        process restart. Returns True if reacquisition succeeded."""
+        """T1 — best-effort `release_media + acquire_media` on the
+        bot. Many WebRTC drops recover with a refresh and never need
+        a deeper recovery. Returns True if reacquisition succeeded."""
         try:
             self.mini.release_media()
             log("info", "media released for refresh")
@@ -176,12 +193,52 @@ class Runner:
             log("warn", "acquire_media failed", error=str(exc))
             return False
 
+    def _reconnect_sdk(self) -> bool:
+        """T2 — tear down ReachyMini and recreate it without exiting.
+        Avoids the supervisor circuit breaker (3 restarts/min →
+        60 s cooldown) and gives a fresh WebRTC peer without leaving
+        stale state on the bot. Returns True if the new SDK
+        connected and media was acquired."""
+        # Stop the audio loop so it doesn't hold a stale `self.mini`
+        # reference while we tear down. ~0.5 s is enough — the loop
+        # checks `self.recording` at the top of each iteration.
+        self.recording = False
+        time.sleep(0.5)
+        try:
+            self.mini.release_media()
+        except Exception as exc:  # noqa: BLE001
+            log("debug", "release_media during reconnect failed",
+                error=str(exc))
+        try:
+            from reachy_mini import ReachyMini
+            self.mini = ReachyMini(
+                host=self.host, port=self.port,
+                connection_mode="network", media_backend="webrtc",
+                automatic_body_yaw=False,
+                log_level="WARNING",
+            )
+            self.mini.acquire_media()
+        except Exception as exc:  # noqa: BLE001
+            log("error", "SDK reconnect failed", error=str(exc))
+            return False
+        # Restart the audio loop with the fresh SDK. The watchdog
+        # is process-scoped so it stays alive — the audio_loop
+        # thread is what restarts.
+        self.last_frame_ts = time.monotonic()
+        self.recording = True
+        threading.Thread(target=self.audio_loop, name="audio",
+                         daemon=True).start()
+        log("info", "SDK reconnected in-process")
+        return True
+
     def _stall_watchdog(self) -> None:
-        """Two-tier stall recovery for the audio loop. Soft refresh
-        first (release+reacquire media) so transient WebRTC drops
-        don't require a process respawn. Hard exit only if the soft
-        refresh hasn't restored frames within `STALL_FATAL_S`."""
+        """Three-tier stall recovery for the audio loop. Soft refresh
+        first (T1), then in-process SDK reconnect (T2), then fatal
+        exit (T3) only if the deeper tiers haven't restored frames.
+        Cooldowns between tiers prevent hammering on a connection
+        that needs more time to recover."""
         last_refresh = 0.0
+        last_reconnect = 0.0
         while not self.shutdown_flag.is_set():
             time.sleep(1.0)
             if not self.recording:
@@ -190,22 +247,33 @@ class Runner:
             now = time.monotonic()
             stalled = now - self.last_frame_ts
 
-            # Tier 1: soft media refresh, rate-limited so we don't
-            # hammer on a fully broken connection.
+            # T1 — soft media refresh.
             if (stalled > self.STALL_REFRESH_S
                 and now - last_refresh > self.REFRESH_COOLDOWN_S):
-                log("warn", "audio stalled, refreshing media",
+                log("warn", "audio stalled — refreshing media",
                     stalled_s=f"{stalled:.1f}")
                 self._refresh_media()
                 last_refresh = now
-                # Don't reset last_frame_ts — the next real frame
-                # resets it naturally and we want the fatal timer
-                # to keep counting from the original stall.
 
-            # Tier 2: fatal exit, supervisor respawns us.
-            if stalled > self.STALL_FATAL_S:
-                log("error", "audio dead, exiting for supervisor restart",
+            # T2 — in-process SDK reconnect.
+            if (stalled > self.STALL_RECONNECT_S
+                and now - last_reconnect > self.RECONNECT_COOLDOWN_S):
+                log("warn", "audio still stalled — reconnecting SDK in-process",
                     stalled_s=f"{stalled:.1f}")
+                self._reconnect_sdk()
+                last_reconnect = now
+
+            # T3 — fatal exit with cleanup. Releasing media before
+            # `os._exit` matters: a hard exit without it leaves a
+            # half-connected WebRTC peer on the bot, and every
+            # subsequent respawn inherits that corruption.
+            if stalled > self.STALL_FATAL_S:
+                log("error", "audio dead — exiting for supervisor restart",
+                    stalled_s=f"{stalled:.1f}")
+                try:
+                    self.mini.release_media()
+                except Exception:  # noqa: BLE001
+                    pass
                 os._exit(1)
 
     # --- request dispatch ---
