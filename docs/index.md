@@ -1,7 +1,7 @@
 ---
 title: Wiki Index
 type: index
-last_updated: 2026-05-05
+last_updated: 2026-05-07
 ---
 
 # Index
@@ -18,6 +18,7 @@ The catalog of every page in the wiki.
 - [Safety limits](concepts/safety-limits.md) — joint ranges, head/body yaw delta, auto-clamping.
 - [Media architecture](concepts/media-architecture.md) — `local`/`webrtc`/`no_media` backends, GStreamer/IPC.
 - [App lifecycle](concepts/app-lifecycle.md) — entry points, single-app constraint, SIGINT shutdown.
+- [Cockpit design](concepts/cockpit-design.md) — UI design contract: stage + margin + drawer + toolbar window, menu bar as persistent surface, six-wave roadmap.
 
 ## Reference
 

@@ -50,6 +50,14 @@ final class SettingsStore {
     /// noise + tokens.
     var memoryTopK: Int { didSet { save() } }
 
+    /// Whether the user has completed (or explicitly skipped) the
+    /// first-run flow. Set to `true` by `FirstRunOverlay` once any of
+    /// its exit paths fire (finish / skip). The flag is restartable
+    /// from the Help menu — `Help > Show first run` resets it to
+    /// `false` and the overlay reappears next time the cockpit window
+    /// gains focus.
+    var firstRunCompleted: Bool { didSet { save() } }
+
     init() {
         let d = UserDefaults.standard
         self.robotHost = d.string(forKey: Keys.robotHost) ?? "reachy-mini.local"
@@ -77,6 +85,7 @@ final class SettingsStore {
         self.audioVolume = (d.object(forKey: Keys.audioVolume) as? Double) ?? 0.85
         self.memoryRecallEnabled = (d.object(forKey: Keys.memoryRecallEnabled) as? Bool) ?? true
         self.memoryTopK = (d.object(forKey: Keys.memoryTopK) as? Int) ?? 5
+        self.firstRunCompleted = (d.object(forKey: Keys.firstRunCompleted) as? Bool) ?? false
     }
 
     /// Pick robot if the robot-mic sidecar venv has been built; otherwise mac.
@@ -118,6 +127,7 @@ final class SettingsStore {
         d.set(audioVolume, forKey: Keys.audioVolume)
         d.set(memoryRecallEnabled, forKey: Keys.memoryRecallEnabled)
         d.set(memoryTopK, forKey: Keys.memoryTopK)
+        d.set(firstRunCompleted, forKey: Keys.firstRunCompleted)
     }
 
     func robotEndpoint() -> RobotEndpoint {
@@ -217,5 +227,6 @@ final class SettingsStore {
         static let personaVersion = "rocky.persona.version"
         static let memoryRecallEnabled = "rocky.memory.recall.enabled"
         static let memoryTopK = "rocky.memory.topk"
+        static let firstRunCompleted = "rocky.first.run.completed"
     }
 }

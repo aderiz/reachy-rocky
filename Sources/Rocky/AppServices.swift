@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import SwiftUI
 import Cognition
 import RobotLink
 import RockyKit
@@ -42,6 +43,10 @@ final class AppServices {
     let toolRegistry: ToolRegistry
     let cognition: CognitionEngine
     let memory: MemoryService
+    /// Coalesces telemetry events into narrative moments at human
+    /// cadence. Drives the cockpit's margin strip, the menu-bar
+    /// popover's "Recent" section, and the Inspector's Activity tab.
+    let momentFeed: MomentFeed
 
     /// Most recent reachability check for the daemon.
     var daemonReachability: Reachability = .unknown
@@ -123,6 +128,13 @@ final class AppServices {
     /// Manual UI mutes (separate from sidecar/permission errors).
     var ttsMuted: Bool = false
 
+    /// Effective TTS-mute state honoured by speak callsites: the user-
+    /// controlled `ttsMuted` toggle OR the time-bounded quiet-mode
+    /// (`dndUntil`). Use this in any callsite that asks "should we
+    /// speak right now?" so the menu-bar's pause-for-X actually
+    /// silences Rocky's voice as well as cutting off dispatch.
+    var effectiveTTSMuted: Bool { ttsMuted || isDoNotDisturb }
+
     /// Whether the on-Mac face tracker is allowed to push targets to the
     /// streamer. Driven by `setFaceTrackingEnabled` so menu bar and any
     /// future dashboard control read the same source of truth.
@@ -138,6 +150,117 @@ final class AppServices {
     /// `refreshMemoryCount()`. `-1` means "haven't asked yet" so the
     /// UI can show a neutral placeholder rather than a misleading 0.
     var memoryDrawerCount: Int = -1
+
+    /// Recent narrative moments — the human-cadence successor to
+    /// `LogsView`. Mirror of the most recent slice of `MomentFeed`'s
+    /// ring buffer, re-published on each new moment so SwiftUI views
+    /// (the Activity tab, the cockpit margin strip, the menu-bar
+    /// popover) re-render at moment cadence rather than firehose.
+    var recentMoments: [Moment] = []
+
+    /// Whether the ⌘K command palette sheet is currently open. Lives
+    /// here (rather than in RootView's `@State`) so both the keyboard
+    /// shortcut handler in the cockpit AND the Edit-menu command can
+    /// toggle the same flag.
+    var commandPaletteOpen: Bool = false
+
+    /// Quiet mode. When set to a future date, Rocky stops dispatching
+    /// the wake-word pipeline (mic stays warm but user utterances aren't
+    /// routed to the brain) and TTS playback is held. Wired by the
+    /// menu-bar popover's "pause Rocky for X" control. Cleared
+    /// automatically when the date passes; UI watchers should redraw on
+    /// mutation.
+    var dndUntil: Date?
+
+    /// True iff `dndUntil` is in the future. Used by the wake/STT/TTS
+    /// pipelines as a single gate.
+    var isDoNotDisturb: Bool {
+        guard let until = dndUntil else { return false }
+        if Date() >= until {
+            // Lazy clear: avoid stale state if a UI consumer reads us
+            // long after the timer should have expired.
+            dndUntil = nil
+            return false
+        }
+        return true
+    }
+
+    /// Mute Rocky for `minutes`. Pass nil to clear.
+    func pauseFor(minutes: Int?) {
+        if let m = minutes, m > 0 {
+            dndUntil = Date().addingTimeInterval(TimeInterval(m * 60))
+        } else {
+            dndUntil = nil
+        }
+    }
+
+    /// Toolbar-level health summary. Three states: ok (green-ish, quiet),
+    /// warning (orange, something needs attention), critical (red, robot
+    /// offline). Per the cockpit design, this is the *only* always-visible
+    /// status indicator on the main window; the seven-pill detail lives
+    /// in the Inspector → Health tab.
+    struct HealthGlance: Sendable, Equatable {
+        let label: String
+        let symbol: String
+        let tint: Color
+        /// Human-readable description of the *worst* current issue, for
+        /// the toolbar tooltip. `nil` means everything is fine.
+        let tooltip: String?
+    }
+
+    var healthGlance: HealthGlance {
+        // Robot reachability is the most-fatal failure: if Rocky's body
+        // is unreachable, surface that first.
+        if case .offline(let reason) = daemonReachability {
+            return HealthGlance(
+                label: "Robot offline",
+                symbol: "wifi.exclamationmark",
+                tint: .red,
+                tooltip: "Robot offline — \(reason)"
+            )
+        }
+        // LM Studio offline isn't fatal but is amber.
+        if case .offline(let reason) = llmStatus {
+            return HealthGlance(
+                label: "Brain offline",
+                symbol: "exclamationmark.triangle.fill",
+                tint: .orange,
+                tooltip: "LM Studio offline — \(reason)"
+            )
+        }
+        // Sidecar lifecycle issues.
+        if let bad = firstUnhealthySidecar() {
+            return HealthGlance(
+                label: bad,
+                symbol: "exclamationmark.triangle.fill",
+                tint: .orange,
+                tooltip: "\(bad) needs attention."
+            )
+        }
+        // Otherwise: quiet glyph, no tooltip.
+        return HealthGlance(
+            label: "Healthy",
+            symbol: "checkmark.circle.fill",
+            tint: .green,
+            tooltip: nil
+        )
+    }
+
+    private func firstUnhealthySidecar() -> String? {
+        for (name, state) in [
+            ("Face tracker", faceTrackerSidecarState),
+            ("Voice", ttsSidecarState),
+            ("Memory", memorySidecarState),
+        ] {
+            switch state {
+            case .ready, .stopped, .starting:
+                continue
+            case .failing, .circuitOpen:
+                return "\(name) sidecar"
+            }
+        }
+        return nil
+    }
 
     enum Reachability: Sendable, Equatable {
         case unknown, online, offline(reason: String)
@@ -367,6 +490,10 @@ final class AppServices {
         )
         self.memory = MemoryService(sidecar: memoryRuntime, logBus: bus)
 
+        // MomentFeed — coalesces telemetry into narrative moments at
+        // human cadence. Subscription is wired in start().
+        self.momentFeed = MomentFeed()
+
         // Cognition: LM Studio client + tool registry + memory.
         self.llm = LMStudioClient(config: settings.lmStudioConfig(), logBus: bus)
         self.toolRegistry = ToolRegistry(logBus: bus)
@@ -404,6 +531,30 @@ final class AppServices {
             await logBus.publish(.error(scope: "app/memory",
                                         message: "\(error) — run Sidecars/mempalace/setup.sh",
                                         recoverable: true))
+        }
+
+        // Pump LogBus events into MomentFeed and mirror new moments
+        // back into the @Observable `recentMoments` slice for SwiftUI.
+        // The two pumps run on detached Tasks so they survive any
+        // restart of `start()`.
+        let bus = self.logBus
+        let feed = self.momentFeed
+        Task { [weak self] in
+            for await event in await bus.subscribe() {
+                await feed.ingest(event)
+                if Task.isCancelled { break }
+                _ = self  // keep the closure capturing self for the
+                          // weak guard above
+            }
+        }
+        let momentsStream = await momentFeed.subscribe()
+        Task { [weak self] in
+            for await _ in momentsStream {
+                guard let self else { return }
+                let snapshot = await feed.recent(limit: 50)
+                await MainActor.run { self.recentMoments = snapshot }
+                if Task.isCancelled { break }
+            }
         }
 
         // Mac-side face tracker is the source of truth for set_target now;
@@ -736,6 +887,33 @@ final class AppServices {
         mic.stop()
     }
 
+    /// Defensive shutdown for app quit. Stops the target streamer
+    /// FIRST so no more `set_target` writes go out, then disables
+    /// the daemon's motor controller so the bot doesn't keep
+    /// absorbing whatever pose was last commanded. Each step is
+    /// best-effort with a hard timeout — Rocky must exit promptly
+    /// even if the daemon is unreachable.
+    func safeShutdown() async {
+        await targetStreamer.stop()
+        do {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask { [robotLink] in
+                    try await robotLink.setMotorMode(.disabled)
+                }
+                group.addTask {
+                    try await Task.sleep(nanoseconds: 1_500_000_000)
+                    throw CancellationError()
+                }
+                try await group.next()
+                group.cancelAll()
+            }
+        } catch {
+            // Best-effort. Daemon offline / timeout is fine — the
+            // important thing is that no more writes leave Rocky.
+        }
+        await stop()
+    }
+
     // MARK: - Voice control
 
     func toggleMic() async {
@@ -851,6 +1029,25 @@ final class AppServices {
     func sendUserText(_ text: String) async {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+
+        // Quiet-mode gate. The menu-bar's "Pause Rocky for X" sets
+        // `dndUntil`; while it's in the future, we drop user dispatches
+        // so Rocky genuinely stops responding (rather than just going
+        // silent on the speaker side). Still surface the message in
+        // brainTurns so the user can see Rocky heard them but
+        // intentionally didn't reply.
+        if isDoNotDisturb {
+            await MainActor.run {
+                self.brainTurns.append(.init(role: "user", content: trimmed))
+                let mins = max(1, Int((self.dndUntil?
+                    .timeIntervalSinceNow ?? 0) / 60))
+                self.brainTurns.append(.init(
+                    role: "assistant",
+                    content: "(quiet for \(mins) more min — won't reply until then)"
+                ))
+            }
+            return
+        }
 
         // Probe LM Studio if we don't yet know it's online.
         if case .unknown = llmStatus { await probeLMStudio() }
@@ -1116,7 +1313,7 @@ final class AppServices {
     func speakAndMove(text: String,
                       _ motion: @Sendable @escaping () async throws -> Void)
     async throws {
-        let muted = await MainActor.run { self.ttsMuted }
+        let muted = await MainActor.run { self.effectiveTTSMuted }
         async let move: () = motion()
         async let speech: RobotTTS.SpeakStats? = muted
             ? nil
@@ -1641,8 +1838,9 @@ final class AppServices {
                     return .object(["ok": .bool(false),
                                     "error": .string("empty text")])
                 }
-                if await MainActor.run(body: { self?.ttsMuted ?? false }) {
-                    return .object(["ok": .bool(false), "error": .string("tts muted")])
+                if await MainActor.run(body: { self?.effectiveTTSMuted ?? false }) {
+                    return .object(["ok": .bool(false),
+                                    "error": .string("tts muted (or quiet mode)")])
                 }
                 let stats = try await tts.speak(text)
                 // Drive the "speaking" hero state: report busy through the
@@ -1949,7 +2147,7 @@ final class AppServices {
         // Don't greet from a sleeping or muted/busy state — Rocky should
         // be present and able to speak.
         guard rockyState.isAwake else { return }
-        if ttsMuted { return }
+        if effectiveTTSMuted { return }
         if brainBusy { return }
         if let until = ttsBusyUntil, now < until { return }
 

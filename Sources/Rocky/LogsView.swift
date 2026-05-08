@@ -1,138 +1,204 @@
 import SwiftUI
 import Telemetry
 
-/// Tails the LogBus into an in-memory ring buffer (last N events) and
-/// renders a filterable, color-coded list. Same Card chrome as the rest.
+/// Inspector → Raw. The firehose, for engineer + post-mortem use.
+///
+/// Per `docs/concepts/cockpit-design.md` §5: the moment feed in the
+/// Activity tab is the daily surface; Raw is the un-coalesced
+/// underlying stream. Off by default — a toggle reveals it. Filter
+/// chips collapse into a `Menu` so the chrome fits a 320pt column.
+///
+/// Subscribed to `LogBus` only when active. When the user toggles off,
+/// the subscription is cancelled and the buffer stays put for review.
 struct LogsView: View {
     @Environment(AppServices.self) private var services
     @State private var rows: [Row] = []
     @State private var filter: String = ""
     @State private var paused: Bool = false
+    @State private var enabled: Bool = false
     @State private var showCategories: Set<Category> = Set(Category.allCases)
+    @State private var streamTask: Task<Void, Never>?
 
     private let capacity = 500
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                header
-                Card {
-                    CardHeader("Filters", icon: "line.3.horizontal.decrease")
-                } content: {
-                    filtersBar
-                }
-                Card {
-                    CardHeader("Stream", icon: "waveform") {
-                        StatusPill(text: "\(filteredRows.count) of \(rows.count)",
-                                   tint: .secondary)
-                    }
-                } content: {
-                    streamView
-                }
+        VStack(alignment: .leading, spacing: 12) {
+            headerRow
+            if !enabled {
+                offByDefaultCallout
+            } else {
+                densitySparkline
+                controlsRow
+                searchField
+                Divider()
+                streamView
             }
-            .padding(.horizontal, 24)
-            .padding(.vertical, 22)
-            .frame(maxWidth: 980, alignment: .topLeading)
-            .frame(maxWidth: .infinity)
         }
-        .task {
-            let bus = services.logBus
-            for await event in await bus.subscribe() {
-                if paused { continue }
-                let row = Row.from(event)
-                await MainActor.run {
-                    rows.append(row)
-                    if rows.count > capacity {
-                        rows.removeFirst(rows.count - capacity)
-                    }
-                }
-            }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .onChange(of: enabled) { _, on in
+            if on { startStreaming() } else { stopStreaming() }
         }
     }
 
-    private var header: some View {
-        HStack(alignment: .firstTextBaseline) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Logs")
-                    .font(.system(size: 28, weight: .bold, design: .rounded))
-                Text("Every event Rocky published, in arrival order.")
-                    .font(.subheadline)
+    // MARK: - Density sparkline
+
+    /// Last-30-seconds traffic. Each cell = one second; height is the
+    /// event count in that second normalised to the 30-second peak.
+    /// Lets engineers see traffic spikes at a glance instead of
+    /// reading row timestamps to figure out "did llm chunks just
+    /// burst?".
+    private var densitySparkline: some View {
+        let bins = SecondBucket.compute(from: rows)
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("LAST 30 SEC")
+                    .font(.caption2.weight(.semibold))
+                    .tracking(0.6)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("\(bins.totalCount) events")
+                    .font(.caption2.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
+            HStack(alignment: .bottom, spacing: 1) {
+                ForEach(bins.bins) { bin in
+                    SecondBar(bin: bin, peak: bins.peak)
+                        .frame(maxWidth: .infinity)
+                }
+            }
+            .frame(height: 24)
+            .padding(.vertical, 3)
+            .padding(.horizontal, 6)
+            .background(.regularMaterial,
+                        in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+        }
+    }
+
+    // MARK: - Header
+
+    private var headerRow: some View {
+        HStack(alignment: .firstTextBaseline) {
+            Label("Raw events", systemImage: "doc.plaintext")
+                .font(.headline)
             Spacer()
+            Toggle(isOn: $enabled) {
+                Text(enabled ? "On" : "Off")
+                    .font(.caption.weight(.medium))
+            }
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .help("Subscribe to LogBus and tail every event into the table below.")
+        }
+    }
+
+    private var offByDefaultCallout: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Raw events are off by default.", systemImage: "info.circle")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Text("Most diagnostic answers are in the Activity tab — moments at human cadence with the same source data, coalesced. Use Raw for engineer-level inspection: motor commands, llm chunks, daemon heartbeats, sidecar logs.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.regularMaterial,
+                    in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    // MARK: - Controls
+
+    private var controlsRow: some View {
+        HStack(spacing: 6) {
             Button {
                 paused.toggle()
             } label: {
-                Label(paused ? "Resume" : "Pause",
-                      systemImage: paused ? "play.fill" : "pause.fill")
+                Image(systemName: paused ? "play.fill" : "pause.fill")
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(.borderless)
             .controlSize(.small)
+            .help(paused ? "Resume the stream" : "Pause the stream")
+
             Button {
                 rows.removeAll()
             } label: {
-                Label("Clear", systemImage: "trash")
+                Image(systemName: "trash")
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(.borderless)
             .controlSize(.small)
+            .help("Clear the buffer")
+
+            categoryMenu
+
+            Spacer()
+
+            Text("\(filteredRows.count) of \(rows.count)")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
         }
     }
 
-    private var filtersBar: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            FlowHStack(spacing: 8) {
-                ForEach(Category.allCases) { cat in
-                    let on = showCategories.contains(cat)
-                    Button {
-                        if on { showCategories.remove(cat) }
-                        else  { showCategories.insert(cat) }
-                    } label: {
-                        StatusPill(
-                            text: cat.label,
-                            tint: on ? cat.color : .secondary,
-                            systemImage: on ? "checkmark" : "circle"
-                        )
+    private var categoryMenu: some View {
+        Menu {
+            ForEach(Category.allCases) { cat in
+                Toggle(cat.label, isOn: Binding(
+                    get: { showCategories.contains(cat) },
+                    set: { on in
+                        if on { showCategories.insert(cat) }
+                        else  { showCategories.remove(cat) }
                     }
-                    .buttonStyle(.plain)
-                }
+                ))
             }
-
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundStyle(.secondary)
-                TextField("filter", text: $filter)
-                    .textFieldStyle(.plain)
-                if !filter.isEmpty {
-                    Button { filter = "" } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(.horizontal, 12).padding(.vertical, 8)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(.gray.opacity(0.08))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .strokeBorder(.gray.opacity(0.20), lineWidth: 1)
-            )
+            Divider()
+            Button("All on") { showCategories = Set(Category.allCases) }
+            Button("All off") { showCategories = [] }
+        } label: {
+            Label("Filter", systemImage: "line.3.horizontal.decrease")
         }
+        .menuStyle(.borderlessButton)
+        .controlSize(.small)
+        .fixedSize()
+    }
+
+    private var searchField: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            TextField("Search events", text: $filter)
+                .textFieldStyle(.plain)
+                .font(.callout)
+            if !filter.isEmpty {
+                Button {
+                    filter = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(.regularMaterial,
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     private var streamView: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 1) {
+                LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(filteredRows) { row in
                         RowView(row: row).id(row.id)
+                        if row.id != filteredRows.last?.id {
+                            Divider().padding(.leading, 16)
+                        }
                     }
                 }
                 .padding(.vertical, 4)
             }
-            .frame(maxHeight: 480)
+            .frame(maxHeight: .infinity)
             .onChange(of: filteredRows.last?.id) { _, newId in
                 guard !paused, let id = newId else { return }
                 proxy.scrollTo(id, anchor: .bottom)
@@ -150,18 +216,45 @@ struct LogsView: View {
         }
     }
 
+    // MARK: - Stream lifecycle
+
+    private func startStreaming() {
+        streamTask?.cancel()
+        let bus = services.logBus
+        streamTask = Task {
+            for await event in await bus.subscribe() {
+                if Task.isCancelled { return }
+                if paused { continue }
+                let row = Row.from(event)
+                await MainActor.run {
+                    rows.append(row)
+                    if rows.count > capacity {
+                        rows.removeFirst(rows.count - capacity)
+                    }
+                }
+            }
+        }
+    }
+
+    private func stopStreaming() {
+        streamTask?.cancel()
+        streamTask = nil
+    }
+
+    // MARK: - Categories
+
     enum Category: Sendable, Hashable, Identifiable, CaseIterable {
         case motor, vision, voice, brain, sidecar, link, error
         var id: Self { self }
         var label: String {
             switch self {
-            case .motor:   "motor"
-            case .vision:  "vision"
-            case .voice:   "voice"
-            case .brain:   "brain"
-            case .sidecar: "sidecar"
-            case .link:    "link"
-            case .error:   "error"
+            case .motor:   "Motor"
+            case .vision:  "Vision"
+            case .voice:   "Voice"
+            case .brain:   "Brain"
+            case .sidecar: "Sidecar"
+            case .link:    "Link"
+            case .error:   "Error"
             }
         }
         var color: Color {
@@ -176,6 +269,8 @@ struct LogsView: View {
             }
         }
     }
+
+    // MARK: - Row
 
     struct Row: Identifiable, Sendable {
         let id = UUID()
@@ -268,20 +363,74 @@ struct LogsView: View {
         }
     }
 
+    // MARK: - Second-bucket model + bar
+
+    private struct SecondBucket: Identifiable {
+        let id: Int
+        let count: Int
+
+        static func compute(from rows: [Row]) -> (bins: [SecondBucket], peak: Int, totalCount: Int) {
+            let now = Date()
+            var counts = [Int: Int](minimumCapacity: 30)
+            for r in rows {
+                let dt = now.timeIntervalSince(r.timestamp)
+                let secAgo = Int(dt)
+                guard secAgo >= 0 && secAgo < 30 else { continue }
+                counts[secAgo, default: 0] += 1
+            }
+            let peak = counts.values.max() ?? 0
+            // Oldest left, newest right.
+            let bins = (0..<30).reversed().map { idx in
+                SecondBucket(id: idx, count: counts[idx] ?? 0)
+            }
+            let total = counts.values.reduce(0, +)
+            return (bins, peak, total)
+        }
+    }
+
+    private struct SecondBar: View {
+        let bin: SecondBucket
+        let peak: Int
+
+        var body: some View {
+            GeometryReader { geo in
+                let h = geo.size.height
+                let normalized: CGFloat = peak > 0
+                    ? CGFloat(bin.count) / CGFloat(peak)
+                    : 0
+                let height = max(2, h * normalized)
+                VStack(spacing: 0) {
+                    Spacer(minLength: 0)
+                    RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                        .fill(bin.count > 0
+                              ? AnyShapeStyle(.tint)
+                              : AnyShapeStyle(.tertiary))
+                        .frame(height: height)
+                }
+            }
+            .help("\(bin.id)s ago — \(bin.count) event\(bin.count == 1 ? "" : "s")")
+        }
+    }
+
     private struct RowView: View {
         let row: Row
 
         var body: some View {
-            HStack(alignment: .top, spacing: 10) {
-                Text(timeString)
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.secondary)
-                    .frame(width: 70, alignment: .leading)
+            HStack(alignment: .top, spacing: 8) {
                 Rectangle()
                     .fill(row.category.color)
-                    .frame(width: 3)
+                    .frame(width: 2)
+                    .frame(maxHeight: .infinity)
                     .clipShape(Capsule())
                 VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(timeString)
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.tertiary)
+                        Text(row.category.label.lowercased())
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(row.category.color)
+                    }
                     Text(row.summary).font(.caption.monospaced())
                     if !row.detail.isEmpty {
                         Text(row.detail)
@@ -292,59 +441,34 @@ struct LogsView: View {
                 }
                 Spacer(minLength: 0)
             }
-            .padding(.horizontal, 6).padding(.vertical, 3)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .contextMenu {
+                Button("Copy summary") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(row.summary, forType: .string)
+                }
+                if !row.detail.isEmpty {
+                    Button("Copy detail") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(row.detail, forType: .string)
+                    }
+                }
+                Button("Copy as line") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(
+                        "\(timeString) [\(row.category.label.lowercased())] " +
+                            row.summary +
+                            (row.detail.isEmpty ? "" : "\n  \(row.detail)"),
+                        forType: .string)
+                }
+            }
         }
 
         private var timeString: String {
             let f = DateFormatter()
             f.dateFormat = "HH:mm:ss.SSS"
             return f.string(from: row.timestamp)
-        }
-    }
-}
-
-/// Tiny flow-layout helper: lays out children left-to-right and wraps when
-/// the row exceeds the available width.
-private struct FlowHStack: Layout {
-    var spacing: CGFloat = 8
-
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let maxWidth = proposal.width ?? .infinity
-        var rowWidth: CGFloat = 0
-        var rowHeight: CGFloat = 0
-        var totalHeight: CGFloat = 0
-        var totalWidth: CGFloat = 0
-        for v in subviews {
-            let s = v.sizeThatFits(.unspecified)
-            if rowWidth + s.width > maxWidth {
-                totalHeight += rowHeight + spacing
-                totalWidth = max(totalWidth, rowWidth)
-                rowWidth = 0
-                rowHeight = 0
-            }
-            rowWidth += s.width + spacing
-            rowHeight = max(rowHeight, s.height)
-        }
-        totalHeight += rowHeight
-        totalWidth = max(totalWidth, rowWidth)
-        return CGSize(width: totalWidth, height: totalHeight)
-    }
-
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize,
-                       subviews: Subviews, cache: inout ()) {
-        var x: CGFloat = bounds.minX
-        var y: CGFloat = bounds.minY
-        var rowHeight: CGFloat = 0
-        for v in subviews {
-            let s = v.sizeThatFits(.unspecified)
-            if x + s.width > bounds.maxX {
-                y += rowHeight + spacing
-                x = bounds.minX
-                rowHeight = 0
-            }
-            v.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(s))
-            x += s.width + spacing
-            rowHeight = max(rowHeight, s.height)
         }
     }
 }

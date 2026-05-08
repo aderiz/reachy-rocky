@@ -2,99 +2,154 @@ import SwiftUI
 import AppKit
 import RockyVision
 
-/// VisionCard — what Rocky sees through the actual robot camera. Live JPEG
-/// frames stream in from the `robot-camera` sidecar; the face-tracker
-/// sidecar's bbox + commanded gaze direction are overlaid on top.
+/// Inspector → Vision. Live JPEG from the robot camera + bbox overlay
+/// + world-target arrow + counters and identity readout.
+///
+/// Reflowed for the inspector column (320–520pt wide). Per
+/// `docs/concepts/cockpit-design.md` §3.4 and the Inspector tab
+/// principles:
+///   - the JPEG frame uses `.aspectRatio(16/9, contentMode: .fit)` so
+///     it grows with the column instead of overflowing at 320pt;
+///   - the world target is two `LabeledContent` rows (Motion already
+///     owns the dial style; redundant inline dials here are noise);
+///   - counters become a single line of `.caption.monospacedDigit()`
+///     text instead of three separate StatusPill rows;
+///   - the identity label hangs under the camera frame so it reads
+///     as "what Rocky sees" rather than as part of the metadata.
 struct VisionCard: View {
     @Environment(AppServices.self) private var services
+    @State private var showOverlays: Bool = true
 
     var body: some View {
-        Card {
-            CardHeader("Vision", icon: "eye") {
-                if services.cameraFrameCount > 0 {
-                    StatusPill(
-                        text: "live · \(services.cameraFrameCount) frames",
-                        tint: .green,
-                        systemImage: "video.fill"
-                    )
+        VStack(alignment: .leading, spacing: 14) {
+            headerRow
+            preview
+            identityLine
+            section("World target") {
+                LabeledContent("Yaw") {
+                    Text(format(services.lastFaceTarget?.yawRad, degrees: true))
+                        .font(.body.monospacedDigit().weight(.semibold))
+                        .foregroundStyle(services.lastFaceTarget == nil
+                                          ? AnyShapeStyle(.tertiary)
+                                          : AnyShapeStyle(.primary))
                 }
-                StatusPill(
-                    text: trackingPillText,
-                    tint: services.lastFaceDetection != nil ? .green : .secondary,
-                    systemImage: services.lastFaceDetection != nil ? "viewfinder" : "circle"
-                )
-            }
-        } content: {
-            HStack(alignment: .top, spacing: 18) {
-                FacePreview(
-                    frame: services.lastCameraFrame,
-                    detection: services.lastFaceDetection,
-                    target: services.lastFaceTarget
-                )
-                .frame(width: 380, height: 214)
-
-                VStack(alignment: .leading, spacing: 14) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        SectionLabel(text: "World target")
-                        HStack(spacing: 14) {
-                            metric("yaw",
-                                   value: services.lastFaceTarget?.yawRad,
-                                   degrees: true)
-                            metric("pitch",
-                                   value: services.lastFaceTarget?.pitchRad,
-                                   degrees: true)
-                        }
-                    }
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        SectionLabel(text: "Counters")
-                        Text("\(services.faceTargetCount.formatted()) targets")
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                        Text("\(services.faceDetectionCount.formatted()) detections")
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                        Text("\(services.cameraFrameCount.formatted()) camera frames")
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-
-                    if services.lastFaceTarget?.decayActive == true {
-                        Label("Idle decay → home", systemImage: "house.circle")
-                            .font(.caption.weight(.medium))
-                            .foregroundStyle(.orange)
-                    }
-
-                    if services.lastCameraFrame == nil {
-                        Label("Waiting for camera…", systemImage: "video.slash")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    Spacer()
+                LabeledContent("Pitch") {
+                    Text(format(services.lastFaceTarget?.pitchRad, degrees: true))
+                        .font(.body.monospacedDigit().weight(.semibold))
+                        .foregroundStyle(services.lastFaceTarget == nil
+                                          ? AnyShapeStyle(.tertiary)
+                                          : AnyShapeStyle(.primary))
+                }
+                if services.lastFaceTarget?.decayActive == true {
+                    Label("Idle decay → home", systemImage: "house.circle")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.orange)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            section("Counters") {
+                Text(countersLine)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    // MARK: - Header
+
+    private var headerRow: some View {
+        HStack(alignment: .firstTextBaseline) {
+            Label("Vision", systemImage: "eye")
+                .font(.headline)
+            Spacer()
+            Toggle(isOn: $showOverlays) {
+                Text("Overlays")
+                    .font(.caption.weight(.medium))
+            }
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .help("Draw the face-detection bbox and target arrow on the camera frame.")
         }
     }
 
-    private var trackingPillText: String {
-        guard let det = services.lastFaceDetection else { return "idle" }
-        if let identity = det.identity { return "tracking · \(identity)" }
-        return "tracking"
+    // MARK: - Preview
+
+    private var preview: some View {
+        FacePreview(
+            frame: services.lastCameraFrame,
+            detection: showOverlays ? services.lastFaceDetection : nil,
+            target: showOverlays ? services.lastFaceTarget : nil
+        )
+        .aspectRatio(16.0/9.0, contentMode: .fit)
+        .frame(maxWidth: .infinity)
     }
+
+    private var identityLine: some View {
+        HStack(spacing: 8) {
+            Image(systemName: identityIcon)
+                .foregroundStyle(identityTint)
+                .frame(width: 16)
+            Text(identityText)
+                .font(.callout)
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var identityText: String {
+        guard let det = services.lastFaceDetection else {
+            return services.lastCameraFrame == nil
+                ? "Camera not connected."
+                : "No face in view."
+        }
+        if let id = det.identity, let d = det.identityDistance {
+            return String(format: "%@ · distance %.2f", id, d)
+        }
+        if let name = det.closestName, let d = det.closestDistance {
+            return String(format: "Closest match: %@ · %.2f (above threshold)", name, d)
+        }
+        return String(format: "Unknown face · confidence %.0f%%", det.confidence * 100)
+    }
+
+    private var identityIcon: String {
+        guard let det = services.lastFaceDetection else { return "video.slash" }
+        return det.identity != nil ? "person.fill.checkmark"
+                                    : "person.crop.circle.fill.badge.questionmark"
+    }
+
+    private var identityTint: Color {
+        guard let det = services.lastFaceDetection else { return .secondary }
+        return det.identity != nil ? .accentColor : .secondary
+    }
+
+    // MARK: - Sections
 
     @ViewBuilder
-    private func metric(_ label: String, value: Double?, degrees: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Text(label.uppercased())
-                .font(.caption2.weight(.medium))
-                .tracking(0.4)
+    private func section<Content: View>(
+        _ title: String,
+        @ViewBuilder _ content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title.uppercased())
+                .font(.caption2.weight(.semibold))
+                .tracking(0.6)
                 .foregroundStyle(.secondary)
-            Text(format(value, degrees: degrees))
-                .font(.body.monospacedDigit().weight(.medium))
+            content()
         }
     }
+
+    private var countersLine: String {
+        let frames = services.cameraFrameCount.formatted()
+        let detections = services.faceDetectionCount.formatted()
+        let targets = services.faceTargetCount.formatted()
+        return "\(frames) frames · \(detections) detections · \(targets) targets"
+    }
+
+    // MARK: - Helpers
 
     private func format(_ v: Double?, degrees: Bool) -> String {
         guard let v else { return "—" }
@@ -103,6 +158,12 @@ struct VisionCard: View {
     }
 }
 
+// MARK: - Face preview
+
+/// JPEG with bbox + target arrow overlays. Now responsive: the parent
+/// dictates size via aspect-ratio; we just fill it. Background uses a
+/// system material instead of a hand-rolled gradient so light/dark
+/// adapt automatically.
 private struct FacePreview: View {
     let frame: RobotCameraService.Frame?
     let detection: RockyVision.FaceTrackerService.Detection?
@@ -110,72 +171,56 @@ private struct FacePreview: View {
 
     var body: some View {
         ZStack {
-            // Live camera image as the background, or a dark gradient if
-            // no frame has arrived yet.
             if let frame, let nsImage = NSImage(data: frame.jpeg) {
                 Image(nsImage: nsImage)
                     .resizable()
                     .interpolation(.medium)
                     .aspectRatio(contentMode: .fill)
             } else {
-                LinearGradient(
-                    colors: [
-                        Color(red: 0.06, green: 0.07, blue: 0.10),
-                        Color(red: 0.10, green: 0.12, blue: 0.16),
-                    ],
-                    startPoint: .topLeading, endPoint: .bottomTrailing
-                )
+                Rectangle()
+                    .fill(.regularMaterial)
                 Image(systemName: "video.slash")
                     .font(.title)
-                    .foregroundStyle(.white.opacity(0.25))
+                    .foregroundStyle(.tertiary)
             }
-
-            // Detection bbox + target arrow on top of the image.
             Canvas { ctx, size in
-                    if let det = detection {
-                        let scaleX = size.width / CGFloat(det.frameWidth)
-                        let scaleY = size.height / CGFloat(det.frameHeight)
-                        let r = CGRect(
-                            x: det.bbox.origin.x * scaleX,
-                            y: det.bbox.origin.y * scaleY,
-                            width: det.bbox.width * scaleX,
-                            height: det.bbox.height * scaleY
-                        )
-                        let strokeColor: Color = det.identity != nil ? .accentColor : .green
-                        ctx.stroke(Path(roundedRect: r, cornerRadius: 8),
-                                   with: .color(strokeColor),
-                                   style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                        // Three label modes:
-                        //   identified → "Alice 0.34"
-                        //   in library but above threshold → "? Alice 0.92"
-                        //   no library match → "73%" confidence fallback
-                        let labelString: String
-                        if let identity = det.identity {
-                            if let d = det.identityDistance {
-                                labelString = String(format: "%@ %.2f", identity, d)
-                            } else {
-                                labelString = identity
-                            }
-                        } else if let name = det.closestName, let d = det.closestDistance {
-                            labelString = String(format: "? %@ %.2f", name, d)
+                if let det = detection {
+                    let scaleX = size.width / CGFloat(det.frameWidth)
+                    let scaleY = size.height / CGFloat(det.frameHeight)
+                    let r = CGRect(
+                        x: det.bbox.origin.x * scaleX,
+                        y: det.bbox.origin.y * scaleY,
+                        width: det.bbox.width * scaleX,
+                        height: det.bbox.height * scaleY
+                    )
+                    let strokeColor: Color = det.identity != nil ? .accentColor : .green
+                    ctx.stroke(Path(roundedRect: r, cornerRadius: 8),
+                               with: .color(strokeColor),
+                               style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                    let labelString: String
+                    if let identity = det.identity {
+                        if let d = det.identityDistance {
+                            labelString = String(format: "%@ %.2f", identity, d)
                         } else {
-                            labelString = String(format: "%.0f%%", det.confidence * 100)
+                            labelString = identity
                         }
-                        let label = Text(labelString)
-                            .font(.caption.monospacedDigit().bold())
-                            .foregroundColor(.white)
-                        ctx.draw(label,
-                                 at: CGPoint(x: r.minX + 6, y: r.minY + 10),
-                                 anchor: .leading)
+                    } else if let name = det.closestName, let d = det.closestDistance {
+                        labelString = String(format: "? %@ %.2f", name, d)
+                    } else {
+                        labelString = String(format: "%.0f%%", det.confidence * 100)
                     }
-
+                    let label = Text(labelString)
+                        .font(.caption.monospacedDigit().bold())
+                        .foregroundColor(.white)
+                    ctx.draw(label,
+                             at: CGPoint(x: r.minX + 6, y: r.minY + 10),
+                             anchor: .leading)
+                }
+                if let target {
                     let center = CGPoint(x: size.width / 2, y: size.height / 2)
-                    let yaw = target?.yawRad ?? 0
-                    let pitch = target?.pitchRad ?? 0
-                    let dx = -CGFloat(yaw) * size.width * 0.45
-                    let dy = CGFloat(pitch) * size.height * 0.45
+                    let dx = -CGFloat(target.yawRad) * size.width * 0.45
+                    let dy = CGFloat(target.pitchRad) * size.height * 0.45
                     let tip = CGPoint(x: center.x + dx, y: center.y + dy)
-
                     var arrow = Path()
                     arrow.move(to: center)
                     arrow.addLine(to: tip)
@@ -191,13 +236,13 @@ private struct FacePreview: View {
                                                width: 6, height: 6)),
                         with: .color(.white.opacity(0.8))
                     )
+                }
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(.white.opacity(0.08), lineWidth: 1)
+                .strokeBorder(.tertiary, lineWidth: 1)
         )
     }
 }

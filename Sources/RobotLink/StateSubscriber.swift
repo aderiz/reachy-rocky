@@ -51,7 +51,12 @@ public actor StateSubscriber {
     }
 
     private func pumpLoop() async {
-        let url = endpoint.wsURL("/api/state/ws/full")
+        // Same `with_*=true` flags as the REST `fullState()` so the
+        // streamed `RobotState` includes head_joints, body_yaw,
+        // antennas_position and passive_joints.
+        let url = endpoint.wsURL(
+            "/api/state/ws/full?\(RobotLinkClient.fullStateQuery)"
+        )
         var attempt = 0
         while !Task.isCancelled {
             status = attempt == 0 ? .connecting : .reconnecting(reason: "retry \(attempt)")

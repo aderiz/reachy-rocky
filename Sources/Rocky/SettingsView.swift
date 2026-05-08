@@ -5,353 +5,443 @@ import ImageIO
 import CoreGraphics
 import Perception
 
+/// Macroscopic shell for the macOS Settings scene. Per
+/// `docs/concepts/cockpit-design.md` §7, settings live in a separate
+/// window with six tabs (Robot, Brain, Voice, Memory, Faces, Persona).
+/// Apply-on-commit per field where safe; the robot endpoint is the
+/// sole exception (relaunch-required, so it stages with a dedicated
+/// Apply button).
+///
+/// Each tab body uses `Form` for native macOS spacing and label
+/// alignment. The tabs all share the surrounding `TabView`'s padding
+/// and the same minimum width so switching tabs doesn't reflow the
+/// window.
 struct SettingsView: View {
     @Environment(AppServices.self) private var services
 
+    var body: some View {
+        TabView {
+            RobotSettingsTab()
+                .tabItem { Label("Robot", systemImage: "antenna.radiowaves.left.and.right") }
+            BrainSettingsTab()
+                .tabItem { Label("Brain", systemImage: "brain") }
+            VoiceSettingsTab()
+                .tabItem { Label("Voice", systemImage: "speaker.wave.2") }
+            MemorySettingsTab()
+                .tabItem { Label("Memory", systemImage: "tray.full") }
+            FacesSettingsTab()
+                .tabItem { Label("Faces", systemImage: "person.crop.rectangle.stack") }
+            PersonaSettingsTab()
+                .tabItem { Label("Persona", systemImage: "text.quote") }
+        }
+        .padding(20)
+        .frame(minWidth: 580, minHeight: 460)
+    }
+}
+
+// MARK: - Robot tab
+
+/// Robot endpoint. Host + port require a relaunch (URLSession sockets
+/// + sidecars hold the original endpoint), so we keep a draft + Apply
+/// here. The tab also surfaces the daemon status with a probe-now
+/// button so the user can verify connectivity without leaving the
+/// window.
+private struct RobotSettingsTab: View {
+    @Environment(AppServices.self) private var services
     @State private var hostDraft: String = ""
     @State private var portDraft: String = ""
-    @State private var lmURLDraft: String = ""
-    @State private var lmModelDraft: String = ""
-    @State private var lmApiKeyDraft: String = ""
-    @State private var personaDraft: String = ""
-    @State private var ttsBackendDraft: String = "say"
-    @State private var micSourceDraft: String = "mac"
-    @State private var savedAt: Date?
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                header
-                robotCard
-                brainCard
-                micCard
-                ttsCard
-                facesCard
-                memoryCard
-                personaCard
-                applyBar
+        Form {
+            Section {
+                TextField("Host", text: $hostDraft, prompt: Text("reachy-mini.local"))
+                TextField("Port", text: $portDraft, prompt: Text("8000"))
+                    .frame(maxWidth: 120)
+            } header: {
+                Text("Robot endpoint")
+            } footer: {
+                Text("Endpoint changes take effect at next launch.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
-            .padding(.horizontal, 24)
-            .padding(.vertical, 22)
-            .frame(maxWidth: 980, alignment: .topLeading)
-            .frame(maxWidth: .infinity)
+
+            Section("Status") {
+                LabeledContent("Daemon") { reachabilityLabel }
+                LabeledContent("Probe") {
+                    Button {
+                        Task { await services.probeRobotPublic() }
+                    } label: {
+                        Label("Probe now", systemImage: "arrow.clockwise")
+                    }
+                }
+            }
+
+            Section("Storage") {
+                LabeledContent("Application support") {
+                    Text("~/Library/Application Support/Rocky/")
+                        .font(.callout.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                }
+            }
+
+            applyRow
         }
-        .onAppear { syncFromStore() }
+        .formStyle(.grouped)
+        .onAppear {
+            hostDraft = services.settings.robotHost
+            portDraft = String(services.settings.robotPort)
+        }
     }
 
-    // MARK: - Header
-
-    private var header: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Settings")
-                .font(.system(size: 28, weight: .bold, design: .rounded))
-            Text("Tune Rocky's connections and personality.")
-                .font(.subheadline)
+    @ViewBuilder
+    private var reachabilityLabel: some View {
+        switch services.daemonReachability {
+        case .online:
+            Label("Online", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+        case .offline(let reason):
+            Label(reason, systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .lineLimit(1)
+        case .unknown:
+            Label("Checking…", systemImage: "hourglass")
                 .foregroundStyle(.secondary)
         }
     }
 
-    // MARK: - Cards
-
-    private var robotCard: some View {
-        Card {
-            CardHeader("Robot", icon: "antenna.radiowaves.left.and.right")
-        } content: {
-            VStack(alignment: .leading, spacing: 10) {
-                field(label: "Host", placeholder: "reachy-mini.local", text: $hostDraft)
-                field(label: "Port", placeholder: "8000", text: $portDraft, width: 96)
-                Text("Endpoint changes take effect on relaunch.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
+    private var dirty: Bool {
+        hostDraft.trimmingCharacters(in: .whitespaces) != services.settings.robotHost
+            || portDraft != String(services.settings.robotPort)
     }
 
-    private var brainCard: some View {
-        Card {
-            CardHeader("Brain (LM Studio)", icon: "brain") {
-                Button {
-                    Task { await services.probeLMStudioPublic() }
-                } label: {
-                    Label("Re-probe", systemImage: "arrow.clockwise")
+    @ViewBuilder
+    private var applyRow: some View {
+        if dirty {
+            HStack {
+                Spacer()
+                Text("Will apply at next launch.")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+                Button("Apply") {
+                    services.settings.robotHost =
+                        hostDraft.trimmingCharacters(in: .whitespaces)
+                    if let p = Int(portDraft.trimmingCharacters(in: .whitespaces)) {
+                        services.settings.robotPort = p
+                    }
                 }
-                .buttonStyle(.borderless)
-                .controlSize(.small)
-            }
-        } content: {
-            VStack(alignment: .leading, spacing: 10) {
-                field(label: "Base URL",
-                      placeholder: "http://localhost:1234/v1",
-                      text: $lmURLDraft, width: 360)
-                modelRow
-                field(label: "API key", placeholder: "(blank for none)",
-                      text: $lmApiKeyDraft, isSecure: true, width: 280)
-                Text("Apply hot-reloads the client and refreshes the model list. No relaunch needed.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                .buttonStyle(.borderedProminent)
             }
         }
     }
+}
 
-    private var modelRow: some View {
+// MARK: - Brain tab
+
+/// LLM endpoint. Hot-reloads on edit via `applySettings()` — no Apply
+/// button, no relaunch. The model picker is sourced live from LM
+/// Studio's `/v1/models` so changing models is one click.
+private struct BrainSettingsTab: View {
+    @Environment(AppServices.self) private var services
+    @State private var lmURLDraft: String = ""
+    @State private var lmApiKeyDraft: String = ""
+
+    var body: some View {
+        Form {
+            Section {
+                TextField("Base URL", text: $lmURLDraft,
+                          prompt: Text("http://localhost:1234/v1"))
+                    .onSubmit { commitURL() }
+                modelPicker
+                SecureField("API key", text: $lmApiKeyDraft,
+                            prompt: Text("(blank for none)"))
+                    .onSubmit { commitAPIKey() }
+            } header: {
+                Text("LM Studio")
+            } footer: {
+                Text("Submitted fields hot-reload the cognition engine. No relaunch needed.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Status") {
+                LabeledContent("Brain") { llmLabel }
+                LabeledContent("Re-probe") {
+                    Button {
+                        Task { await services.probeLMStudioPublic() }
+                    } label: {
+                        Label("Probe", systemImage: "arrow.clockwise")
+                    }
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .onAppear {
+            lmURLDraft = services.settings.lmStudioURL
+            lmApiKeyDraft = services.settings.lmStudioApiKey
+        }
+    }
+
+    private var modelPicker: some View {
         let models = services.availableLLMModels
-        return HStack(alignment: .firstTextBaseline) {
-            Text("Model")
-                .font(.callout.weight(.medium))
-                .frame(width: 80, alignment: .leading)
-                .foregroundStyle(.secondary)
-            if models.isEmpty {
-                TextField("(LM Studio offline)", text: $lmModelDraft)
-                    .textFieldStyle(.plain)
-                    .padding(.horizontal, 12).padding(.vertical, 8)
-                    .frame(width: 280)
-                    .background(textFieldBackground)
-            } else {
-                Picker("", selection: $lmModelDraft) {
-                    // Always include a tag matching the current draft so
-                    // `selection` is never "" / unmatched (which makes
-                    // SwiftUI log "selection is invalid…"). Covers two
-                    // cases: the draft is briefly empty before
-                    // `syncFromStore` runs, and the saved model isn't
-                    // currently loaded in LM Studio.
-                    if !models.contains(lmModelDraft) {
-                        Text(lmModelDraft.isEmpty
-                             ? "—"
-                             : "\(lmModelDraft) (not loaded)")
-                            .tag(lmModelDraft)
-                    }
-                    ForEach(models, id: \.self) { m in
-                        Text(m).tag(m)
-                    }
-                }
-                .labelsHidden()
-                .frame(maxWidth: 360)
+        let store = services.settings
+        return Picker("Model", selection: Binding(
+            get: { store.lmStudioModel },
+            set: { newValue in
+                store.lmStudioModel = newValue
+                Task { await services.applySettings() }
+            }
+        )) {
+            // Stable tag for the current value even when not in the list
+            // — prevents "selection invalid" warnings when LM Studio is
+            // offline or the model isn't loaded.
+            if !models.contains(store.lmStudioModel) {
+                Text(store.lmStudioModel.isEmpty
+                     ? "—"
+                     : "\(store.lmStudioModel) (not loaded)")
+                    .tag(store.lmStudioModel)
+            }
+            ForEach(models, id: \.self) { m in
+                Text(m).tag(m)
             }
         }
     }
 
-    private var micCard: some View {
-        Card {
-            CardHeader("Microphone", icon: "mic")
-        } content: {
-            VStack(alignment: .leading, spacing: 10) {
-                Picker("Source", selection: $micSourceDraft) {
+    @ViewBuilder
+    private var llmLabel: some View {
+        switch services.llmStatus {
+        case .online(let model):
+            Label(model, systemImage: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+                .lineLimit(1)
+        case .offline(let reason):
+            Label(reason, systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .lineLimit(1)
+        case .unknown:
+            Label("Checking…", systemImage: "hourglass")
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func commitURL() {
+        let trimmed = lmURLDraft.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty,
+              trimmed != services.settings.lmStudioURL else { return }
+        services.settings.lmStudioURL = trimmed
+        Task { await services.applySettings() }
+    }
+
+    private func commitAPIKey() {
+        guard lmApiKeyDraft != services.settings.lmStudioApiKey else { return }
+        services.settings.lmStudioApiKey = lmApiKeyDraft
+        Task { await services.applySettings() }
+    }
+}
+
+// MARK: - Voice tab
+
+/// Microphone source + TTS engine + speaker volume. Source / engine
+/// changes are saved instantly but only take effect on the next listen
+/// toggle / next launch (the underlying sidecars hold the original
+/// configuration); the volume slider applies live via PCM scaling
+/// during synthesis.
+private struct VoiceSettingsTab: View {
+    @Environment(AppServices.self) private var services
+
+    var body: some View {
+        Form {
+            Section {
+                Picker("Source", selection: micSourceBinding) {
                     Text("Robot mic (Reachy 4-mic array)").tag("robot")
-                    Text("Mac mic (built-in / system default)").tag("mac")
+                    Text("Mac mic (built-in / system)").tag("mac")
                 }
-                .pickerStyle(.radioGroup)
-                Text("Robot mic uses Reachy's 4-mic ReSpeaker array via WebRTC. Run \u{201C}./Sidecars/robot-mic/setup.sh\u{201D} once. Source change takes effect on the next Listen toggle.")
-                    .font(.caption)
+            } header: {
+                Text("Microphone")
+            } footer: {
+                Text("Robot mic uses Reachy's 4-mic ReSpeaker array via WebRTC. " +
+                     "Run ./Sidecars/robot-mic/setup.sh once. Source change " +
+                     "applies on the next Listen toggle.")
+                    .font(.footnote)
                     .foregroundStyle(.secondary)
             }
-        }
-    }
 
-    private var ttsCard: some View {
-        Card {
-            CardHeader("Voice (TTS)", icon: "speaker.wave.2")
-        } content: {
-            VStack(alignment: .leading, spacing: 14) {
-                Picker("Engine", selection: $ttsBackendDraft) {
+            Section {
+                Picker("Engine", selection: ttsBackendBinding) {
                     Text("System voice (say)").tag("say")
                     Text("Chatterbox FP16 (cloned)").tag("chatterbox")
                 }
-                .pickerStyle(.radioGroup)
-                Text("Chatterbox uses your cloned voice from ~/Library/Application Support/Rocky/voice/. Engine change takes effect on next launch.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
                 BotVolumeSlider()
+            } header: {
+                Text("Voice (TTS)")
+            } footer: {
+                Text("Chatterbox uses your cloned voice from " +
+                     "~/Library/Application Support/Rocky/voice/. " +
+                     "Engine change applies on next launch.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
         }
+        .formStyle(.grouped)
     }
 
-    private var facesCard: some View {
-        // Snapshot is read once per body eval. Down-stream EnrolledFacesList
-        // doesn't read services at all, so its identity (and the form's)
-        // stays stable across services-driven re-renders.
-        let people = services.enrolledPeople
-        return Card {
-            CardHeader("Known Faces", icon: "person.crop.rectangle.stack") {
-                if !people.isEmpty {
-                    Text("\(people.count) enrolled")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-            }
-        } content: {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Rocky says \u{201C}hey\u{201D} when he recognises someone. Add a name, an optional phonetic spelling for TTS, and one or more photos (or grab the current camera frame).")
-                    .font(.caption)
+    private var micSourceBinding: Binding<String> {
+        let store = services.settings
+        return Binding(get: { store.micSource },
+                       set: { store.micSource = $0 })
+    }
+
+    private var ttsBackendBinding: Binding<String> {
+        let store = services.settings
+        return Binding(get: { store.ttsBackend },
+                       set: { store.ttsBackend = $0 })
+    }
+}
+
+// MARK: - Memory tab
+
+/// Memory recall toggle + top-K slider + drawer count + forget. All
+/// existing controls re-homed from the old long-scroll into a focused
+/// tab. Each control already commits-on-change.
+private struct MemorySettingsTab: View {
+    @Environment(AppServices.self) private var services
+
+    var body: some View {
+        Form {
+            Section {
+                MemoryStatusLine()
+                MemoryRecallToggle()
+                MemoryTopKSlider()
+            } header: {
+                Text("Recall")
+            } footer: {
+                Text("Rocky stores every user and assistant utterance verbatim, " +
+                     "then pulls the most relevant snippets into the next reply. " +
+                     "Storage is local — see ~/Library/Application Support/Rocky/Memory.")
+                    .font(.footnote)
                     .foregroundStyle(.secondary)
+            }
 
+            Section("Manage") {
+                MemoryForgetButton()
+            }
+        }
+        .formStyle(.grouped)
+    }
+}
+
+// MARK: - Faces tab
+
+/// Enrolment + threshold + the list of known people.
+private struct FacesSettingsTab: View {
+    @Environment(AppServices.self) private var services
+
+    var body: some View {
+        // Snapshot once per body eval — EnrolledFacesList doesn't read
+        // services, so its identity stays stable across services-driven
+        // re-renders.
+        let people = services.enrolledPeople
+        return Form {
+            Section {
                 EnrollFaceForm()
+            } header: {
+                Text("Add a face")
+            } footer: {
+                Text("Rocky says \u{201C}hey\u{201D} when he recognises someone. " +
+                     "Add a name, an optional phonetic spelling for TTS, and one " +
+                     "or more photos.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
 
+            Section("Match threshold") {
                 FaceMatchThresholdSlider()
+            }
 
-                if !people.isEmpty {
-                    Divider().padding(.vertical, 4)
+            if !people.isEmpty {
+                Section("Enrolled (\(people.count))") {
                     EnrolledFacesList(people: people)
                 }
             }
         }
+        .formStyle(.grouped)
     }
+}
 
-    private var memoryCard: some View {
-        Card {
-            CardHeader("Memory", icon: "brain") {
-                if services.memoryDrawerCount >= 0 {
-                    Text("\(services.memoryDrawerCount) drawer\(services.memoryDrawerCount == 1 ? "" : "s")")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-            }
-        } content: {
-            VStack(alignment: .leading, spacing: 14) {
-                Text("Rocky stores every user and assistant utterance verbatim, then pulls the most relevant snippets into the next reply. Storage is local — see ~/Library/Application Support/Rocky/Memory.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+// MARK: - Persona tab
 
-                MemoryStatusLine()
+/// Full-width, full-height TextEditor for Rocky's system prompt. Hot-
+/// reloads on edit (debounced — saves every time the user pauses for
+/// 1 s) so the next turn picks up the new persona without an Apply
+/// button.
+private struct PersonaSettingsTab: View {
+    @Environment(AppServices.self) private var services
+    @State private var draft: String = ""
+    @State private var savedAt: Date?
+    @State private var debounceTask: Task<Void, Never>?
 
-                MemoryRecallToggle()
-
-                MemoryTopKSlider()
-
-                MemoryForgetButton()
-            }
-        }
-    }
-
-    private var personaCard: some View {
-        Card {
-            CardHeader("Persona", icon: "text.quote") {
-                Button("Reset") {
-                    personaDraft = SettingsStore.defaultPersona
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Persona")
+                    .font(.title3.weight(.semibold))
+                Spacer()
+                Button("Reset to default") {
+                    draft = SettingsStore.defaultPersona
+                    commit()
                 }
                 .buttonStyle(.borderless)
                 .controlSize(.small)
             }
-        } content: {
-            VStack(alignment: .leading, spacing: 8) {
-                TextEditor(text: $personaDraft)
-                    .font(.body.monospaced())
-                    .scrollContentBackground(.hidden)
-                    .padding(10)
-                    .frame(minHeight: 200)
-                    .background(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .fill(.gray.opacity(0.06))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .strokeBorder(.gray.opacity(0.18), lineWidth: 1)
-                    )
-                Text("System prompt. Edit to change Rocky's voice and rules.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    private var applyBar: some View {
-        HStack {
-            if let savedAt {
-                Label("Saved \(savedAt.formatted(.dateTime.hour().minute().second()))",
-                      systemImage: "checkmark.circle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.green)
-            }
-            Spacer()
-            Button("Apply") {
-                Task { await apply() }
-            }
-            .keyboardShortcut("s", modifiers: .command)
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
-            .disabled(!isDirty)
-        }
-        .padding(.top, 6)
-    }
-
-    // MARK: - Field helper
-
-    @ViewBuilder
-    private func field(
-        label: String,
-        placeholder: String,
-        text: Binding<String>,
-        isSecure: Bool = false,
-        width: CGFloat = 280
-    ) -> some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text(label)
-                .font(.callout.weight(.medium))
-                .frame(width: 80, alignment: .leading)
+            Text("System prompt the LLM sees on every turn. Edits hot-reload — " +
+                 "the next turn uses the new persona. Auto-saves on pause.")
+                .font(.caption)
                 .foregroundStyle(.secondary)
-            Group {
-                if isSecure {
-                    SecureField(placeholder, text: text)
-                } else {
-                    TextField(placeholder, text: text)
+
+            TextEditor(text: $draft)
+                .font(.body.monospaced())
+                .scrollContentBackground(.hidden)
+                .padding(10)
+                .background(.regularMaterial,
+                            in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .onChange(of: draft) { _, _ in scheduleCommit() }
+
+            HStack {
+                Text("\(draft.count) characters")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if let savedAt {
+                    Label("Saved \(savedAt.formatted(.dateTime.hour().minute().second()))",
+                          systemImage: "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.green)
                 }
             }
-            .textFieldStyle(.plain)
-            .padding(.horizontal, 12).padding(.vertical, 8)
-            .frame(width: width)
-            .background(textFieldBackground)
+        }
+        .padding(.horizontal, 4)
+        .onAppear { draft = services.settings.persona }
+    }
+
+    private func scheduleCommit() {
+        debounceTask?.cancel()
+        debounceTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            if Task.isCancelled { return }
+            commit()
         }
     }
 
-    private var textFieldBackground: some View {
-        RoundedRectangle(cornerRadius: 10, style: .continuous)
-            .fill(.gray.opacity(0.08))
-            .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .strokeBorder(.gray.opacity(0.20), lineWidth: 1)
-            )
-    }
-
-    // MARK: - Apply / sync
-
-    private var isDirty: Bool {
-        hostDraft != services.settings.robotHost
-            || portDraft != String(services.settings.robotPort)
-            || lmURLDraft != services.settings.lmStudioURL
-            || lmModelDraft != services.settings.lmStudioModel
-            || lmApiKeyDraft != services.settings.lmStudioApiKey
-            || personaDraft != services.settings.persona
-            || ttsBackendDraft != services.settings.ttsBackend
-            || micSourceDraft != services.settings.micSource
-    }
-
-    private func syncFromStore() {
-        hostDraft = services.settings.robotHost
-        portDraft = String(services.settings.robotPort)
-        lmURLDraft = services.settings.lmStudioURL
-        lmModelDraft = services.settings.lmStudioModel
-        lmApiKeyDraft = services.settings.lmStudioApiKey
-        personaDraft = services.settings.persona
-        ttsBackendDraft = services.settings.ttsBackend
-        micSourceDraft = services.settings.micSource
-    }
-
-    private func apply() async {
-        let store = services.settings
-        store.robotHost = hostDraft.trimmingCharacters(in: .whitespaces)
-        if let p = Int(portDraft.trimmingCharacters(in: .whitespaces)) {
-            store.robotPort = p
+    private func commit() {
+        guard draft != services.settings.persona else { return }
+        services.settings.persona = draft
+        Task {
+            await services.applySettings()
+            await MainActor.run { savedAt = Date() }
         }
-        store.lmStudioURL = lmURLDraft.trimmingCharacters(in: .whitespaces)
-        store.lmStudioModel = lmModelDraft.trimmingCharacters(in: .whitespaces)
-        store.lmStudioApiKey = lmApiKeyDraft
-        store.persona = personaDraft
-        store.ttsBackend = ttsBackendDraft
-        store.micSource = micSourceDraft
-        await services.applySettings()
-        savedAt = Date()
     }
-
 }
 
 /// Self-contained enrollment form. Owns its own `@State` for the form
