@@ -328,9 +328,16 @@ public actor CognitionEngine {
 
     // MARK: - Markdown tool-call recovery
 
-    /// Detects `{"tool": "name", "args": {...}}` (or `{"name": "...", "arguments": {...}}`)
-    /// inside fenced code blocks. Used when an LLM that doesn't natively emit
-    /// `tool_calls` falls back to JSON-in-markdown.
+    /// Detects tool invocations inside fenced code blocks. Used when an LLM
+    /// that doesn't natively emit `tool_calls` falls back to JSON-in-markdown.
+    /// Accepts every shape we've seen Gemma / Qwen / Llama produce:
+    ///
+    ///   {"tool": "name", "args": {...}}                          — Rocky persona format
+    ///   {"name": "name", "arguments": {...}}                     — OpenAI function format
+    ///   {"name": "name", "arguments": "{...}"}                   — string-encoded args
+    ///   {"function": "name", "args": {...}}                      — Gemma improv
+    ///   {"function": {"name": "name", "arguments": "{...}"}}     — OpenAI nested
+    ///   {"tool_calls": [<any of the above>...]}                  — array wrapper
     public static func extractFencedToolCalls(
         in text: String,
         knownTools: [String]
@@ -341,28 +348,61 @@ public actor CognitionEngine {
             guard let data = body.data(using: .utf8),
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             else { continue }
-            // Accept both shapes:
-            //   {"tool": "name", "args": {...}}
-            //   {"name": "name", "arguments": {...}}  (OpenAI native)
-            //   {"name": "name", "arguments": "{...}"} (string-encoded args)
-            let name = (json["tool"] as? String) ?? (json["name"] as? String)
-            guard let name, allowed.contains(name) else { continue }
 
-            let argsJSON: String
-            if let argsStr = json["arguments"] as? String {
-                argsJSON = argsStr
-            } else {
-                let argsObj = json["args"] ?? json["arguments"] ?? [String: Any]()
-                if let data = try? JSONSerialization.data(withJSONObject: argsObj),
-                   let s = String(data: data, encoding: .utf8) {
-                    argsJSON = s
-                } else {
-                    argsJSON = "{}"
+            // Top-level may be a `tool_calls` array OR a single call.
+            if let calls = json["tool_calls"] as? [[String: Any]] {
+                for call in calls {
+                    if let entry = parseSingleCall(call), allowed.contains(entry.0) {
+                        found.append(entry)
+                    }
                 }
+            } else if let entry = parseSingleCall(json), allowed.contains(entry.0) {
+                found.append(entry)
             }
-            found.append((name, argsJSON))
         }
         return found
+    }
+
+    /// Parse a single tool-call object across the half-dozen shapes the
+    /// LLM might emit. Returns nil if no recognisable name/args pair.
+    private static func parseSingleCall(
+        _ dict: [String: Any]
+    ) -> (String, String)? {
+        // Name extraction. Order matters — `function` can be either a
+        // string (Gemma's shorthand) or a nested dict (OpenAI native).
+        var name: String?
+        var nestedFunction: [String: Any]?
+        if let s = dict["tool"] as? String { name = s }
+        else if let s = dict["name"] as? String { name = s }
+        else if let s = dict["function"] as? String { name = s }
+        else if let nested = dict["function"] as? [String: Any] {
+            nestedFunction = nested
+            name = nested["name"] as? String
+        }
+        guard let resolvedName = name else { return nil }
+
+        // Argument extraction. Look first inside `function` (OpenAI nested),
+        // then at top-level `arguments` / `args`. Both string-encoded and
+        // object forms are accepted.
+        if let nested = nestedFunction {
+            if let argStr = nested["arguments"] as? String {
+                return (resolvedName, argStr)
+            }
+            if let argObj = nested["arguments"],
+               let d = try? JSONSerialization.data(withJSONObject: argObj),
+               let s = String(data: d, encoding: .utf8) {
+                return (resolvedName, s)
+            }
+        }
+        if let argStr = dict["arguments"] as? String {
+            return (resolvedName, argStr)
+        }
+        let argsObj = dict["args"] ?? dict["arguments"] ?? [String: Any]()
+        if let d = try? JSONSerialization.data(withJSONObject: argsObj),
+           let s = String(data: d, encoding: .utf8) {
+            return (resolvedName, s)
+        }
+        return (resolvedName, "{}")
     }
 
     /// Removes any fenced JSON block from the assistant text. We don't want
