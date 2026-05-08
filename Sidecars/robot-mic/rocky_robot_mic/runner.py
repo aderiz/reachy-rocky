@@ -41,12 +41,19 @@ def respond_error(req_id: str, code: int, message: str) -> None:
 
 
 class Runner:
-    # Audio loop stall detection. If `recording` is true but no frames
-    # have flowed for this long, exit the process so the SidecarHost
-    # supervisor restarts us with a fresh WebRTC connection. This is
-    # the difference between "mic is unreliable" (silent freezes) and
-    # "mic is offline for 7 seconds and then comes back".
-    STALL_TIMEOUT_S = 5.0
+    # Two-tier stall recovery, mirroring the camera sidecar:
+    #
+    # 1. After `STALL_REFRESH_S` of no frames, try a soft refresh:
+    #    `release_media + acquire_media`. Most WebRTC drops on the
+    #    bot side recover from this without a full process respawn.
+    # 2. After `STALL_FATAL_S` of no frames (regardless of refresh
+    #    attempts), exit the process so the SidecarHost supervisor
+    #    respawns us with a brand-new ReachyMini connection. The
+    #    cooldown between refreshes prevents hammering on a totally
+    #    broken connection.
+    STALL_REFRESH_S = 3.0
+    STALL_FATAL_S = 12.0
+    REFRESH_COOLDOWN_S = 6.0
 
     def __init__(self) -> None:
         self.host = os.environ.get("ROCKY_ROBOT_HOST", "reachy-mini.local")
@@ -151,25 +158,54 @@ class Runner:
             pass
         log("info", "recording stopped")
 
+    def _refresh_media(self) -> bool:
+        """Best-effort `release_media + acquire_media` on the bot.
+        Many WebRTC drops recover with a refresh and never need a
+        process restart. Returns True if reacquisition succeeded."""
+        try:
+            self.mini.release_media()
+            log("info", "media released for refresh")
+        except Exception as exc:  # noqa: BLE001
+            log("debug", "release_media skipped", error=str(exc))
+        time.sleep(0.3)
+        try:
+            self.mini.acquire_media()
+            log("info", "media reacquired")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log("warn", "acquire_media failed", error=str(exc))
+            return False
+
     def _stall_watchdog(self) -> None:
-        """Exit the process if `recording` is true but no audio frames
-        have arrived for `STALL_TIMEOUT_S`. Triggers when the bot's
-        media has been released externally, when WebRTC silently
-        drops, or when GStreamer's pipeline deadlocks. The
-        SidecarSupervisor on the Swift side will respawn us with a
-        fresh ReachyMini connection — much faster recovery than
-        waiting for someone to notice the mic is dead."""
+        """Two-tier stall recovery for the audio loop. Soft refresh
+        first (release+reacquire media) so transient WebRTC drops
+        don't require a process respawn. Hard exit only if the soft
+        refresh hasn't restored frames within `STALL_FATAL_S`."""
+        last_refresh = 0.0
         while not self.shutdown_flag.is_set():
             time.sleep(1.0)
             if not self.recording:
                 self.last_frame_ts = time.monotonic()
                 continue
-            stalled = time.monotonic() - self.last_frame_ts
-            if stalled > self.STALL_TIMEOUT_S:
-                log("error", "audio stalled, exiting for restart",
+            now = time.monotonic()
+            stalled = now - self.last_frame_ts
+
+            # Tier 1: soft media refresh, rate-limited so we don't
+            # hammer on a fully broken connection.
+            if (stalled > self.STALL_REFRESH_S
+                and now - last_refresh > self.REFRESH_COOLDOWN_S):
+                log("warn", "audio stalled, refreshing media",
                     stalled_s=f"{stalled:.1f}")
-                # Hard exit — the supervisor's restart_policy=on_failure
-                # will respawn us and audio resumes within ~1s.
+                self._refresh_media()
+                last_refresh = now
+                # Don't reset last_frame_ts — the next real frame
+                # resets it naturally and we want the fatal timer
+                # to keep counting from the original stall.
+
+            # Tier 2: fatal exit, supervisor respawns us.
+            if stalled > self.STALL_FATAL_S:
+                log("error", "audio dead, exiting for supervisor restart",
+                    stalled_s=f"{stalled:.1f}")
                 os._exit(1)
 
     # --- request dispatch ---
