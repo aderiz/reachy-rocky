@@ -1,5 +1,9 @@
 import SwiftUI
 import AppKit
+import AVFoundation
+import CoreLocation
+import EventKit
+import Speech
 import UniformTypeIdentifiers
 import ImageIO
 import CoreGraphics
@@ -33,6 +37,8 @@ struct SettingsView: View {
                 .tabItem { Label("Faces", systemImage: "person.crop.rectangle.stack") }
             PersonaSettingsTab()
                 .tabItem { Label("Persona", systemImage: "text.quote") }
+            PermissionsSettingsTab()
+                .tabItem { Label("Permissions", systemImage: "checkmark.shield") }
         }
         .padding(20)
         .frame(minWidth: 580, minHeight: 460)
@@ -1025,6 +1031,166 @@ private struct MemoryForgetButton: View {
             }
         } message: {
             Text("This deletes every stored drawer in Rocky's palace. He won't remember any prior conversations after this.")
+        }
+    }
+}
+
+// MARK: - Permissions tab
+
+/// Live view of the four TCC permissions Rocky uses, mirroring the
+/// first-run "Grant access" step. Useful when a permission gets
+/// revoked, when the user wants to re-prompt for one that was
+/// denied, or just to confirm what's been granted. Status refreshes
+/// on every render and on `NSApplication.didBecomeActive` (when the
+/// user comes back from System Settings).
+private struct PermissionsSettingsTab: View {
+    @Environment(AppServices.self) private var services
+    @State private var refreshTick = 0
+
+    var body: some View {
+        Form {
+            Section {
+                if services.settings.micSource != "robot" {
+                    permissionRow(
+                        icon: "mic.fill",
+                        title: "Microphone",
+                        rationale: "So Rocky can hear you say his name.",
+                        status: micStatus,
+                        anchor: "Privacy_Microphone",
+                        grant: { _ = await AVCaptureDevice.requestAccess(for: .audio) }
+                    )
+                }
+                permissionRow(
+                    icon: "waveform",
+                    title: "Speech recognition",
+                    rationale: "So your words become text Rocky can act on.",
+                    status: speechStatus,
+                    anchor: "Privacy_SpeechRecognition",
+                    grant: { _ = await services.appleSTT.requestAuthorization() }
+                )
+                permissionRow(
+                    icon: "calendar",
+                    title: "Calendar",
+                    rationale: "So Rocky can answer \"what's on tomorrow?\" without guessing.",
+                    status: calendarStatus,
+                    anchor: "Privacy_Calendars",
+                    grant: {
+                        let store = EKEventStore()
+                        _ = try? await store.requestFullAccessToEvents()
+                    }
+                )
+                permissionRow(
+                    icon: "location.fill",
+                    title: "Location",
+                    rationale: "So \"what's the weather?\" works without naming the city.",
+                    status: locationStatus,
+                    anchor: "Privacy_LocationServices",
+                    grant: { _ = await LocationProvider.shared.requestAuthorization() }
+                )
+            } header: {
+                Text("System permissions")
+            } footer: {
+                Text("macOS shows the prompt the first time Rocky needs each permission. After that, denied entries can only be re-enabled in System Settings.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .id(refreshTick)
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.didBecomeActiveNotification
+        )) { _ in
+            // Trigger a re-render so the row reads fresh TCC state
+            // when the user returns from System Settings.
+            refreshTick &+= 1
+        }
+    }
+
+    @ViewBuilder
+    private func permissionRow(
+        icon: String,
+        title: String,
+        rationale: String,
+        status: PermissionRowStatus,
+        anchor: String,
+        grant: @escaping @Sendable () async -> Void
+    ) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .font(.title3)
+                .foregroundStyle(.tint)
+                .frame(width: 24)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.callout.weight(.medium))
+                Text(rationale).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            switch status {
+            case .granted:
+                Label("Granted", systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                    .font(.caption.weight(.medium))
+            case .denied:
+                HStack(spacing: 6) {
+                    Label("Denied", systemImage: "xmark.circle.fill")
+                        .foregroundStyle(.orange)
+                        .font(.caption.weight(.medium))
+                    Button("Open Settings") {
+                        let url = URL(string:
+                            "x-apple.systempreferences:com.apple.preference.security?\(anchor)"
+                        )!
+                        NSWorkspace.shared.open(url)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            case .unknown:
+                Button("Grant") { Task { await grant() } }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    // MARK: - Status readers
+
+    private enum PermissionRowStatus { case granted, denied, unknown }
+
+    private var micStatus: PermissionRowStatus {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:                 return .granted
+        case .denied, .restricted:        return .denied
+        case .notDetermined:              return .unknown
+        @unknown default:                 return .unknown
+        }
+    }
+
+    private var speechStatus: PermissionRowStatus {
+        switch SFSpeechRecognizer.authorizationStatus() {
+        case .authorized:                 return .granted
+        case .denied, .restricted:        return .denied
+        case .notDetermined:              return .unknown
+        @unknown default:                 return .unknown
+        }
+    }
+
+    private var calendarStatus: PermissionRowStatus {
+        switch EKEventStore.authorizationStatus(for: .event) {
+        case .fullAccess, .authorized:    return .granted
+        case .denied, .restricted, .writeOnly: return .denied
+        case .notDetermined:              return .unknown
+        @unknown default:                 return .unknown
+        }
+    }
+
+    private var locationStatus: PermissionRowStatus {
+        // Inverted check matches `LocationProvider.currentLocation()` —
+        // anything that isn't explicitly bad reads as granted.
+        switch LocationProvider.shared.authorizationStatus {
+        case .denied, .restricted: return .denied
+        case .notDetermined:       return .unknown
+        default:                   return .granted
         }
     }
 }
