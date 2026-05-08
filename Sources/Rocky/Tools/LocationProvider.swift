@@ -35,13 +35,35 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
     }
 
     /// Show the system "allow Rocky to use your location" dialog if
-    /// the status is `notDetermined`. Resolves once the user picks.
-    /// Returns the resolved status. macOS doesn't have an async API
-    /// for the prompt itself, so we wait for the delegate callback.
+    /// the status is `notDetermined`. Resolves once the user picks
+    /// or times out after 8s — without a bundle ID + Info.plist
+    /// usage description, macOS silently no-ops `requestWhenInUseAuthorization`
+    /// and the delegate never fires, so the timeout is the only way
+    /// to avoid leaking the continuation.
     func requestAuthorization() async -> CLAuthorizationStatus {
         if manager.authorizationStatus != .notDetermined {
             return manager.authorizationStatus
         }
+        // Defensive guard for the "ran without a bundle" case. The
+        // app needs `Bundle.main.bundleIdentifier` non-nil + the
+        // location usage description in Info.plist for the system
+        // dialog to appear; both ship via scripts/build-app.sh.
+        if Bundle.main.bundleIdentifier == nil {
+            return manager.authorizationStatus
+        }
+        // Reject overlapping requests rather than overwriting the
+        // pending continuation — the previous async caller would
+        // leak forever.
+        if authPending != nil {
+            return manager.authorizationStatus
+        }
+        let timeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 8 * 1_000_000_000)
+            guard let self, let cont = self.authPending else { return }
+            self.authPending = nil
+            cont.resume(returning: self.manager.authorizationStatus)
+        }
+        defer { timeoutTask.cancel() }
         return await withCheckedContinuation { cont in
             authPending = cont
             manager.requestWhenInUseAuthorization()
