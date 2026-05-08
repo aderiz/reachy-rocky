@@ -91,7 +91,12 @@ cat > "$CONTENTS/Info.plist" <<'PLIST'
 PLIST
 
 echo "==> Ad-hoc signing"
-codesign --force --sign - --options runtime --timestamp=none "$APP" >/dev/null
+# Hardened runtime (--options runtime) is for notarised distribution.
+# With ad-hoc signing + hardened runtime + no entitlements file,
+# macOS Sequoia silently refuses Calendar / EventKit prompts —
+# `requestFullAccessToEvents()` returns false without ever showing
+# the system dialog. Plain ad-hoc is what local dev needs.
+codesign --force --sign - --timestamp=none "$APP" >/dev/null
 
 echo
 echo "Built: $APP"
