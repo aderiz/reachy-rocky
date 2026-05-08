@@ -14,7 +14,7 @@ dependencies = []  # `say` placeholder needs no Python deps
 # `synthesize` call and caches under ~/.cache/huggingface/.
 mlx = [
     "mlx>=0.18",
-    "mlx-audio>=0.4",
+    "mlx-audio>=0.4.3",
     "soundfile>=0.12",
     "numpy>=1.26",
 ]
