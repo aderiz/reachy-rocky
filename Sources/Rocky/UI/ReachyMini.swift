@@ -118,19 +118,32 @@ public final class ReachyMini {
 
     // MARK: - Visual cleanups for partial IK
 
-    /// Hide the Stewart-platform rod / ball linkage meshes. While the
-    /// driver only sets `setHeadEuler` (no Stewart IK), the rods and
-    /// balls don't track the head — they stay at rest while the upper
-    /// plate moves elsewhere. Hiding them keeps the visual honest:
-    /// the head moves, the body and motor arms stay still, and
-    /// nothing's visibly disconnected. Restore the rods by calling
-    /// this with `hidden = false` once the IK is wired.
+    /// Hide the Stewart-platform rod linkage meshes. While the driver
+    /// only sets `setHeadEuler` (no Stewart IK), the rods don't track
+    /// the head — they stay at rest while the upper plate moves
+    /// elsewhere. Hiding them keeps the visual honest.
+    ///
+    /// CRUCIAL: hide only the *geometry child nodes*, not the link
+    /// nodes themselves. `stewart_link_rod_6` is load-bearing — it's
+    /// the parent in the kinematic chain that carries `xl_330` (and
+    /// therefore the head + antennas + upper plate) up via
+    /// `passive_7_x → passive_7_y → passive_7_z`. Hiding the link
+    /// node would hide every descendant in SceneKit, taking the
+    /// entire upper half of the bot with it. Hiding only the visual
+    /// child preserves the transform chain.
     public func setStewartLinkageHidden(_ hidden: Bool) {
-        let prefixes = ["stewart_link_rod", "stewart_link_ball"]
+        let prefixes = ["stewart_link_rod"]
         for link in links.values {
             let name = link.name
-            if prefixes.contains(where: { name.hasPrefix($0) }) {
-                link.node.isHidden = hidden
+            guard prefixes.contains(where: { name.hasPrefix($0) }) else {
+                continue
+            }
+            // Each visual mesh added in `parse(...)` is a direct
+            // child of the link node — they're the only children we
+            // attached, so hiding all of them just hides the rendered
+            // rod without disturbing any joint nodes parented below.
+            for child in link.node.childNodes {
+                child.isHidden = hidden
             }
         }
     }
