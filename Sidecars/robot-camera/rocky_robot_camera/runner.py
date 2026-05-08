@@ -74,15 +74,15 @@ class Runner:
             return False
 
     def _refresh_media(self) -> bool:
-        """Best-effort release+reacquire to recover from a silent WebRTC
-        drop. Some daemon versions don't expose release_media; ignore
-        AttributeError."""
-        try:
-            self.mini.release_media()
-            log("info", "media released for refresh")
-        except (AttributeError, Exception) as exc:  # noqa: BLE001
-            log("debug", "release_media skipped", error=str(exc))
-        time.sleep(0.3)  # let the daemon settle before re-acquiring
+        """Best-effort `acquire_media` to nudge a silently-dropped
+        WebRTC peer back. We do NOT call `release_media` here —
+        the bot's media lock is shared with the mic sidecar, and
+        releasing it on a transient stall would tear down the
+        mic's peer too. `acquire_media` alone is idempotent: a
+        no-op when healthy, a re-arm when the daemon has
+        half-dropped. If the SDK's internal state is genuinely
+        broken, the fatal-exit tier respawns us with a clean
+        instance."""
         return self._acquire_media()
 
     def stream_loop(self) -> None:

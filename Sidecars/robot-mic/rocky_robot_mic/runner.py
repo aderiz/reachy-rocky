@@ -186,22 +186,23 @@ class Runner:
         log("info", "recording stopped")
 
     def _refresh_media(self) -> bool:
-        """T1 — best-effort `release_media + acquire_media` on the
-        bot. Many WebRTC drops recover with a refresh and never need
-        a deeper recovery. Returns True if reacquisition succeeded."""
+        """T1 — best-effort `acquire_media` on the bot.
+        Crucially, we do NOT call `release_media` here. The bot's
+        media lock is shared with the camera sidecar; if mic's
+        soft-refresh released the lock, the camera lost its peer
+        too. Both sidecars then thrashed in lockstep. `acquire_media`
+        on its own is idempotent — when the connection is healthy
+        it's a cheap no-op, and when WebRTC has half-dropped on the
+        bot side it nudges the daemon to re-establish without
+        kicking the camera. If the connection is fully dead, T2's
+        full SDK reconnect handles it."""
         with self._mini_lock:
             mini = self.mini
         if mini is None:
             return False
         try:
-            mini.release_media()
-            log("info", "media released for refresh")
-        except Exception as exc:  # noqa: BLE001
-            log("debug", "release_media skipped", error=str(exc))
-        time.sleep(0.3)
-        try:
             mini.acquire_media()
-            log("info", "media reacquired")
+            log("info", "media reacquired (no release)")
             return True
         except Exception as exc:  # noqa: BLE001
             log("warn", "acquire_media failed", error=str(exc))
@@ -227,14 +228,13 @@ class Runner:
                 log("warn", "audio thread did not exit within 2s")
 
         with self._mini_lock:
-            old_mini = self.mini
             self.mini = None
-
-        try:
-            old_mini.release_media()  # type: ignore[union-attr]
-        except Exception as exc:  # noqa: BLE001
-            log("debug", "release_media during reconnect failed",
-                error=str(exc))
+        # Don't `release_media` on the old SDK — that's a server-
+        # side hangup that would also tear down the camera's peer.
+        # The old ReachyMini instance is dropped by Python GC when
+        # this scope ends; its WebRTC peer cleans up
+        # asynchronously. New SDK below opens its own fresh peer
+        # via `acquire_media`.
 
         try:
             from reachy_mini import ReachyMini
