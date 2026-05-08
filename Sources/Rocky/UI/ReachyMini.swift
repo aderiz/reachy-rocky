@@ -97,16 +97,20 @@ public final class ReachyMini {
             * simd_quatf(angle: angle, axis: j.axis)
     }
 
-    /// Set the 6 Stewart actuator angles. OVERWRITE (no compose) —
-    /// matches the bundle's reference loader, which is the convention
-    /// the WASM kinematics module was authored against. The WASM
-    /// returns 18 passive-joint angles assuming the actuators were
-    /// applied via overwrite; composing on top of rest here would
-    /// produce visually-broken legs.
+    /// Set the 6 Stewart actuator angles. Composed with rest — the
+    /// daemon reports motor positions as joint angles relative to
+    /// the calibrated home (URDF semantic), so motor=0 should leave
+    /// the actuator at its authored URDF rest. The WASM's returned
+    /// passive joints are still applied via overwrite (see
+    /// `setJoint`); the WASM was tested against the bundle's
+    /// overwrite-loader so its passive outputs assume that
+    /// convention, but motor inputs flow through the daemon's URDF
+    /// semantic so they need compose.
     public func setStewartActuators(_ angles: [Float]) {
         for (i, angle) in angles.prefix(6).enumerated() {
             guard let joint = joints["stewart_\(i+1)"] else { continue }
-            joint.node.simdOrientation = simd_quatf(angle: angle, axis: joint.axis)
+            joint.node.simdOrientation = joint.restOrientation
+                * simd_quatf(angle: angle, axis: joint.axis)
         }
     }
 
