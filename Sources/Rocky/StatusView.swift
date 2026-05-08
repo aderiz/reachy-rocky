@@ -37,7 +37,15 @@ struct StatusView: View {
     /// out without needing to read the rows below. Each tile is a
     /// button that scrolls the issues list to that subsystem.
     private var subsystemStrip: some View {
-        let entries = allRows
+        // Six capability tiles, each aggregating the worst state from
+        // its underlying Health rows. Reads as "what can Rocky do
+        // right now?" — Listen is the whole audio→text path, See is
+        // the whole camera→face-tracker path, Think is the LLM, etc.
+        // The detailed rows below tell you which sub-component
+        // failed when a tile turns yellow. Memory stays separate
+        // from Think because long-term continuity is its own
+        // capability — failing memory doesn't block thinking.
+        let entries = capabilityRows
         return HStack(spacing: 6) {
             ForEach(entries) { entry in
                 SubsystemTile(entry: entry)
@@ -49,6 +57,44 @@ struct StatusView: View {
         .frame(maxWidth: .infinity)
         .background(.regularMaterial,
                     in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    fileprivate var capabilityRows: [HealthRow] {
+        [
+            capability(id: "cap.body",   title: "Body",
+                       icon: "dot.radiowaves.left.and.right",
+                       from: [robotRow]),
+            capability(id: "cap.listen", title: "Listen",
+                       icon: "ear",
+                       from: [micRow, sttRow]),
+            capability(id: "cap.see",    title: "See",
+                       icon: "eye",
+                       from: [cameraRow, faceSidecarRow]),
+            capability(id: "cap.think",  title: "Think",
+                       icon: "brain",
+                       from: [llmRow]),
+            capability(id: "cap.speak",  title: "Speak",
+                       icon: "speaker.wave.2",
+                       from: [ttsSidecarRow]),
+            capability(id: "cap.memory", title: "Memory",
+                       icon: "tray.full",
+                       from: [memorySidecarRow]),
+        ]
+    }
+
+    private func capability(
+        id: String, title: String, icon: String, from rows: [HealthRow]
+    ) -> HealthRow {
+        // Worst-state propagation. If any row in the capability is
+        // unhealthy, the tile reflects it. Subtitle quotes the
+        // worst row's subtitle so hover/help is actionable
+        // ("stalled · last frame 5s ago" rather than "5 things
+        // checked").
+        let worst = rows.max(by: { $0.state.severity < $1.state.severity })
+            ?? rows[0]
+        return HealthRow(id: id, title: title,
+                         subtitle: worst.subtitle, icon: icon,
+                         state: worst.state, action: nil)
     }
 
     // MARK: - Header
@@ -483,10 +529,9 @@ struct StatusView: View {
 
 // MARK: - Subsystem tile
 
-/// One of six subsystem icons in the Health tab's hero strip. Tinted
-/// by status — broken systems pop, healthy ones recede. Click bounces
-/// the row in the list (planned for a later cross-panel polish pass;
-/// for now the click is a no-op anchor for the affordance).
+/// One tile per Rocky capability (Body, Listen, See, Think, Speak,
+/// Memory). The colour reflects the worst state of the underlying
+/// Health rows — broken parts pop, healthy ones recede.
 private struct SubsystemTile: View {
     let entry: StatusView.HealthRow
 
@@ -500,7 +545,7 @@ private struct SubsystemTile: View {
                     .font(.title3.weight(.semibold))
                     .foregroundStyle(entry.state.color)
             }
-            Text(shortLabel)
+            Text(entry.title)
                 .font(.caption2.weight(.medium))
                 .foregroundStyle(.primary)
                 .lineLimit(1)
@@ -509,21 +554,6 @@ private struct SubsystemTile: View {
         .frame(maxWidth: .infinity)
         .help(entry.subtitle)
         .accessibilityLabel("\(entry.title): \(entry.subtitle)")
-    }
-
-    /// Five-char-or-less label so six tiles fit comfortably at the
-    /// inspector's 320pt minimum width.
-    private var shortLabel: String {
-        switch entry.id {
-        case "robot":          return "Body"
-        case "llm":            return "Brain"
-        case "mic":            return "Mic"
-        case "stt":            return "Speech"
-        case "facetracker":    return "Eyes"
-        case "sidecar.tts":    return "Voice"
-        case "sidecar.memory": return "Memory"
-        default:               return entry.title
-        }
     }
 }
 
