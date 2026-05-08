@@ -71,7 +71,9 @@ struct MotionCard: View {
             state: services.rockyState,
             pose: services.lastRobotState?.headPose,
             antennas: services.lastRobotState?.antennasPosition,
-            bodyYaw: services.lastRobotState?.bodyYaw
+            bodyYaw: services.lastRobotState?.bodyYaw,
+            headJoints: services.lastRobotState?.headJoints,
+            passiveJoints: services.lastRobotState?.passiveJoints
         )
         .aspectRatio(1, contentMode: .fit)
         .frame(maxWidth: 360)

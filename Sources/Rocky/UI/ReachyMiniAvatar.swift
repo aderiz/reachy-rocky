@@ -2,36 +2,50 @@ import SwiftUI
 import SceneKit
 import RockyKit
 
-/// Live SwiftUI wrapper around `ReachyMini` (URDF + STL loader). Drop-in
-/// replacement for the older `ReachyHead3D`: same call signature
-/// (rockyState + headPose + antennas), same camera framing, but the
-/// scene is now the full robot model from the Pollen bundle.
+/// Live SwiftUI wrapper around `ReachyMini` (URDF + STL loader). Drives
+/// the URDF the same way the Pollen Tauri app does: by feeding the 6
+/// Stewart motor angles + 2 antenna angles into the bundled WASM
+/// kinematics, then applying the 18 returned passive-joint angles
+/// alongside the motor angles. The head pose follows naturally from
+/// the kinematic chain — no `setHeadEuler` shortcut.
 ///
-/// Per the bundle's README: setting `setHeadEuler` directly bypasses
-/// the Stewart-platform IK, so the leg rods between the body and the
-/// upper plate visually disconnect during head motion. We crop the
-/// camera tightly to the head/antennas, hiding the legs entirely.
-/// The cockpit / inspector preview never sees the broken linkage.
+/// Inputs:
+///   - `state`         — drives the sleep override (slump + antenna fold)
+///   - `headJoints`    — 6 stewart motor angles (radians)
+///   - `passiveJoints` — 18 passive joint angles (radians) if the daemon
+///                       provides them; otherwise the IK is run locally
+///   - `antennas`      — 2 antenna angles (radians)
+///   - `bodyYaw`       — single body rotation around the foot
+///   - `pose`          — fallback head pose for the legacy "no motor
+///                       angles" path (used only when both `headJoints`
+///                       and the IK are unavailable)
 ///
-/// Sleep behaviour preserved from the previous avatar — when
-/// `state == .sleeping` we override the antennas to fold down (π
-/// around their hinge axis), regardless of the live `antennas` value.
+/// When motor angles are available the Stewart linkage rods are visible
+/// and animate correctly. When they're not, the linkage is hidden and
+/// the head is driven directly via `setHeadEuler` — honest stub for
+/// when the daemon hasn't started reporting joint state yet.
 struct ReachyMiniAvatar: NSViewRepresentable {
     let state: AppServices.RockyState
     let pose: RPYPose?
     let antennas: Antennas?
     let bodyYaw: Double?
+    let headJoints: [Double]?
+    let passiveJoints: [Double]?
 
     init(
         state: AppServices.RockyState,
         pose: RPYPose?,
         antennas: Antennas?,
-        bodyYaw: Double? = nil
+        bodyYaw: Double? = nil,
+        headJoints: [Double]? = nil,
+        passiveJoints: [Double]? = nil
     ) {
         self.state = state
         self.pose = pose
         self.antennas = antennas
         self.bodyYaw = bodyYaw
+        self.headJoints = headJoints
+        self.passiveJoints = passiveJoints
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -58,21 +72,12 @@ struct ReachyMiniAvatar: NSViewRepresentable {
             angle: .pi, axis: SIMD3<Float>(0, 1, 0)
         )
         if let robot = Self.loadRobot() {
-            // Until the Stewart IK is wired (WASM bridge or Swift port),
-            // hide the leg rods + balls — they can't track head motion
-            // when we drive head pose directly. Better to show no rods
-            // than disconnected ones.
-            robot.setStewartLinkageHidden(true)
             presentation.addChildNode(robot.rootNode)
             context.coordinator.robot = robot
         }
         scene.rootNode.addChildNode(presentation)
 
-        // Camera, framed on the full bot. Reachy Mini is roughly 0.40 m
-        // tall standing on its foot. Pulling the camera back to ~1.0 m
-        // with a 30° FOV gives ~0.54 m of vertical visible extent —
-        // bot + comfortable margin. Look-at is mid-body so the head
-        // sits in the upper third.
+        // Camera framed on the full bot.
         let lookAtTarget = SCNNode()
         lookAtTarget.position = SCNVector3(0, 0.20, 0)
         scene.rootNode.addChildNode(lookAtTarget)
@@ -90,9 +95,9 @@ struct ReachyMiniAvatar: NSViewRepresentable {
         cameraNode.constraints = [lookAt]
         scene.rootNode.addChildNode(cameraNode)
 
-        // Lighting — soft 3-point. Same intent as the previous avatar:
-        // a warm key from upper-front-left, a cool rim from upper-back-
-        // right, and a low ambient fill so shadows don't go pure black.
+        // Lighting — soft 3-point. Warm key from upper-front-left, cool
+        // rim from upper-back-right, low ambient fill so shadows don't
+        // go pure black.
         let key = SCNNode()
         let keyLight = SCNLight()
         keyLight.type = .directional
@@ -127,7 +132,9 @@ struct ReachyMiniAvatar: NSViewRepresentable {
         scene.rootNode.addChildNode(fill)
 
         context.coordinator.apply(state: state, pose: pose,
-                                   antennas: antennas, bodyYaw: bodyYaw)
+                                   antennas: antennas, bodyYaw: bodyYaw,
+                                   headJoints: headJoints,
+                                   passiveJoints: passiveJoints)
         return view
     }
 
@@ -135,13 +142,16 @@ struct ReachyMiniAvatar: NSViewRepresentable {
         SCNTransaction.begin()
         SCNTransaction.animationDuration = 0.18
         context.coordinator.apply(state: state, pose: pose,
-                                   antennas: antennas, bodyYaw: bodyYaw)
+                                   antennas: antennas, bodyYaw: bodyYaw,
+                                   headJoints: headJoints,
+                                   passiveJoints: passiveJoints)
         SCNTransaction.commit()
     }
 
-    // MARK: - One-shot loader (cached)
+    // MARK: - One-shot loaders (cached)
 
     @MainActor private static var cachedRobot: ReachyMini?
+    @MainActor private static var cachedIK: StewartIK?
 
     @MainActor
     private static func loadRobot() -> ReachyMini? {
@@ -165,47 +175,120 @@ struct ReachyMiniAvatar: NSViewRepresentable {
         }
     }
 
+    @MainActor
+    fileprivate static func loadIK() -> StewartIK? {
+        if let cached = cachedIK { return cached }
+        guard let url = Bundle.module.url(
+            forResource: "reachy_mini_kinematics",
+            withExtension: "wasm",
+            subdirectory: "ReachyMini"
+        ) else {
+            assertionFailure("reachy_mini_kinematics.wasm missing from app bundle")
+            return nil
+        }
+        do {
+            let ik = try StewartIK(wasmURL: url)
+            cachedIK = ik
+            return ik
+        } catch {
+            assertionFailure("StewartIK init failed: \(error)")
+            return nil
+        }
+    }
+
     // MARK: - Coordinator
 
+    @MainActor
     final class Coordinator {
         weak var robot: ReachyMini?
-        private var lastSleeping: Bool?
 
         func apply(
             state: AppServices.RockyState,
             pose: RPYPose?,
             antennas: Antennas?,
-            bodyYaw: Double?
+            bodyYaw: Double?,
+            headJoints: [Double]?,
+            passiveJoints: [Double]?
         ) {
             guard let robot else { return }
 
             let isSleeping = (state == .sleeping)
 
-            // Head pose — drive from live `pose` when awake, slump
-            // gently forward when asleep to match the menu-bar pose.
-            let headPose = pose ?? RPYPose(roll: 0, pitch: 0, yaw: 0)
-            let pitch = isSleeping ? 0.55 : Float(headPose.pitch)
-            let roll  = isSleeping ? 0.05 : Float(headPose.roll)
-            let yaw   = Float(headPose.yaw)
-            robot.setHeadEuler(roll: roll, pitch: pitch, yaw: yaw)
-
-            // Antennas. Awake → live values; sleeping → folded down at
-            // the joint hinge so they drape across the head shell, the
-            // same shape as the old GLTF avatar achieved.
+            // Antennas — sleep folds them down regardless of live
+            // values; awake uses the daemon's reported angles.
+            let antennaPair: (left: Float, right: Float)
             if isSleeping {
                 let fold = Float.pi
-                robot.setAntennas(left: fold, right: fold)
+                antennaPair = (left: fold, right: fold)
             } else {
-                let live = antennas
-                let l = Float(live?.left ?? 0)
-                let r = Float(live?.right ?? 0)
-                robot.setAntennas(left: l, right: r)
+                antennaPair = (
+                    left: Float(antennas?.left ?? 0),
+                    right: Float(antennas?.right ?? 0)
+                )
             }
 
-            // Body yaw — single floor rotation around the foot.
+            // Body yaw — single rotation around the foot, always live.
             robot.setBodyYaw(Float(bodyYaw ?? 0))
 
-            lastSleeping = isSleeping
+            // Stewart platform — preferred path. When motor angles are
+            // available we drive the URDF as the Pollen app does:
+            //   1. setStewartActuators(headJoints)
+            //   2. compute passive joints (use daemon's if present;
+            //      fall back to local WASM IK; fall back to zeros)
+            //   3. setJoint(passive_N_x|y|z, ...) for each
+            // Sleep state ignores motor angles and uses the head-Euler
+            // override so the bot looks visibly slumped — the rods
+            // would visually disconnect, so we hide the linkage too.
+            if isSleeping {
+                robot.setStewartLinkageHidden(true)
+                robot.setHeadEuler(roll: 0.05, pitch: 0.55, yaw: 0)
+                robot.setAntennas(left: antennaPair.left,
+                                   right: antennaPair.right)
+                return
+            }
+
+            if let motors = headJoints, motors.count == 6 {
+                robot.setStewartLinkageHidden(false)
+                robot.setStewartActuators(motors.map { Float($0) })
+
+                // Passive joints — daemon-provided or computed locally.
+                let passive: [Double]?
+                if let provided = passiveJoints, provided.count == 18 {
+                    passive = provided
+                } else if let ik = ReachyMiniAvatar.loadIK() {
+                    passive = ik.calculatePassiveJoints(
+                        headJoints: motors,
+                        antennas: [Double(antennaPair.left),
+                                    Double(antennaPair.right)]
+                    )
+                } else {
+                    passive = nil
+                }
+                if let passive {
+                    for i in 0..<6 {
+                        let base = i * 3
+                        robot.setJoint("passive_\(i+1)_x",
+                                        angle: Float(passive[base + 0]))
+                        robot.setJoint("passive_\(i+1)_y",
+                                        angle: Float(passive[base + 1]))
+                        robot.setJoint("passive_\(i+1)_z",
+                                        angle: Float(passive[base + 2]))
+                    }
+                }
+            } else {
+                // Fallback: no motor angles from the daemon. Hide the
+                // linkage (it can't follow the head pose without IK)
+                // and animate the head directly. Honest stub until the
+                // daemon reports head_joints.
+                robot.setStewartLinkageHidden(true)
+                let p = pose ?? RPYPose(roll: 0, pitch: 0, yaw: 0)
+                robot.setHeadEuler(roll: Float(p.roll),
+                                    pitch: Float(p.pitch),
+                                    yaw: Float(p.yaw))
+            }
+
+            robot.setAntennas(left: antennaPair.left,
+                               right: antennaPair.right)
         }
     }
 }
