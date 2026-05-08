@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import CoreLocation
 import EventKit
 import Speech
 
@@ -36,6 +37,7 @@ struct FirstRunOverlay: View {
     @State private var micStatus: PermissionStatus = .unknown
     @State private var speechStatus: PermissionStatus = .unknown
     @State private var calendarStatus: PermissionStatus = .unknown
+    @State private var locationStatus: PermissionStatus = .unknown
     @State private var requestingAll: Bool = false
 
     var body: some View {
@@ -355,7 +357,8 @@ struct FirstRunOverlay: View {
     /// to switch the primary button label from "Skip for now" to a
     /// confident "Continue."
     private var permissionsAllResolved: Bool {
-        ![micStatus, speechStatus, calendarStatus].contains(where: \.isUnknown)
+        ![micStatus, speechStatus, calendarStatus, locationStatus]
+            .contains(where: \.isUnknown)
     }
 
     private var primaryDisabled: Bool {
@@ -419,6 +422,13 @@ struct FirstRunOverlay: View {
                     status: calendarStatus,
                     grant: { await requestCalendar() }
                 )
+                permissionRow(
+                    icon: "location.fill",
+                    title: "Location",
+                    rationale: "So \"what's the weather?\" works without you naming the city.",
+                    status: locationStatus,
+                    grant: { await requestLocation() }
+                )
             }
 
             HStack {
@@ -443,11 +453,12 @@ struct FirstRunOverlay: View {
     }
 
     private var allGrantedHint: String {
-        let granted = [micStatus, speechStatus, calendarStatus]
+        let total = 4
+        let granted = [micStatus, speechStatus, calendarStatus, locationStatus]
             .filter { $0 == .granted }.count
-        if granted == 3 { return "All set." }
+        if granted == total { return "All set." }
         if !permissionsAllResolved { return "" }
-        return "\(granted) of 3 granted — you can adjust the rest later in System Settings."
+        return "\(granted) of \(total) granted — you can adjust the rest later in System Settings."
     }
 
     @ViewBuilder
@@ -495,6 +506,20 @@ struct FirstRunOverlay: View {
         micStatus = currentMicStatus()
         speechStatus = currentSpeechStatus()
         calendarStatus = currentCalendarStatus()
+        locationStatus = currentLocationStatus()
+    }
+
+    private func currentLocationStatus() -> PermissionStatus {
+        switch LocationProvider.shared.authorizationStatus {
+        case .authorized, .authorizedAlways:
+            return .granted
+        case .denied, .restricted:
+            return .denied
+        case .notDetermined:
+            return .unknown
+        @unknown default:
+            return .unknown
+        }
     }
 
     private func currentMicStatus() -> PermissionStatus {
@@ -546,6 +571,22 @@ struct FirstRunOverlay: View {
         }
     }
 
+    private func requestLocation() async {
+        let status = await LocationProvider.shared.requestAuthorization()
+        await MainActor.run {
+            switch status {
+            case .authorized, .authorizedAlways:
+                locationStatus = .granted
+            case .denied, .restricted:
+                locationStatus = .denied
+            case .notDetermined:
+                locationStatus = .unknown
+            @unknown default:
+                locationStatus = .unknown
+            }
+        }
+    }
+
     /// Sequential because macOS only displays one TCC prompt at a
     /// time; firing them in parallel just means later ones are queued
     /// behind the user's first decision.
@@ -554,6 +595,7 @@ struct FirstRunOverlay: View {
         if micStatus == .unknown      { await requestMic() }
         if speechStatus == .unknown   { await requestSpeech() }
         if calendarStatus == .unknown { await requestCalendar() }
+        if locationStatus == .unknown { await requestLocation() }
         await MainActor.run { requestingAll = false }
     }
 

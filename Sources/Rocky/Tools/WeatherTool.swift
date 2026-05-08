@@ -20,26 +20,45 @@ enum WeatherTool {
     static func register(in registry: ToolRegistry, urlSession: URLSession = .shared) async {
         await registry.register(
             name: "get_weather",
-            description: "Get current weather and a short forecast for a named location. Pass a city name (\"Manchester\"), a place (\"Eiffel Tower\"), or a literal lat,lon (\"40.7,-74.0\"). Returns temperature in Celsius, plain-English conditions, wind speed, humidity, and the next 24 hourly forecasts.",
+            description: "Get current weather and a short forecast. With no `location` argument the Mac's current location is used (subject to system Location permission). Otherwise pass a city/place name (\"Manchester\") or a literal lat,lon (\"40.7,-74.0\"). Returns temperature in Celsius, plain-English conditions, wind speed, humidity, and the next 24 hourly forecasts.",
             parameters: .object([
                 "type": .string("object"),
                 "properties": .object([
                     "location": .object([
                         "type": .string("string"),
-                        "description": .string("City name, place name, or 'lat,lon'. Required."),
+                        "description": .string("Optional city name, place name, or 'lat,lon'. Omit for the Mac's current location."),
                     ]),
                 ]),
-                "required": .array([.string("location")]),
             ]),
             handler: { args in
-                guard let location = args.asObject?["location"]?.asString,
-                      !location.trimmingCharacters(in: .whitespaces).isEmpty
-                else {
-                    return .object(["error": .string("missing location")])
+                let raw = args.asObject?["location"]?.asString?
+                    .trimmingCharacters(in: .whitespaces) ?? ""
+                if raw.isEmpty {
+                    return await fetchHere(session: urlSession)
                 }
-                return await fetch(location: location, session: urlSession)
+                return await fetch(location: raw, session: urlSession)
             }
         )
+    }
+
+    /// One-shot CoreLocation fix → forecast. Used when the LLM omits
+    /// the `location` argument. Falls back to a clear "permission
+    /// denied" error if the user hasn't granted Location yet.
+    private static func fetchHere(session: URLSession) async -> JSONValue {
+        do {
+            let loc = try await MainActor.run {
+                LocationProvider.shared
+            }.currentLocation()
+            let lat = loc.coordinate.latitude
+            let lon = loc.coordinate.longitude
+            return try await forecast(
+                lat: lat, lon: lon,
+                name: String(format: "%.3f,%.3f", lat, lon),
+                session: session
+            )
+        } catch {
+            return .object(["error": .string("\(error)")])
+        }
     }
 
     private static func fetch(location: String, session: URLSession) async -> JSONValue {

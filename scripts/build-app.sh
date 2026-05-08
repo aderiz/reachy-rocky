@@ -74,6 +74,12 @@ cat > "$CONTENTS/Info.plist" <<'PLIST'
     <key>NSCalendarsFullAccessUsageDescription</key>
     <string>Rocky reads your calendar so he can answer questions about your schedule and what's coming up.</string>
 
+    <key>NSLocationUsageDescription</key>
+    <string>Rocky uses your approximate location so he can tell you the local weather without having to ask which city.</string>
+
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>Rocky uses your approximate location so he can tell you the local weather without having to ask which city.</string>
+
     <!-- Allow plain HTTP to the local-network daemon and LM Studio. -->
     <key>NSAppTransportSecurity</key>
     <dict>
