@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import Speech
 import SwiftUI
 import Cognition
 import RobotLink
@@ -862,7 +863,22 @@ final class AppServices {
         Task { [weak self] in await self?.warmUpSTT() }
     }
 
+    /// Refresh the STT backend label without ever showing a TCC prompt
+    /// to the user. The first-run overlay's Grant access step asks
+    /// for speech recognition explicitly; if we eagerly call
+    /// `requestAuthorization()` here on every launch the system
+    /// dialog appears under the overlay before the user gets a
+    /// chance to read what's being asked. Once the user resolves
+    /// the prompt (granted or denied), Apple's API guarantees
+    /// subsequent `requestAuthorization()` calls return
+    /// synchronously without re-prompting — so for non-`.notDetermined`
+    /// statuses we still call through to update labels.
     private func warmUpSTT() async {
+        let initial = SFSpeechRecognizer.authorizationStatus()
+        if initial == .notDetermined {
+            await MainActor.run { self.sttBackendName = "Apple Speech (pending)" }
+            return
+        }
         let resolved = await appleSTT.requestAuthorization()
         switch resolved {
         case .ready:
