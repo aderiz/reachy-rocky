@@ -70,35 +70,39 @@ public final class ReachyMini {
     }
 
     /// Antenna angles in radians. Left rotates around the antenna's revolute axis, similarly for right.
-    /// Antenna angles in radians. Overwrites the joint orientation
-    /// rather than composing on top of the URDF rest rpy — the
-    /// Pollen bundle's loader and the wasm-bindgen output were both
-    /// authored against this convention. The URDF's authored rest
-    /// rpys are encoded such that the visible mesh placements work
-    /// when joints are driven via overwrite (i.e. the rest rpys are
-    /// the home pose, applied at parse time, then replaced by the
-    /// commanded motor angle on every update).
+    /// Antenna angles in radians, composed on top of each joint's
+    /// URDF rest rpy. The daemon reports antenna positions as joint
+    /// angles relative to the calibrated home (URDF semantic), so
+    /// composing preserves the CAD-authored mounting orientation
+    /// when the angle is 0. Without compose, the antenna joint loses
+    /// its rest rpy and the antenna mesh ends up at the world axes.
     public func setAntennas(left: Float, right: Float) {
         if let j = joints["left_antenna"] {
-            j.node.simdOrientation = simd_quatf(angle: left, axis: j.axis)
+            j.node.simdOrientation = j.restOrientation
+                * simd_quatf(angle: left, axis: j.axis)
         }
         if let j = joints["right_antenna"] {
-            j.node.simdOrientation = simd_quatf(angle: right, axis: j.axis)
+            j.node.simdOrientation = j.restOrientation
+                * simd_quatf(angle: right, axis: j.axis)
         }
     }
 
     /// Body yaw — rotates the entire upper body around the foot.
-    /// Overwrite (see `setAntennas` for the convention).
+    /// Composed with rest (the URDF authors yaw_body with a -π/2 rest
+    /// rpy that defines the body's "face forward" direction; without
+    /// compose, calling setBodyYaw(0) snaps the body 90° off-axis).
     public func setBodyYaw(_ angle: Float) {
         guard let j = joints["yaw_body"] else { return }
-        j.node.simdOrientation = simd_quatf(angle: angle, axis: j.axis)
+        j.node.simdOrientation = j.restOrientation
+            * simd_quatf(angle: angle, axis: j.axis)
     }
 
-    /// Set the 6 Stewart actuator angles (radians). Indices 0..5 →
-    /// joints stewart_1..stewart_6. Without computing the passive
-    /// joints, the rod linkages will *not* close — the legs will
-    /// look visually wrong unless you also drive the passive joints
-    /// (use the bundled WASM kinematics). Overwrite.
+    /// Set the 6 Stewart actuator angles. OVERWRITE (no compose) —
+    /// matches the bundle's reference loader, which is the convention
+    /// the WASM kinematics module was authored against. The WASM
+    /// returns 18 passive-joint angles assuming the actuators were
+    /// applied via overwrite; composing on top of rest here would
+    /// produce visually-broken legs.
     public func setStewartActuators(_ angles: [Float]) {
         for (i, angle) in angles.prefix(6).enumerated() {
             guard let joint = joints["stewart_\(i+1)"] else { continue }
@@ -106,9 +110,9 @@ public final class ReachyMini {
         }
     }
 
-    /// Set arbitrary named joint angle. Useful when driving passive
-    /// joints from external IK. Overwrite — matches the convention
-    /// the WASM was authored against.
+    /// Set arbitrary named joint angle. OVERWRITE — used for the 18
+    /// passive-joint angles returned by the WASM kinematics module.
+    /// See `setStewartActuators` for why we don't compose with rest.
     public func setJoint(_ name: String, angle: Float) {
         guard let joint = joints[name] else { return }
         joint.node.simdOrientation = simd_quatf(angle: angle, axis: joint.axis)
