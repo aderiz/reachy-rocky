@@ -176,4 +176,75 @@ struct EchoSidecarIntegrationTests {
 
         await supervisor.stopAll()
     }
+
+    // MARK: - Multicast contract
+
+    /// Two subscribers iterate the same sidecar's events; both must
+    /// see the same state transitions. Pre-multicast (single
+    /// AsyncStream) state events were partitioned across consumers,
+    /// which broke the supervisor restart path because
+    /// `.state(.failing)` could land on either watcher unpredictably.
+    @Test("two subscribers each receive every state transition")
+    func multicastStateToTwoSubscribers() async throws {
+        let runtime = try await Self.makeRuntime()
+        try await runtime.start()
+
+        // Subscribe twice via the synchronous-insert API.
+        let s1 = await runtime.subscribe()
+        let s2 = await runtime.subscribe()
+
+        // Each subscriber should immediately see a replayed
+        // `.state(.ready)`. Then we stop the runtime and both
+        // should see `.state(.stopped)` (after a brief
+        // intermediate transition).
+        async let r1: [SidecarState] = Self.collectStates(
+            from: s1, target: 2, deadline: Date().addingTimeInterval(3.0)
+        )
+        async let r2: [SidecarState] = Self.collectStates(
+            from: s2, target: 2, deadline: Date().addingTimeInterval(3.0)
+        )
+        // Trigger a state transition.
+        try await Task.sleep(nanoseconds: 200_000_000)
+        await runtime.stop()
+        let (states1, states2) = await (r1, r2)
+
+        #expect(states1.first == .ready, "s1 first state was \(String(describing: states1.first))")
+        #expect(states2.first == .ready, "s2 first state was \(String(describing: states2.first))")
+        #expect(states1 == states2, "subscribers diverged: s1=\(states1) s2=\(states2)")
+    }
+
+    private static func collectStates(
+        from stream: AsyncStream<SidecarOutboundEvent>,
+        target: Int,
+        deadline: Date
+    ) async -> [SidecarState] {
+        var out: [SidecarState] = []
+        for await event in stream {
+            if case .state(let s) = event { out.append(s) }
+            if out.count >= target || Date() > deadline { break }
+        }
+        return out
+    }
+
+    /// A subscriber that connects AFTER `.ready` should still see
+    /// the current state replayed on subscription. This is what
+    /// keeps AppServices' state mirror in sync — its subscription
+    /// happens after `sidecar.start()` returns, by which point
+    /// `.ready` has already fired.
+    @Test("late subscriber sees replayed current state")
+    func lateSubscriberStateReplay() async throws {
+        let runtime = try await Self.makeRuntime()
+        try await runtime.start()
+        defer { Task { await runtime.stop() } }
+
+        // start() has returned, so state is .ready by now. Subscribe
+        // and confirm the first event is `.state(.ready)`.
+        let stream = await runtime.subscribe()
+        var iter = stream.makeAsyncIterator()
+        let first = await iter.next()
+        guard case .state(.ready)? = first else {
+            Issue.record("expected first event to be .state(.ready), got \(String(describing: first))")
+            return
+        }
+    }
 }
