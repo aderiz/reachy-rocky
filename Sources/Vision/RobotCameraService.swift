@@ -25,10 +25,14 @@ public actor RobotCameraService {
     private let sidecar: any Sidecar
     private let logBus: LogBus
     private var pumpTask: Task<Void, Never>?
-    private var stateTask: Task<Void, Never>?
     public private(set) var isStreaming: Bool = false
     public private(set) var lastSeq: Int = 0
     public private(set) var lastFrameAt: Date?
+    /// First `.state(.ready)` is the initial start in `start()` — we
+    /// already issued `start_streaming` synchronously. Subsequent
+    /// `.ready` transitions are supervisor restarts (e.g. after the
+    /// runner's 20s fatal exit) that need streaming re-armed.
+    private var seenInitialReady: Bool = false
 
     public init(sidecar: any Sidecar, logBus: LogBus) {
         self.sidecar = sidecar
@@ -44,30 +48,24 @@ public actor RobotCameraService {
         try await sidecar.start()
         try await sendStartStreaming()
 
+        // Single pump consuming both frame events and lifecycle
+        // state changes — AsyncStream is effectively single-consumer,
+        // so two iterators competing over `sidecar.events` would
+        // race for each item and randomly drop frames or state
+        // transitions.
         let events = sidecar.events
         pumpTask?.cancel()
         pumpTask = Task { [weak self] in
             for await event in events {
-                if case .event(let name, let payload) = event, name == "frame" {
-                    await self?.ingest(payload)
-                }
+                await self?.handleSidecarEvent(event)
                 if Task.isCancelled { break }
             }
-        }
-
-        // Watch sidecar lifecycle: when the supervisor restarts the
-        // process (e.g., after our 20s "fatal" exit), re-arm streaming
-        // so frames resume without app intervention.
-        stateTask?.cancel()
-        stateTask = Task { [weak self] in
-            await self?.watchSidecarState()
         }
         isStreaming = true
     }
 
     public func stop() async {
         pumpTask?.cancel(); pumpTask = nil
-        stateTask?.cancel(); stateTask = nil
         isStreaming = false
         struct Empty: Encodable, Sendable {}
         struct R: Decodable, Sendable { let streaming: Bool }
@@ -81,36 +79,38 @@ public actor RobotCameraService {
         let _: R = try await sidecar.send(method: "start_streaming", params: Empty())
     }
 
-    private func watchSidecarState() async {
-        var sawReadyOnce = false
-        for await event in sidecar.events {
-            if case .state(let s) = event {
-                switch s {
-                case .ready:
-                    if sawReadyOnce {
-                        // Restart — re-arm streaming. The sidecar's init
-                        // already runs acquire_media on its main thread.
-                        do {
-                            try await sendStartStreaming()
-                            await logBus.publish(.sidecarLog(
-                                sidecar: "robot-camera", level: .info,
-                                message: "re-armed streaming after restart",
-                                fields: [:]
-                            ))
-                        } catch {
-                            await logBus.publish(.error(
-                                scope: "robot-camera",
-                                message: "re-arm failed: \(error)",
-                                recoverable: true
-                            ))
-                        }
+    private func handleSidecarEvent(_ event: SidecarOutboundEvent) async {
+        switch event {
+        case .event(let name, let payload):
+            if name == "frame" { await ingest(payload) }
+        case .state(let s):
+            // Re-arm streaming on supervisor-driven restarts (the
+            // runner's stall watchdog → fatal exit → respawn). The
+            // sidecar's init already runs acquire_media on its main
+            // thread, so the new process is ready to stream once it
+            // gets `start_streaming` back.
+            if s == .ready {
+                if !seenInitialReady {
+                    seenInitialReady = true
+                } else if isStreaming {
+                    do {
+                        try await sendStartStreaming()
+                        await logBus.publish(.sidecarLog(
+                            sidecar: "robot-camera", level: .info,
+                            message: "re-armed streaming after restart",
+                            fields: [:]
+                        ))
+                    } catch {
+                        await logBus.publish(.error(
+                            scope: "robot-camera",
+                            message: "re-arm failed: \(error)",
+                            recoverable: true
+                        ))
                     }
-                    sawReadyOnce = true
-                default:
-                    break
                 }
             }
-            if Task.isCancelled { break }
+        case .log:
+            break
         }
     }
 
