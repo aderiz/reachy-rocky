@@ -152,7 +152,6 @@ private struct BrainSettingsTab: View {
     @Environment(AppServices.self) private var services
     @State private var lmURLDraft: String = ""
     @State private var lmApiKeyDraft: String = ""
-    @State private var braveKeyDraft: String = ""
 
     var body: some View {
         Form {
@@ -173,9 +172,20 @@ private struct BrainSettingsTab: View {
             }
 
             Section {
-                SecureField("Brave Search API key", text: $braveKeyDraft,
-                            prompt: Text("paste from search.brave.com/api"))
-                    .onSubmit { commitBraveKey() }
+                // Direct binding to the store — no draft state, no
+                // dependence on `.onSubmit` firing (which only fires
+                // when the user presses Return; paste-and-click-away
+                // wouldn't commit). Brave key has no hot-reload
+                // cost, so writing on every character change is
+                // fine; UserDefaults batches the writes.
+                SecureField(
+                    "Brave Search API key",
+                    text: Binding(
+                        get: { services.settings.braveSearchAPIKey },
+                        set: { services.settings.braveSearchAPIKey = $0 }
+                    ),
+                    prompt: Text("paste from search.brave.com/api")
+                )
             } header: {
                 Text("Web search")
             } footer: {
@@ -199,13 +209,7 @@ private struct BrainSettingsTab: View {
         .onAppear {
             lmURLDraft = services.settings.lmStudioURL
             lmApiKeyDraft = services.settings.lmStudioApiKey
-            braveKeyDraft = services.settings.braveSearchAPIKey
         }
-    }
-
-    private func commitBraveKey() {
-        guard braveKeyDraft != services.settings.braveSearchAPIKey else { return }
-        services.settings.braveSearchAPIKey = braveKeyDraft
     }
 
     private var modelPicker: some View {
