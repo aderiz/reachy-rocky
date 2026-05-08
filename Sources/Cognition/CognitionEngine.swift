@@ -135,6 +135,13 @@ public actor CognitionEngine {
         }
 
         var rounds = 0
+        // Dedup ledger across this turn — small LLMs (Gemma especially)
+        // sometimes loop on `get_weather({})` or similar after the
+        // first tool result, fanning out 3–4 identical calls before
+        // hitting `maxToolRounds`. If we see the same (name, args)
+        // pair fire twice in one turn, abort the loop and force the
+        // model to actually speak instead of cascading.
+        var dispatchedSignatures: Set<String> = []
 
         while rounds < config.maxToolRounds {
             rounds += 1
@@ -233,6 +240,14 @@ public actor CognitionEngine {
             )
             transcript.append(assistantMsg)
 
+            // Detect cascading-identical-call loops. If every call in
+            // this round has already fired earlier in the turn, the
+            // model is stuck — break the loop instead of letting it
+            // burn another round on the same data.
+            let signatures = calls.map { "\($0.function.name)::\($0.function.arguments)" }
+            let allRepeats = !signatures.isEmpty
+                && signatures.allSatisfy { dispatchedSignatures.contains($0) }
+
             for call in calls {
                 continuation.yield(.toolCallDispatched(
                     name: call.function.name,
@@ -251,6 +266,14 @@ public actor CognitionEngine {
                     name: call.function.name,
                     toolCallId: call.id
                 ))
+            }
+            for sig in signatures { dispatchedSignatures.insert(sig) }
+
+            if allRepeats {
+                continuation.yield(.error(
+                    "model repeated identical tool calls; ending turn"
+                ))
+                return
             }
             // Loop: feed tool outputs back to the model for another turn.
         }
