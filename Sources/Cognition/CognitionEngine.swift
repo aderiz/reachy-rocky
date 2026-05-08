@@ -474,32 +474,70 @@ public actor CognitionEngine {
     /// legitimate `bash` / `python` code blocks the assistant might
     /// emit when explaining code — the user would type "show me a
     /// Bash one-liner" and the rendered chat showed nothing.
-    /// Strip cosmetic quote-wrapping the LLM adds around spoken
-    /// phrases (`"Rocky check weather." "17 degrees today."`).
-    /// Quote characters in the synthesized audio sound wrong (TTS
-    /// engines pronounce literal quote marks as pauses or skip
-    /// them awkwardly). The persona prompt tries to forbid this
-    /// but small models ignore it; cleanup at the boundary is the
-    /// reliable fix.
+    /// Normalise text for TTS at the boundary. Two jobs:
+    ///
+    /// 1. Strip cosmetic quote-wrapping the LLM adds around spoken
+    ///    phrases (`"Rocky check weather." "17 degrees today."`).
+    ///    Quote characters in synthesized audio sound wrong (TTS
+    ///    engines pronounce literal quote marks as awkward pauses
+    ///    or skip them).
+    ///
+    /// 2. Expand symbols and abbreviations that TTS reads
+    ///    character-by-character (`°C` → "degree-symbol C", `kph`
+    ///    → "kuh-puh-huh"). Tool outputs and persona quotes both
+    ///    leak these; centralising the expansion here means tools
+    ///    don't each have to remember the rules.
+    ///
+    /// The persona prompt also instructs the model to use spoken
+    /// form natively, but small models forget; cleanup at the
+    /// boundary is the reliable fix.
     public static func cleanupForTTS(_ text: String) -> String {
-        // Drop straight + curly quote characters. We keep the
+        // 1. Drop straight + curly quote characters. We keep the
         // punctuation between phrases (the period at the end of
         // each quoted segment), so the resulting prose still has
         // sentence breaks: `"Foo." "Bar."` → `Foo. Bar.`.
-        let stripped = text
+        var out = text
             .replacingOccurrences(of: "\"", with: "")
             .replacingOccurrences(of: "\u{201C}", with: "") // U+201C left "
             .replacingOccurrences(of: "\u{201D}", with: "") // U+201D right "
             .replacingOccurrences(of: "\u{2018}", with: "") // U+2018 left '
             .replacingOccurrences(of: "\u{2019}", with: "") // U+2019 right '
-        // Collapse runs of whitespace that the strip can produce.
-        let collapsed = stripped
-            .replacingOccurrences(
-                of: "\\s+",
-                with: " ",
-                options: .regularExpression
+
+        // 2. Symbol / abbreviation expansion. Order matters — do
+        // the multi-char patterns before the single-char ones so
+        // `°C` becomes "degrees" not "degrees C".
+        out = out
+            .replacingOccurrences(of: "°C", with: " degrees")
+            .replacingOccurrences(of: "°F", with: " degrees")
+            .replacingOccurrences(of: "°",  with: " degrees")
+            .replacingOccurrences(of: "%",  with: " percent")
+            .replacingOccurrences(of: "&",  with: " and ")
+
+        // Whole-word abbreviations — use word-boundary regex so
+        // we don't munge embedded characters in URLs etc.
+        let wordReplacements: [(pattern: String, replacement: String)] = [
+            ("\\bkm/h\\b",  "kilometres per hour"),
+            ("\\bkph\\b",   "kilometres per hour"),
+            ("\\bkmph\\b",  "kilometres per hour"),
+            ("\\bmph\\b",   "miles per hour"),
+            ("\\bm/s\\b",   "metres per second"),
+        ]
+        for (pat, rep) in wordReplacements {
+            out = out.replacingOccurrences(
+                of: pat,
+                with: rep,
+                options: [.regularExpression, .caseInsensitive]
             )
-        return collapsed.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        // Collapse runs of whitespace introduced by the
+        // replacements above.
+        out = out.replacingOccurrences(
+            of: "\\s+",
+            with: " ",
+            options: .regularExpression
+        )
+        return out.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     public static func stripFencedJSONBlocks(from text: String) -> String {

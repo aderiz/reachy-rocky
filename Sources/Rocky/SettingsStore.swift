@@ -23,7 +23,7 @@ final class SettingsStore {
     /// once instead of being permanently pinned to whatever they had
     /// when they first launched. Subsequent app launches honour any
     /// user customisation beyond the migration.
-    static let currentPersonaVersion: Int = 3
+    static let currentPersonaVersion: Int = 4
 
     /// Apple Vision feature-print accept threshold for face recognition.
     /// Smaller = stricter; range typically 0.4 (very tight) – 1.5 (very
@@ -229,6 +229,14 @@ final class SettingsStore {
       see sun.\""})`. Quote characters are pronounced as awkward pauses
       by the TTS engine. No matter how the chat history shows previous
       replies, the next call's `text` is unquoted.
+    - The `say` text MUST be in SPOKEN form. Tools return data with
+      symbols and abbreviations (`17°C`, `15 kph`, `60%`); never
+      pass those through to `say`. Convert to spoken form first:
+      "seventeen degrees" not "17°C", "fifteen kilometres per hour"
+      not "15 kph", "sixty percent" not "60%". TTS reads symbols
+      character-by-character — `°` becomes "degree symbol", `kph`
+      becomes "kuh-puh-huh". A `narrative` field, when the tool
+      provides one, is already speech-friendly and safe to quote.
     """
 
     private enum Keys {

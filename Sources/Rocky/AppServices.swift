@@ -1883,7 +1883,13 @@ final class AppServices {
                 "required": .array([.string("text")]),
             ]),
             handler: { [weak self] args in
-                let text = args.asObject?["text"]?.asString ?? ""
+                let raw = args.asObject?["text"]?.asString ?? ""
+                // Normalise every `say` text at the boundary —
+                // strip quotes, expand `°C` / `kph` / `%` to spoken
+                // form. Tools that don't pre-bake speech-friendly
+                // strings, and LLMs that paraphrase with
+                // abbreviations, both flow through this gate.
+                let text = CognitionEngine.cleanupForTTS(raw)
                 guard !text.isEmpty else {
                     return .object(["ok": .bool(false),
                                     "error": .string("empty text")])

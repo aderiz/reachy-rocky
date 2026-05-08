@@ -180,11 +180,12 @@ enum WeatherTool {
             .trimmingCharacters(in: .whitespaces) ?? name
 
         // Pre-baked one-sentence narrative the LLM can quote or
-        // paraphrase. Persona transforms still apply ("Rocky see
-        // sun. Twelve degrees. Warm.") — this just gives the LLM
-        // a clean human starting point instead of asking it to
-        // assemble a sentence from raw numerics.
-        let narrative = "\(temp)°C and \(conditions) in \(shortName)."
+        // paraphrase. Speech-friendly already — no degree symbol,
+        // no `kph` abbreviation — so a TTS engine reading it
+        // verbatim sounds natural. Persona transforms still apply
+        // ("Rocky see sun. Twelve degrees. Warm.") if the model
+        // paraphrases.
+        let narrative = "\(temp) degrees and \(conditions) in \(shortName). Wind \(wind) kilometres per hour."
 
         // Hourly: from `now` forward, capped at the next 6 entries
         // (the LLM never needs a full 24-hour breakdown to answer
