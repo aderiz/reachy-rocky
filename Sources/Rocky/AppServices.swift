@@ -1000,13 +1000,24 @@ final class AppServices {
                 voiceErrorMessage = nil
                 // Periodic poll so the VU meter updates without
                 // bouncing through the audio thread on every frame.
-                // Captured `useRobot` snapshot for this listen session.
+                // Read `useRobot` fresh each iteration rather than
+                // capturing the toggle-time value — if the user
+                // changes `micSource` in Settings during the
+                // session, the VU meter and Health row should
+                // follow the new source instead of staying frozen
+                // on the old one. (Switching the actual mic input
+                // source mid-session still requires a toggle
+                // off-then-on cycle; this just makes the diagnostic
+                // mirrors honest about which mic is live.)
                 Task { [weak self] in
                     while let self, await MainActor.run(body: { self.micEnabled }) {
-                        let rms: Float = useRobot
+                        let liveUseRobot = await MainActor.run {
+                            self.settings.micSource == "robot"
+                        }
+                        let rms: Float = liveUseRobot
                             ? await self.robotMic.lastRMS
                             : self.mic.lastRMS
-                        let frameAt: Date? = useRobot
+                        let frameAt: Date? = liveUseRobot
                             ? await self.robotMic.lastFrameAt
                             : self.mic.lastFrameAt
                         await MainActor.run {

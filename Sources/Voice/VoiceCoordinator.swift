@@ -91,8 +91,16 @@ public actor VoiceCoordinator {
         self.config = config
         self.vad = vad
         var c: AsyncStream<Output>.Continuation!
+        // Unbounded buffer — this stream carries sequence-sensitive
+        // state events (`.windowOpened` / `.windowClosed`)
+        // alongside transcript events. A `.bufferingNewest`
+        // policy could drop a `.windowClosed` while delivering
+        // a later `.windowOpened`, leaving AppServices'
+        // `conversationOpenUntil` mirror inconsistent with the
+        // wake filter's actual state. Volumes are low (a few
+        // events per turn); unbounded is safe.
         self.outputs = AsyncStream<Output>(
-            bufferingPolicy: .bufferingNewest(64)
+            bufferingPolicy: .unbounded
         ) { cont in c = cont }
         self.outputsContinuation = c
     }
@@ -212,7 +220,16 @@ public actor VoiceCoordinator {
         let started = segmentStart ?? Date()
         pendingSegment.removeAll(keepingCapacity: true)
         segmentStart = nil
-        if forceEnd { vad.reset() }
+        // Don't reset the VAD on a force-end. The previous code
+        // did, which forced `inSpeech` back to false and required
+        // another `minSpeechFrames` of accumulation before the
+        // next frame would be captured — re-introducing the C1
+        // dropout mid-utterance every time the segment cap was
+        // hit. The user is still talking; treat the cap as an
+        // artificial slice, not a real silence event. The pump
+        // continues feeding `pendingSegment` from the very next
+        // frame because `vad.inSpeech` stays true.
+        _ = forceEnd
 
         // STT is single-in-flight (Apple Speech doesn't pipeline a
         // second request well). Earlier behaviour was "drop new

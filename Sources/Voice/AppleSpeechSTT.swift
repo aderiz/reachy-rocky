@@ -16,10 +16,19 @@ public actor AppleSpeechSTT: STTEngine {
         case ready
     }
 
-    private let recognizer: SFSpeechRecognizer?
+    /// Recogniser is `var` (not `let`) so a per-call retry can
+    /// upgrade nil → real instance once the locale's offline
+    /// model finishes downloading. macOS Sequoia downloads
+    /// Speech assets in the background after a clean install;
+    /// without the retry, a first-launch user with `en-GB` (or
+    /// any locale Apple downloads on demand) gets a permanently
+    /// `.unavailable` STT until they relaunch.
+    private var recognizer: SFSpeechRecognizer?
+    private let localeIdentifier: String
     public private(set) var status: Status
 
     public init(localeIdentifier: String = "en-US") {
+        self.localeIdentifier = localeIdentifier
         let locale = Locale(identifier: localeIdentifier)
         self.recognizer = SFSpeechRecognizer(locale: locale)
         if self.recognizer == nil {
@@ -28,6 +37,25 @@ public actor AppleSpeechSTT: STTEngine {
             let auth = SFSpeechRecognizer.authorizationStatus()
             self.status = (auth == .authorized) ? .ready : .unauthorized(auth)
         }
+    }
+
+    /// Re-attempt to build the recogniser if we don't have one
+    /// yet. Cheap; called per-`transcribe` so a first-launch
+    /// user whose locale-data was still downloading at init
+    /// time gets STT as soon as the assets land.
+    private func ensureRecognizer() -> SFSpeechRecognizer? {
+        if let existing = recognizer { return existing }
+        let locale = Locale(identifier: localeIdentifier)
+        let fresh = SFSpeechRecognizer(locale: locale)
+        if fresh != nil {
+            recognizer = fresh
+            // Promote status if auth is good — the only thing
+            // gating us before was the missing recogniser.
+            if SFSpeechRecognizer.authorizationStatus() == .authorized {
+                status = .ready
+            }
+        }
+        return fresh
     }
 
     /// Request user authorization. Returns the resolved status. macOS shows
@@ -56,7 +84,7 @@ public actor AppleSpeechSTT: STTEngine {
     }
 
     public func transcribe(samples: [Float], at sampleRate: Int) async throws -> Transcript {
-        guard let recognizer else {
+        guard let recognizer = ensureRecognizer() else {
             throw VoiceError.sttUnavailable("no recognizer for current locale")
         }
         guard case .ready = status else {
@@ -65,6 +93,11 @@ public actor AppleSpeechSTT: STTEngine {
 
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = false
+        // Re-evaluate per-call rather than caching at init.
+        // `supportsOnDeviceRecognition` flips when Speech finishes
+        // downloading the offline model in the background; setting
+        // requiresOnDeviceRecognition = true with the model not
+        // yet available silently fails.
         request.requiresOnDeviceRecognition = recognizer.supportsOnDeviceRecognition
 
         guard let format = AVAudioFormat(

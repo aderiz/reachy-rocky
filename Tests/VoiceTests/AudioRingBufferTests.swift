@@ -14,13 +14,17 @@ struct AudioRingBufferTests {
         #expect(out == input)
     }
 
-    @Test("write past capacity drops oldest samples")
-    func overflowDropsOldest() {
+    @Test("write past capacity drops newest samples (preserves wake word)")
+    func overflowDropsNewest() {
+        // Drop-newest policy: the oldest samples in a full buffer
+        // typically contain the start of an utterance (including
+        // the wake word), so we'd rather lose the tail of an
+        // over-long utterance than the leading words.
         let rb = AudioRingBuffer(capacity: 4)
         var input: [Float] = [1, 2, 3, 4, 5, 6]
         input.withUnsafeBufferPointer { rb.write($0) }
         let drained = rb.drain()
-        #expect(drained == [3, 4, 5, 6])
+        #expect(drained == [1, 2, 3, 4])
         #expect(rb.droppedSamples == 2)
     }
 

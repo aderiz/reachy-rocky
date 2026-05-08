@@ -4,8 +4,18 @@ import Foundation
 ///
 /// `MicService` is the single producer (audio render thread); the VAD/STT
 /// pipeline is the single consumer. Backpressure: when the buffer is full,
-/// oldest samples are dropped and a counter increments — the dashboard can
-/// surface the drop rate.
+/// NEWEST samples are dropped and a counter increments — the dashboard
+/// can surface the drop rate.
+///
+/// "Drop newest" rather than the more obvious "drop oldest" because the
+/// oldest samples in a full buffer typically contain the START of the
+/// user's current utterance (including the wake word). Dropping those
+/// to make room for new audio is exactly the wrong tradeoff: STT then
+/// sees a transcript missing its leading words, and the wake filter
+/// misses the match. With "drop newest", we lose the tail of an
+/// over-long utterance instead — STT still sees the wake word, the
+/// turn dispatches, the LLM gets a slightly truncated command. Far
+/// less destructive than losing the wake word entirely.
 public final class AudioRingBuffer: @unchecked Sendable {
     private var storage: [Float]
     private let capacity: Int
@@ -27,14 +37,16 @@ public final class AudioRingBuffer: @unchecked Sendable {
         return count
     }
 
-    /// Produce: append samples; drop oldest if full.
+    /// Produce: append samples; drop NEWEST (this batch's tail) if
+    /// full. Preserves the start of the current utterance so the
+    /// wake word survives — see the type-level comment for the
+    /// "why drop-newest is the right policy" rationale.
     public func write(_ samples: UnsafeBufferPointer<Float>) {
         lock.lock(); defer { lock.unlock() }
         for s in samples {
             if count == capacity {
-                tail = (tail + 1) % capacity
-                count -= 1
                 droppedSamples += 1
+                continue
             }
             storage[head] = s
             head = (head + 1) % capacity

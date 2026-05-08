@@ -110,7 +110,10 @@ public actor WakeFilter {
 
     private func hasStopPhrase(_ transcript: String) -> Bool {
         let lc = transcript.lowercased()
-        return config.stopPhrases.contains { lc.contains($0) }
+        // Lowercase BOTH sides — defensive against a configured
+        // phrase like "Stop Listening" that would otherwise never
+        // match a lowercase transcript.
+        return config.stopPhrases.contains { lc.contains($0.lowercased()) }
     }
 
     /// Address-pattern wake match.
@@ -140,14 +143,14 @@ public actor WakeFilter {
         let needle = name.lowercased()
         let articles: Set<String> = ["the", "a", "an", "this", "that"]
 
-        // Apple Speech regularly mishears "rocky" as one of these spellings
-        // depending on accent and noise. Accept any of them as the wake
-        // word so a clean utterance doesn't get dropped on a transcription
-        // wobble. Only kicks in when the configured wakeName is "rocky";
-        // for any other name we stay strict.
+        // Apple Speech regularly mishears "rocky" as one of these
+        // spellings on noisy mics. Trimmed from the previous list
+        // (`rockie`/`roque` are common standalone names that fired
+        // false positives when other people in the room were
+        // mentioned by name) to just the homophone variants.
         let acceptables: Set<String>
         if needle == "rocky" {
-            acceptables = ["rocky", "rockey", "rocki", "rockie", "rockee", "roque"]
+            acceptables = ["rocky", "rockey", "rocki"]
         } else {
             acceptables = [needle]
         }
@@ -156,12 +159,24 @@ public actor WakeFilter {
             .lowercased()
             .components(separatedBy: CharacterSet.alphanumerics.inverted)
             .filter { !$0.isEmpty }
-        let firstThree = Array(tokens.prefix(3))
-        for (i, t) in firstThree.enumerated() {
+        // Look 5 tokens deep instead of 3 so vocative-anywhere
+        // patterns like "hi there my friend Rocky" match. The
+        // article-prefix guard still rejects "the rocky road" /
+        // "a rocky climb" → those legitimately aren't addressing
+        // the bot.
+        let lookahead = Array(tokens.prefix(5))
+        for (i, t) in lookahead.enumerated() {
             guard acceptables.contains(t) else { continue }
             if i == 0 { return true }
-            let prev = firstThree[i - 1]
-            if articles.contains(prev) { return false }
+            let prev = lookahead[i - 1]
+            // Article check is per-position. The previous code did
+            // `return false` on an article match, abandoning the
+            // rest of the prefix — so `"the rocky rocky go"` was
+            // rejected even though the SECOND "rocky" (with prev
+            // = "rocky", not an article) was a valid match. Now
+            // an article-prefixed hit is just SKIPPED; later
+            // positions still get a chance.
+            if articles.contains(prev) { continue }
             return true
         }
         return false
