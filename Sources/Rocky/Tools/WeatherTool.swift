@@ -20,7 +20,7 @@ enum WeatherTool {
     static func register(in registry: ToolRegistry, urlSession: URLSession = .shared) async {
         await registry.register(
             name: "get_weather",
-            description: "Get current weather and a short forecast. With no `location` argument the Mac's current location is used (subject to system Location permission). Otherwise pass a city/place name (\"Manchester\") or a literal lat,lon (\"40.7,-74.0\"). Returns temperature in Celsius, plain-English conditions, wind speed, humidity, and the next 24 hourly forecasts.",
+            description: "Get current weather and a short forecast. With no `location` argument the Mac's current location is used (subject to system Location permission). Otherwise pass a city/place name (\"Manchester\") or a literal lat,lon (\"40.7,-74.0\"). Returns a `narrative` field with a one-sentence summary you can quote or paraphrase, plus structured fields (temp_c, conditions, wind_kph, humidity, is_day) and 6 hourly forecasts. All numerics are rounded to whole units so they read naturally through TTS.",
             parameters: .object([
                 "type": .string("object"),
                 "properties": .object([
@@ -162,38 +162,67 @@ enum WeatherTool {
             throw WeatherError.emptyForecast
         }
 
-        // Hourly: from `now` forward, capped at the next 24 entries.
-        let isoFmt = ISO8601DateFormatter()
-        isoFmt.formatOptions = [.withInternetDateTime]
+        // All numerics rounded to whole units before they hit the LLM:
+        // temp / wind / humidity are spoken aloud, and a TTS engine
+        // narrating "twelve point five degrees and fourteen point two
+        // kilometres an hour" is grating. Hourly times become local
+        // "HH:mm" strings (the LLM was reading ISO timestamps like
+        // "two-thousand-twenty-six-dash-zero-five..." literally).
+        let temp = Int(cur.temperature_2m.rounded())
+        let wind = Int(cur.wind_speed_10m.rounded())
+        let humidity = cur.relative_humidity_2m
+        let conditions = describe(code: cur.weather_code)
+
+        // Trim the city name to the first comma — geocoding returns
+        // "Manchester, England, United Kingdom" but the LLM only
+        // needs "Manchester" to phrase a natural reply.
+        let shortName = name.split(separator: ",").first.map(String.init)?
+            .trimmingCharacters(in: .whitespaces) ?? name
+
+        // Pre-baked one-sentence narrative the LLM can quote or
+        // paraphrase. Persona transforms still apply ("Rocky see
+        // sun. Twelve degrees. Warm.") — this just gives the LLM
+        // a clean human starting point instead of asking it to
+        // assemble a sentence from raw numerics.
+        let narrative = "\(temp)°C and \(conditions) in \(shortName)."
+
+        // Hourly: from `now` forward, capped at the next 6 entries
+        // (the LLM never needs a full 24-hour breakdown to answer
+        // "is it going to rain?", and a longer list bloats the
+        // prompt).
         let now = Date()
         var hourly: [JSONValue] = []
         if let h = decoded.hourly {
             // Open-Meteo time strings are local without offset
-            // ("2026-05-08T13:00") — parse with the matching formatter.
+            // ("2026-05-08T13:00"); parse with the matching formatter.
             let hourFmt = DateFormatter()
             hourFmt.locale = Locale(identifier: "en_US_POSIX")
             hourFmt.dateFormat = "yyyy-MM-dd'T'HH:mm"
             hourFmt.timeZone = TimeZone(identifier: decoded.timezone ?? "UTC")
+            let outFmt = DateFormatter()
+            outFmt.locale = Locale(identifier: "en_US_POSIX")
+            outFmt.dateFormat = "HH:mm"
+            outFmt.timeZone = hourFmt.timeZone
             for i in 0..<min(h.time.count, h.temperature_2m.count, h.weather_code.count) {
                 guard let parsed = hourFmt.date(from: h.time[i]),
                       parsed > now,
-                      hourly.count < 24 else { continue }
+                      hourly.count < 6 else { continue }
                 hourly.append(.object([
-                    "time":       .string(isoFmt.string(from: parsed)),
-                    "temp_c":     .number(h.temperature_2m[i]),
+                    "time":       .string(outFmt.string(from: parsed)),
+                    "temp_c":     .number(Double(Int(h.temperature_2m[i].rounded()))),
                     "conditions": .string(describe(code: h.weather_code[i])),
                 ]))
             }
         }
 
         return .object([
-            "location":   .string(name),
-            "temp_c":     .number(cur.temperature_2m),
-            "conditions": .string(describe(code: cur.weather_code)),
-            "wind_kph":   .number(cur.wind_speed_10m),
-            "humidity":   .number(Double(cur.relative_humidity_2m)),
+            "narrative":  .string(narrative),
+            "location":   .string(shortName),
+            "temp_c":     .number(Double(temp)),
+            "conditions": .string(conditions),
+            "wind_kph":   .number(Double(wind)),
+            "humidity":   .number(Double(humidity)),
             "is_day":     .bool(cur.is_day == 1),
-            "timezone":   .string(decoded.timezone ?? ""),
             "hourly":     .array(hourly),
         ])
     }
