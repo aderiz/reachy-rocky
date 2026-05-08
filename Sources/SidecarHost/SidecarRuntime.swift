@@ -14,7 +14,33 @@ public actor SidecarRuntime: Sidecar {
     public nonisolated let name: String
     public nonisolated let manifest: SidecarManifest
     public var state: SidecarState { _state }
-    public nonisolated let events: AsyncStream<SidecarOutboundEvent>
+
+    /// Multicast event source. Each access returns a fresh
+    /// `AsyncStream` subscribed to a single internal broadcast point;
+    /// every emitted event is delivered to every active subscriber in
+    /// order. Supports the supervisor watcher, the per-sidecar Swift
+    /// service (e.g. `RobotMicService`), and any AppServices mirror
+    /// listening for state transitions — all simultaneously.
+    ///
+    /// Single-consumer behaviour was the root cause of the mic stall
+    /// loop on 2026-05-08: supervisor and `RobotMicService` were
+    /// racing for the same `AsyncStream`, so `.state(.failing)` and
+    /// `.state(.ready)` events landed unpredictably and either the
+    /// restart never fired or the new sidecar never got
+    /// `start_recording` re-issued.
+    public nonisolated var events: AsyncStream<SidecarOutboundEvent> {
+        AsyncStream(bufferingPolicy: .bufferingNewest(256)) { continuation in
+            let id = UUID()
+            Task { [weak self] in
+                await self?.addSubscriber(id: id, continuation: continuation)
+            }
+            continuation.onTermination = { [weak self] _ in
+                Task { [weak self] in
+                    await self?.removeSubscriber(id: id)
+                }
+            }
+        }
+    }
 
     // MARK: - Internals
 
@@ -28,10 +54,10 @@ public actor SidecarRuntime: Sidecar {
     private var stderrBuffer = Data()
 
     private var _state: SidecarState = .stopped {
-        didSet { eventsContinuation.yield(.state(_state)) }
+        didSet { emit(.state(_state)) }
     }
 
-    private let eventsContinuation: AsyncStream<SidecarOutboundEvent>.Continuation
+    private var subscribers: [UUID: AsyncStream<SidecarOutboundEvent>.Continuation] = [:]
 
     /// `id` → continuation expecting a single envelope.
     private var pending: [String: PendingRequest] = [:]
@@ -50,12 +76,28 @@ public actor SidecarRuntime: Sidecar {
         self.manifest = manifest
         self.resolver = resolver
         self.logBus = logBus
+    }
 
-        var ec: AsyncStream<SidecarOutboundEvent>.Continuation!
-        self.events = AsyncStream<SidecarOutboundEvent>(
-            bufferingPolicy: .bufferingNewest(256)
-        ) { c in ec = c }
-        self.eventsContinuation = ec
+    private func addSubscriber(
+        id: UUID,
+        continuation: AsyncStream<SidecarOutboundEvent>.Continuation
+    ) {
+        subscribers[id] = continuation
+    }
+
+    private func removeSubscriber(id: UUID) {
+        subscribers[id]?.finish()
+        subscribers.removeValue(forKey: id)
+    }
+
+    /// Broadcast an event to every active subscriber. Yielding to an
+    /// `AsyncStream.Continuation` is non-blocking and Sendable-safe,
+    /// so this is fine to call from inside a `didSet` or any
+    /// actor-isolated method.
+    private func emit(_ event: SidecarOutboundEvent) {
+        for cont in subscribers.values {
+            cont.yield(event)
+        }
     }
 
     // MARK: - Sidecar API
@@ -233,7 +275,7 @@ public actor SidecarRuntime: Sidecar {
                 await logBus.publish(.sidecarLog(
                     sidecar: name, level: .info, message: text, fields: ["stream": "stderr"]
                 ))
-                eventsContinuation.yield(.log(level: .info, message: text, fields: ["stream": "stderr"]))
+                emit(.log(level: .info, message: text, fields: ["stream": "stderr"]))
             }
         }
     }
@@ -265,11 +307,11 @@ public actor SidecarRuntime: Sidecar {
                 message: "event \(evName)",
                 fields: ["payload_bytes": "\(payload.count)"]
             ))
-            eventsContinuation.yield(.event(name: evName, payload: payload))
+            emit(.event(name: evName, payload: payload))
         case .log(let level, let message, let fields):
             let lvl = TelemetryEvent.LogLevel(rawValue: level) ?? .info
             await logBus.publish(.sidecarLog(sidecar: name, level: lvl, message: message, fields: fields))
-            eventsContinuation.yield(.log(level: lvl, message: message, fields: fields))
+            emit(.log(level: lvl, message: message, fields: fields))
         case .unknown(let raw):
             let preview = String(data: raw.prefix(120), encoding: .utf8) ?? ""
             await logBus.publish(.error(
