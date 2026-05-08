@@ -357,8 +357,26 @@ struct FirstRunOverlay: View {
     /// to switch the primary button label from "Skip for now" to a
     /// confident "Continue."
     private var permissionsAllResolved: Bool {
-        ![micStatus, speechStatus, calendarStatus, locationStatus]
-            .contains(where: \.isUnknown)
+        !relevantStatuses.contains(where: \.isUnknown)
+    }
+
+    /// The permissions actually shown on the current screen — `mic`
+    /// is excluded when Rocky is configured to use the robot's
+    /// microphone over WebRTC.
+    private var relevantStatuses: [PermissionStatus] {
+        var statuses: [PermissionStatus] = [speechStatus, calendarStatus, locationStatus]
+        if !usingRobotMic { statuses.insert(micStatus, at: 0) }
+        return statuses
+    }
+
+    private func spelledOut(_ n: Int) -> String {
+        switch n {
+        case 1: return "one"
+        case 2: return "two"
+        case 3: return "three"
+        case 4: return "four"
+        default: return String(n)
+        }
     }
 
     private var primaryDisabled: Bool {
@@ -392,23 +410,35 @@ struct FirstRunOverlay: View {
     /// random later when Rocky tries to listen / read calendar / etc.
     /// The "Grant all" button fires the requests sequentially because
     /// macOS only shows one TCC prompt at a time.
+    /// True when Rocky is configured to read audio from the bot's
+    /// built-in mic (over WebRTC). In that mode the Mac microphone
+    /// is never opened, so we don't need to ask for the permission
+    /// — SFSpeechRecognizer transcribes whatever PCM buffer we
+    /// hand it, regardless of source.
+    private var usingRobotMic: Bool {
+        services.settings.micSource == "robot"
+    }
+
     private var permissionsStep: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        let total = usingRobotMic ? 3 : 4
+        return VStack(alignment: .leading, spacing: 14) {
             Text("Grant access.")
                 .font(.title.weight(.semibold))
-            Text("Rocky needs four permissions to do his job. macOS shows a system prompt for each one — that's mandatory and Apple doesn't let apps bundle them. They're listed here so you only deal with them once.")
+            Text("Rocky needs \(spelledOut(total)) permissions to do his job. macOS shows a system prompt for each one — that's mandatory and Apple doesn't let apps bundle them. They're listed here so you only deal with them once.")
                 .font(.body)
                 .foregroundStyle(.primary)
 
             VStack(spacing: 8) {
-                permissionRow(
-                    icon: "mic.fill",
-                    title: "Microphone",
-                    rationale: "So Rocky can hear you say his name.",
-                    status: micStatus,
-                    settingsAnchor: "Privacy_Microphone",
-                    grant: { await requestMic() }
-                )
+                if !usingRobotMic {
+                    permissionRow(
+                        icon: "mic.fill",
+                        title: "Microphone",
+                        rationale: "So Rocky can hear you say his name.",
+                        status: micStatus,
+                        settingsAnchor: "Privacy_Microphone",
+                        grant: { await requestMic() }
+                    )
+                }
                 permissionRow(
                     icon: "waveform",
                     title: "Speech recognition",
@@ -465,9 +495,9 @@ struct FirstRunOverlay: View {
     }
 
     private var allGrantedHint: String {
-        let total = 4
-        let granted = [micStatus, speechStatus, calendarStatus, locationStatus]
-            .filter { $0 == .granted }.count
+        let statuses = relevantStatuses
+        let total = statuses.count
+        let granted = statuses.filter { $0 == .granted }.count
         if granted == total { return "All set." }
         if !permissionsAllResolved { return "" }
         return "\(granted) of \(total) granted — you can adjust the rest later in System Settings."
@@ -627,10 +657,10 @@ struct FirstRunOverlay: View {
     /// behind the user's first decision.
     private func grantAll() async {
         await MainActor.run { requestingAll = true }
-        if micStatus == .unknown      { await requestMic() }
-        if speechStatus == .unknown   { await requestSpeech() }
-        if calendarStatus == .unknown { await requestCalendar() }
-        if locationStatus == .unknown { await requestLocation() }
+        if !usingRobotMic, micStatus == .unknown { await requestMic() }
+        if speechStatus == .unknown              { await requestSpeech() }
+        if calendarStatus == .unknown            { await requestCalendar() }
+        if locationStatus == .unknown            { await requestLocation() }
         await MainActor.run { requestingAll = false }
     }
 
