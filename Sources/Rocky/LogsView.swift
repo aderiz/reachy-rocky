@@ -27,6 +27,7 @@ struct LogsView: View {
             if !enabled {
                 offByDefaultCallout
             } else {
+                densitySparkline
                 controlsRow
                 searchField
                 Divider()
@@ -36,6 +37,40 @@ struct LogsView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .onChange(of: enabled) { _, on in
             if on { startStreaming() } else { stopStreaming() }
+        }
+    }
+
+    // MARK: - Density sparkline
+
+    /// Last-30-seconds traffic. Each cell = one second; height is the
+    /// event count in that second normalised to the 30-second peak.
+    /// Lets engineers see traffic spikes at a glance instead of
+    /// reading row timestamps to figure out "did llm chunks just
+    /// burst?".
+    private var densitySparkline: some View {
+        let bins = SecondBucket.compute(from: rows)
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("LAST 30 SEC")
+                    .font(.caption2.weight(.semibold))
+                    .tracking(0.6)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("\(bins.totalCount) events")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            HStack(alignment: .bottom, spacing: 1) {
+                ForEach(bins.bins) { bin in
+                    SecondBar(bin: bin, peak: bins.peak)
+                        .frame(maxWidth: .infinity)
+                }
+            }
+            .frame(height: 24)
+            .padding(.vertical, 3)
+            .padding(.horizontal, 6)
+            .background(.regularMaterial,
+                        in: RoundedRectangle(cornerRadius: 6, style: .continuous))
         }
     }
 
@@ -325,6 +360,55 @@ struct LogsView: View {
                         "ERROR \(scope): \(message)",
                         recoverable ? "(recoverable)" : "")
             }
+        }
+    }
+
+    // MARK: - Second-bucket model + bar
+
+    private struct SecondBucket: Identifiable {
+        let id: Int
+        let count: Int
+
+        static func compute(from rows: [Row]) -> (bins: [SecondBucket], peak: Int, totalCount: Int) {
+            let now = Date()
+            var counts = [Int: Int](minimumCapacity: 30)
+            for r in rows {
+                let dt = now.timeIntervalSince(r.timestamp)
+                let secAgo = Int(dt)
+                guard secAgo >= 0 && secAgo < 30 else { continue }
+                counts[secAgo, default: 0] += 1
+            }
+            let peak = counts.values.max() ?? 0
+            // Oldest left, newest right.
+            let bins = (0..<30).reversed().map { idx in
+                SecondBucket(id: idx, count: counts[idx] ?? 0)
+            }
+            let total = counts.values.reduce(0, +)
+            return (bins, peak, total)
+        }
+    }
+
+    private struct SecondBar: View {
+        let bin: SecondBucket
+        let peak: Int
+
+        var body: some View {
+            GeometryReader { geo in
+                let h = geo.size.height
+                let normalized: CGFloat = peak > 0
+                    ? CGFloat(bin.count) / CGFloat(peak)
+                    : 0
+                let height = max(2, h * normalized)
+                VStack(spacing: 0) {
+                    Spacer(minLength: 0)
+                    RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                        .fill(bin.count > 0
+                              ? AnyShapeStyle(.tint)
+                              : AnyShapeStyle(.tertiary))
+                        .frame(height: height)
+                }
+            }
+            .help("\(bin.id)s ago — \(bin.count) event\(bin.count == 1 ? "" : "s")")
         }
     }
 

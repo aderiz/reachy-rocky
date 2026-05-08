@@ -23,10 +23,32 @@ struct StatusView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             headerRow
+            subsystemStrip
             issuesSection
             healthySection
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    // MARK: - Subsystem strip — visual hero
+
+    /// Six tiles, one per Rocky subsystem. Tinted by status so the
+    /// user sees "is Rocky whole?" at a glance — broken parts stand
+    /// out without needing to read the rows below. Each tile is a
+    /// button that scrolls the issues list to that subsystem.
+    private var subsystemStrip: some View {
+        let entries = allRows
+        return HStack(spacing: 6) {
+            ForEach(entries) { entry in
+                SubsystemTile(entry: entry)
+                    .frame(maxWidth: .infinity)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 14)
+        .frame(maxWidth: .infinity)
+        .background(.regularMaterial,
+                    in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 
     // MARK: - Header
@@ -160,7 +182,7 @@ struct StatusView: View {
 
     // MARK: - Row data model
 
-    private struct HealthRow: Identifiable {
+    fileprivate struct HealthRow: Identifiable {
         let id: String
         let title: String
         let subtitle: String
@@ -169,12 +191,12 @@ struct StatusView: View {
         let action: HealthAction?
     }
 
-    private struct HealthAction {
+    fileprivate struct HealthAction {
         let label: String
         let run: () -> Void
     }
 
-    private enum HealthState {
+    fileprivate enum HealthState {
         case ok
         case warn
         case bad
@@ -208,7 +230,7 @@ struct StatusView: View {
 
     // MARK: - Row computation
 
-    private var rowsByCategory: [(String, [HealthRow])] {
+    fileprivate var rowsByCategory: [(String, [HealthRow])] {
         [
             ("Connections", [robotRow, llmRow]),
             ("Audio",       [micRow, sttRow]),
@@ -216,7 +238,7 @@ struct StatusView: View {
         ]
     }
 
-    private var allRows: [HealthRow] {
+    fileprivate var allRows: [HealthRow] {
         rowsByCategory.flatMap(\.1)
     }
 
@@ -375,6 +397,52 @@ struct StatusView: View {
         }
         return HealthRow(id: id, title: title, subtitle: subtitle,
                          icon: icon, state: healthState, action: nil)
+    }
+}
+
+// MARK: - Subsystem tile
+
+/// One of six subsystem icons in the Health tab's hero strip. Tinted
+/// by status — broken systems pop, healthy ones recede. Click bounces
+/// the row in the list (planned for a later cross-panel polish pass;
+/// for now the click is a no-op anchor for the affordance).
+private struct SubsystemTile: View {
+    let entry: StatusView.HealthRow
+
+    var body: some View {
+        VStack(spacing: 6) {
+            ZStack {
+                Circle()
+                    .fill(entry.state.color.opacity(0.16))
+                    .frame(width: 38, height: 38)
+                Image(systemName: entry.icon)
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(entry.state.color)
+            }
+            Text(shortLabel)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .frame(maxWidth: .infinity)
+        .help(entry.subtitle)
+        .accessibilityLabel("\(entry.title): \(entry.subtitle)")
+    }
+
+    /// Five-char-or-less label so six tiles fit comfortably at the
+    /// inspector's 320pt minimum width.
+    private var shortLabel: String {
+        switch entry.id {
+        case "robot":          return "Body"
+        case "llm":            return "Brain"
+        case "mic":            return "Mic"
+        case "stt":            return "Speech"
+        case "sidecar.face":   return "Eyes"
+        case "sidecar.tts":    return "Voice"
+        case "sidecar.memory": return "Memory"
+        default:               return entry.title
+        }
     }
 }
 
