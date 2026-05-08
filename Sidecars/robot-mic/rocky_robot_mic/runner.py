@@ -75,6 +75,16 @@ class Runner:
         self.last_doa_emit_ts: float = 0.0
         self.last_frame_ts: float = time.monotonic()
         self._watchdog_thread: threading.Thread | None = None
+        self._audio_thread: threading.Thread | None = None
+        # Serialises every operation that mutates `self.mini` or
+        # invokes a multi-step SDK call against it. Without this,
+        # the audio thread (`mini.media.get_audio_sample`), the
+        # main stdin thread (`mini.media.start_recording`), and the
+        # watchdog (`_refresh_media` / `_reconnect_sdk` reassigning
+        # `self.mini`) can observe two different SDK instances mid-
+        # operation. Held briefly during reassignments; not held
+        # during long blocking calls.
+        self._mini_lock = threading.Lock()
 
         # Connect on the MAIN thread before stdin loop. GStreamer's GLib
         # main-loop integration is finicky from a background thread, which
@@ -179,14 +189,18 @@ class Runner:
         """T1 — best-effort `release_media + acquire_media` on the
         bot. Many WebRTC drops recover with a refresh and never need
         a deeper recovery. Returns True if reacquisition succeeded."""
+        with self._mini_lock:
+            mini = self.mini
+        if mini is None:
+            return False
         try:
-            self.mini.release_media()
+            mini.release_media()
             log("info", "media released for refresh")
         except Exception as exc:  # noqa: BLE001
             log("debug", "release_media skipped", error=str(exc))
         time.sleep(0.3)
         try:
-            self.mini.acquire_media()
+            mini.acquire_media()
             log("info", "media reacquired")
             return True
         except Exception as exc:  # noqa: BLE001
@@ -199,44 +213,65 @@ class Runner:
         60 s cooldown) and gives a fresh WebRTC peer without leaving
         stale state on the bot. Returns True if the new SDK
         connected and media was acquired."""
-        # Stop the audio loop so it doesn't hold a stale `self.mini`
-        # reference while we tear down. ~0.5 s is enough — the loop
-        # checks `self.recording` at the top of each iteration.
+        # Stop the current audio loop and wait for it to exit. We
+        # capture the thread reference up-front so we can `join()`
+        # — the previous version's blind 0.5 s sleep meant a slow
+        # audio loop iteration could still be holding the OLD
+        # `self.mini` reference when we reassigned it, and the
+        # restart could spawn a SECOND concurrent audio loop.
         self.recording = False
-        time.sleep(0.5)
+        old_thread = self._audio_thread
+        if old_thread is not None and old_thread.is_alive():
+            old_thread.join(timeout=2.0)
+            if old_thread.is_alive():
+                log("warn", "audio thread did not exit within 2s")
+
+        with self._mini_lock:
+            old_mini = self.mini
+            self.mini = None
+
         try:
-            self.mini.release_media()
+            old_mini.release_media()  # type: ignore[union-attr]
         except Exception as exc:  # noqa: BLE001
             log("debug", "release_media during reconnect failed",
                 error=str(exc))
+
         try:
             from reachy_mini import ReachyMini
-            self.mini = ReachyMini(
+            new_mini = ReachyMini(
                 host=self.host, port=self.port,
                 connection_mode="network", media_backend="webrtc",
                 automatic_body_yaw=False,
                 log_level="WARNING",
             )
-            self.mini.acquire_media()
+            new_mini.acquire_media()
         except Exception as exc:  # noqa: BLE001
             log("error", "SDK reconnect failed", error=str(exc))
             return False
-        # Restart the audio loop with the fresh SDK. The watchdog
-        # is process-scoped so it stays alive — the audio_loop
-        # thread is what restarts.
-        self.last_frame_ts = time.monotonic()
+
+        with self._mini_lock:
+            self.mini = new_mini
+
+        # Grace period — WebRTC re-negotiation can take a few
+        # seconds to produce its first frame. Without offsetting
+        # `last_frame_ts` into the future, the watchdog wakes up
+        # right after reconnect and immediately re-trips T1.
+        self.last_frame_ts = time.monotonic() + 5.0
         self.recording = True
-        threading.Thread(target=self.audio_loop, name="audio",
-                         daemon=True).start()
+        self._audio_thread = threading.Thread(
+            target=self.audio_loop, name="audio", daemon=True
+        )
+        self._audio_thread.start()
         log("info", "SDK reconnected in-process")
         return True
 
     def _stall_watchdog(self) -> None:
-        """Three-tier stall recovery for the audio loop. Soft refresh
-        first (T1), then in-process SDK reconnect (T2), then fatal
-        exit (T3) only if the deeper tiers haven't restored frames.
-        Cooldowns between tiers prevent hammering on a connection
-        that needs more time to recover."""
+        """Three-tier stall recovery for the audio loop. Most invasive
+        tier checked first — `if/elif` so a single watchdog tick
+        never fires multiple tiers (the previous code could T1+T2
+        in the same iteration, with T2 destroying the SDK that T1
+        had just refreshed). Cooldowns prevent hammering on a
+        connection that needs more time to recover."""
         last_refresh = 0.0
         last_reconnect = 0.0
         while not self.shutdown_flag.is_set():
@@ -247,34 +282,35 @@ class Runner:
             now = time.monotonic()
             stalled = now - self.last_frame_ts
 
-            # T1 — soft media refresh.
-            if (stalled > self.STALL_REFRESH_S
-                and now - last_refresh > self.REFRESH_COOLDOWN_S):
-                log("warn", "audio stalled — refreshing media",
+            if stalled > self.STALL_FATAL_S:
+                # T3 — fatal exit with cleanup. Releasing media
+                # before `os._exit` matters: a hard exit without
+                # it leaves a half-connected WebRTC peer on the
+                # bot, and every subsequent respawn inherits the
+                # corruption.
+                log("error", "audio dead — exiting for supervisor restart",
                     stalled_s=f"{stalled:.1f}")
-                self._refresh_media()
-                last_refresh = now
-
-            # T2 — in-process SDK reconnect.
-            if (stalled > self.STALL_RECONNECT_S
-                and now - last_reconnect > self.RECONNECT_COOLDOWN_S):
+                try:
+                    with self._mini_lock:
+                        if self.mini is not None:
+                            self.mini.release_media()
+                except Exception:  # noqa: BLE001
+                    pass
+                os._exit(1)
+            elif (stalled > self.STALL_RECONNECT_S
+                  and now - last_reconnect > self.RECONNECT_COOLDOWN_S):
+                # T2 — in-process SDK reconnect.
                 log("warn", "audio still stalled — reconnecting SDK in-process",
                     stalled_s=f"{stalled:.1f}")
                 self._reconnect_sdk()
                 last_reconnect = now
-
-            # T3 — fatal exit with cleanup. Releasing media before
-            # `os._exit` matters: a hard exit without it leaves a
-            # half-connected WebRTC peer on the bot, and every
-            # subsequent respawn inherits that corruption.
-            if stalled > self.STALL_FATAL_S:
-                log("error", "audio dead — exiting for supervisor restart",
+            elif (stalled > self.STALL_REFRESH_S
+                  and now - last_refresh > self.REFRESH_COOLDOWN_S):
+                # T1 — soft media refresh.
+                log("warn", "audio stalled — refreshing media",
                     stalled_s=f"{stalled:.1f}")
-                try:
-                    self.mini.release_media()
-                except Exception:  # noqa: BLE001
-                    pass
-                os._exit(1)
+                self._refresh_media()
+                last_refresh = now
 
     # --- request dispatch ---
 
@@ -289,8 +325,10 @@ class Runner:
             if method == "start_recording":
                 if not self.recording:
                     self.recording = True
-                    threading.Thread(target=self.audio_loop, name="audio",
-                                     daemon=True).start()
+                    self._audio_thread = threading.Thread(
+                        target=self.audio_loop, name="audio", daemon=True
+                    )
+                    self._audio_thread.start()
                 respond(rid, {"recording": True})
             elif method == "stop_recording":
                 self.recording = False
