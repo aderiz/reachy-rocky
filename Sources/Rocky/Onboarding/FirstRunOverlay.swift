@@ -1,4 +1,7 @@
 import SwiftUI
+import AVFoundation
+import EventKit
+import Speech
 
 /// First-run overlay — Rocky's introduction to a brand-new owner.
 ///
@@ -26,9 +29,14 @@ struct FirstRunOverlay: View {
     @FocusState private var helloFocused: Bool
 
     enum Step: Int, CaseIterable {
-        case meet, connect, brain, hello, face, finish
+        case meet, connect, permissions, brain, hello, face, finish
         var index: Int { rawValue + 1 }
     }
+
+    @State private var micStatus: PermissionStatus = .unknown
+    @State private var speechStatus: PermissionStatus = .unknown
+    @State private var calendarStatus: PermissionStatus = .unknown
+    @State private var requestingAll: Bool = false
 
     var body: some View {
         ZStack {
@@ -98,12 +106,13 @@ struct FirstRunOverlay: View {
     @ViewBuilder
     private var stepContent: some View {
         switch step {
-        case .meet:    meetStep
-        case .connect: connectStep
-        case .brain:   brainStep
-        case .hello:   helloStep
-        case .face:    faceStep
-        case .finish:  finishStep
+        case .meet:        meetStep
+        case .connect:     connectStep
+        case .permissions: permissionsStep
+        case .brain:       brainStep
+        case .hello:       helloStep
+        case .face:        faceStep
+        case .finish:      finishStep
         }
     }
 
@@ -331,13 +340,22 @@ struct FirstRunOverlay: View {
 
     private var primaryLabel: String {
         switch step {
-        case .meet:    return "Wake him up"
-        case .connect: return "Continue"
-        case .brain:   return "Continue"
-        case .hello:   return firstReplyArrived ? "Continue" : "Skip for now"
-        case .face:    return "Maybe later"
-        case .finish:  return "Open the cockpit"
+        case .meet:        return "Wake him up"
+        case .connect:     return "Continue"
+        case .permissions: return permissionsAllResolved ? "Continue" : "Skip for now"
+        case .brain:       return "Continue"
+        case .hello:       return firstReplyArrived ? "Continue" : "Skip for now"
+        case .face:        return "Maybe later"
+        case .finish:      return "Open the cockpit"
         }
+    }
+
+    /// True once every permission has been either granted or explicitly
+    /// denied — i.e. there's nothing left for "Grant all" to do. Used
+    /// to switch the primary button label from "Skip for now" to a
+    /// confident "Continue."
+    private var permissionsAllResolved: Bool {
+        ![micStatus, speechStatus, calendarStatus].contains(where: \.isUnknown)
     }
 
     private var primaryDisabled: Bool {
@@ -362,6 +380,183 @@ struct FirstRunOverlay: View {
         .help("Close this introduction. You can revisit it from Help → Show first run.")
     }
 
+    // MARK: - Permissions step
+
+    /// Single-screen master grant. macOS TCC prompts can't be batched
+    /// into one system dialog — Apple makes each request user-visible
+    /// — but consolidating them onto one onboarding screen means the
+    /// user sees all three at once instead of being interrupted at
+    /// random later when Rocky tries to listen / read calendar / etc.
+    /// The "Grant all" button fires the requests sequentially because
+    /// macOS only shows one TCC prompt at a time.
+    private var permissionsStep: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Grant access.")
+                .font(.title.weight(.semibold))
+            Text("Rocky needs three permissions to do his job. macOS shows a system prompt for each one — that's mandatory and Apple doesn't let apps bundle them. They're listed here so you only deal with them once.")
+                .font(.body)
+                .foregroundStyle(.primary)
+
+            VStack(spacing: 8) {
+                permissionRow(
+                    icon: "mic.fill",
+                    title: "Microphone",
+                    rationale: "So Rocky can hear you say his name.",
+                    status: micStatus,
+                    grant: { await requestMic() }
+                )
+                permissionRow(
+                    icon: "waveform",
+                    title: "Speech recognition",
+                    rationale: "So your words become text Rocky can act on.",
+                    status: speechStatus,
+                    grant: { await requestSpeech() }
+                )
+                permissionRow(
+                    icon: "calendar",
+                    title: "Calendar",
+                    rationale: "So Rocky can answer \"what's on tomorrow?\" without guessing.",
+                    status: calendarStatus,
+                    grant: { await requestCalendar() }
+                )
+            }
+
+            HStack {
+                Button {
+                    Task { await grantAll() }
+                } label: {
+                    if requestingAll {
+                        Label("Asking…", systemImage: "ellipsis")
+                    } else {
+                        Label("Grant all", systemImage: "checkmark.shield")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(requestingAll || permissionsAllResolved)
+                Spacer()
+                Text(allGrantedHint)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .onAppear { refreshStatuses() }
+    }
+
+    private var allGrantedHint: String {
+        let granted = [micStatus, speechStatus, calendarStatus]
+            .filter { $0 == .granted }.count
+        if granted == 3 { return "All set." }
+        if !permissionsAllResolved { return "" }
+        return "\(granted) of 3 granted — you can adjust the rest later in System Settings."
+    }
+
+    @ViewBuilder
+    private func permissionRow(
+        icon: String,
+        title: String,
+        rationale: String,
+        status: PermissionStatus,
+        grant: @escaping @Sendable () async -> Void
+    ) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .font(.title3)
+                .foregroundStyle(.tint)
+                .frame(width: 24)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.callout.weight(.medium))
+                Text(rationale).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Group {
+                switch status {
+                case .granted:
+                    Label("Granted", systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                case .denied:
+                    Label("Denied", systemImage: "xmark.circle.fill")
+                        .foregroundStyle(.orange)
+                case .unknown:
+                    Button("Grant") { Task { await grant() } }
+                        .buttonStyle(.bordered)
+                }
+            }
+            .font(.caption.weight(.medium))
+        }
+        .padding(.vertical, 6)
+        .padding(.horizontal, 10)
+        .background(.background.tertiary,
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    // MARK: - Permission requests
+
+    private func refreshStatuses() {
+        micStatus = currentMicStatus()
+        speechStatus = currentSpeechStatus()
+        calendarStatus = currentCalendarStatus()
+    }
+
+    private func currentMicStatus() -> PermissionStatus {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:                 return .granted
+        case .denied, .restricted:        return .denied
+        case .notDetermined:              return .unknown
+        @unknown default:                 return .unknown
+        }
+    }
+
+    private func currentSpeechStatus() -> PermissionStatus {
+        switch SFSpeechRecognizer.authorizationStatus() {
+        case .authorized:                 return .granted
+        case .denied, .restricted:        return .denied
+        case .notDetermined:              return .unknown
+        @unknown default:                 return .unknown
+        }
+    }
+
+    private func currentCalendarStatus() -> PermissionStatus {
+        switch EKEventStore.authorizationStatus(for: .event) {
+        case .fullAccess, .authorized:    return .granted
+        case .denied, .restricted, .writeOnly: return .denied
+        case .notDetermined:              return .unknown
+        @unknown default:                 return .unknown
+        }
+    }
+
+    private func requestMic() async {
+        let granted = await AVCaptureDevice.requestAccess(for: .audio)
+        await MainActor.run { micStatus = granted ? .granted : .denied }
+    }
+
+    private func requestSpeech() async {
+        let resolved = await services.appleSTT.requestAuthorization()
+        await MainActor.run {
+            speechStatus = (resolved == .ready) ? .granted : .denied
+        }
+    }
+
+    private func requestCalendar() async {
+        do {
+            let store = EKEventStore()
+            let granted = try await store.requestFullAccessToEvents()
+            await MainActor.run { calendarStatus = granted ? .granted : .denied }
+        } catch {
+            await MainActor.run { calendarStatus = .denied }
+        }
+    }
+
+    /// Sequential because macOS only displays one TCC prompt at a
+    /// time; firing them in parallel just means later ones are queued
+    /// behind the user's first decision.
+    private func grantAll() async {
+        await MainActor.run { requestingAll = true }
+        if micStatus == .unknown      { await requestMic() }
+        if speechStatus == .unknown   { await requestSpeech() }
+        if calendarStatus == .unknown { await requestCalendar() }
+        await MainActor.run { requestingAll = false }
+    }
+
     // MARK: - State machine
 
     private func back() {
@@ -377,16 +572,22 @@ struct FirstRunOverlay: View {
             // immediate sense of agency.
             Task { await services.wakeRobot() }
             step = .connect
-        case .connect:  step = .brain
-        case .brain:    step = .hello
-        case .hello:    step = .face
-        case .face:     step = .finish
-        case .finish:   finish(skipped: false)
+        case .connect:     step = .permissions
+        case .permissions: step = .brain
+        case .brain:       step = .hello
+        case .hello:       step = .face
+        case .face:        step = .finish
+        case .finish:      finish(skipped: false)
         }
     }
 
     private func finish(skipped: Bool) {
         services.settings.firstRunCompleted = true
+    }
+
+    enum PermissionStatus: Equatable {
+        case unknown, granted, denied
+        var isUnknown: Bool { self == .unknown }
     }
 
     private func applyHostDraft() {
