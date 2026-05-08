@@ -11,6 +11,37 @@ import Cognition
 /// a coarse time-of-day bucket the persona prompt can use to vary
 /// tone ("morning" / "afternoon" / "evening" / "night").
 enum TimeTool {
+    // Static formatters — initialised once and reused across calls.
+    // The pattern strings never change, so building a fresh
+    // formatter per invocation was pure allocation churn.
+    // ISO8601DateFormatter / DateFormatter are documented
+    // thread-safe for read-only use on macOS 10.9+, but neither is
+    // Sendable in Swift 6 strict mode — `nonisolated(unsafe)` is
+    // the right escape hatch given the actual runtime contract.
+    private nonisolated(unsafe) static let isoFmt: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private nonisolated(unsafe) static let dateFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "EEEE, d MMMM yyyy"
+        return f
+    }()
+    private nonisolated(unsafe) static let timeFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "HH:mm"
+        return f
+    }()
+    private nonisolated(unsafe) static let dayFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "EEEE"
+        return f
+    }()
+
     static func register(in registry: ToolRegistry) async {
         await registry.register(
             name: "get_current_time",
@@ -19,17 +50,10 @@ enum TimeTool {
                 let now = Date()
                 let cal = Calendar.current
                 let tz = TimeZone.current
-                let isoFmt = ISO8601DateFormatter()
-                isoFmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-                let dateFmt = DateFormatter()
-                dateFmt.locale = Locale(identifier: "en_US_POSIX")
-                dateFmt.dateFormat = "EEEE, d MMMM yyyy"
-                let timeFmt = DateFormatter()
-                timeFmt.locale = Locale(identifier: "en_US_POSIX")
-                timeFmt.dateFormat = "HH:mm"
-                let dayFmt = DateFormatter()
-                dayFmt.locale = Locale(identifier: "en_US_POSIX")
-                dayFmt.dateFormat = "EEEE"
+                let isoFmt = Self.isoFmt
+                let dateFmt = Self.dateFmt
+                let timeFmt = Self.timeFmt
+                let dayFmt = Self.dayFmt
 
                 let hour = cal.component(.hour, from: now)
                 let timeOfDay: String

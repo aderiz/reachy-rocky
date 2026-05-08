@@ -59,6 +59,7 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
         }
         let timeoutTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 8 * 1_000_000_000)
+            if Task.isCancelled { return }
             guard let self, let cont = self.authPending else { return }
             self.authPending = nil
             cont.resume(returning: self.manager.authorizationStatus)
@@ -71,10 +72,13 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
     }
 
     /// One-shot location fetch. Returns the most recent fix or
-    /// throws if denied / restricted / no signal. Default 6s timeout
-    /// since the WeatherTool is in-line in a tool call and the user
-    /// is waiting on a reply.
-    func currentLocation(timeout: TimeInterval = 6) async throws -> CLLocation {
+    /// throws if denied / restricted / no signal. 12s default
+    /// because CLLocationManager on a cold start (no recent fix,
+    /// GPS not warm) routinely takes 8–10 seconds to produce its
+    /// first location — 6s would fail more than it succeeds for
+    /// first-use; 12s gives WiFi-cache hits and triangulation
+    /// enough room.
+    func currentLocation(timeout: TimeInterval = 12) async throws -> CLLocation {
         // Inverted check — fail only on EXPLICITLY bad states.
         // CLAuthorizationStatus on macOS Sequoia can return raw
         // values that don't map cleanly to the named cases the
@@ -96,12 +100,16 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
 
         // Schedule a timeout task that fails the in-flight continuation
         // if CLLocationManager doesn't fire a delegate callback in time.
-        // We capture the continuation through `self.continuation` so the
-        // delegate methods race against the timer for the same slot.
+        // The delegate methods race against the timer for the same
+        // slot via `self.continuation`. `Task.sleep` IS cancellable
+        // and will throw `CancellationError` on cancellation — wrap
+        // with `try?` and check `Task.isCancelled` so a successful
+        // delegate firing terminates the timer cleanly.
         let timeoutTask = Task { @MainActor [weak self] in
             try? await Task.sleep(
                 nanoseconds: UInt64(timeout * 1_000_000_000)
             )
+            if Task.isCancelled { return }
             guard let self, let cont = self.continuation else { return }
             self.continuation = nil
             cont.resume(throwing: LocationError.timeout)

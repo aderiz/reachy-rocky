@@ -46,9 +46,9 @@ enum WeatherTool {
     /// denied" error if the user hasn't granted Location yet.
     private static func fetchHere(session: URLSession) async -> JSONValue {
         do {
-            let loc = try await MainActor.run {
-                LocationProvider.shared
-            }.currentLocation()
+            // `LocationProvider` is `@MainActor`, so the call hops
+            // automatically — no need for an explicit `MainActor.run`.
+            let loc = try await LocationProvider.shared.currentLocation()
             let lat = loc.coordinate.latitude
             let lon = loc.coordinate.longitude
             return try await forecast(
@@ -195,14 +195,20 @@ enum WeatherTool {
         if let h = decoded.hourly {
             // Open-Meteo time strings are local without offset
             // ("2026-05-08T13:00"); parse with the matching formatter.
+            // Default to the system zone if Open-Meteo returns an
+            // identifier we can't resolve — using `.current` keeps
+            // hours in the user's perceived timezone instead of
+            // silently dropping to UTC.
+            let zone = decoded.timezone.flatMap(TimeZone.init(identifier:))
+                ?? TimeZone.current
             let hourFmt = DateFormatter()
             hourFmt.locale = Locale(identifier: "en_US_POSIX")
             hourFmt.dateFormat = "yyyy-MM-dd'T'HH:mm"
-            hourFmt.timeZone = TimeZone(identifier: decoded.timezone ?? "UTC")
+            hourFmt.timeZone = zone
             let outFmt = DateFormatter()
             outFmt.locale = Locale(identifier: "en_US_POSIX")
             outFmt.dateFormat = "HH:mm"
-            outFmt.timeZone = hourFmt.timeZone
+            outFmt.timeZone = zone
             for i in 0..<min(h.time.count, h.temperature_2m.count, h.weather_code.count) {
                 guard let parsed = hourFmt.date(from: h.time[i]),
                       parsed > now,

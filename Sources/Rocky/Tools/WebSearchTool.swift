@@ -40,11 +40,16 @@ enum WebSearchTool {
                 "required": .array([.string("query")]),
             ]),
             handler: { args in
-                guard let query = args.asObject?["query"]?.asString,
-                      !query.trimmingCharacters(in: .whitespaces).isEmpty
+                guard let raw = args.asObject?["query"]?.asString,
+                      !raw.trimmingCharacters(in: .whitespaces).isEmpty
                 else {
                     return .object(["error": .string("missing query")])
                 }
+                // Cap query length to defend against a buggy or
+                // malicious LLM passing megabyte-scale strings.
+                // Brave's own limit is 400 chars; anything more
+                // than ~512 isn't going to help the search anyway.
+                let query = String(raw.prefix(512))
                 let key = await keyProvider()
                 guard !key.isEmpty else {
                     return .object([
