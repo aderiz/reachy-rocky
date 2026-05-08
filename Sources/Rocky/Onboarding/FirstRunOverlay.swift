@@ -575,15 +575,17 @@ struct FirstRunOverlay: View {
     }
 
     private func currentLocationStatus() -> PermissionStatus {
+        // Map by exclusion: anything that isn't explicitly bad is
+        // treated as granted, mirroring `LocationProvider.currentLocation()`'s
+        // guard. Necessary because `CLAuthorizationStatus` on macOS
+        // can return raw values the named cases don't cover.
         switch LocationProvider.shared.authorizationStatus {
-        case .authorized, .authorizedAlways:
-            return .granted
         case .denied, .restricted:
             return .denied
         case .notDetermined:
             return .unknown
-        @unknown default:
-            return .unknown
+        default:
+            return .granted
         }
     }
 
@@ -640,14 +642,12 @@ struct FirstRunOverlay: View {
         let status = await LocationProvider.shared.requestAuthorization()
         await MainActor.run {
             switch status {
-            case .authorized, .authorizedAlways:
-                locationStatus = .granted
             case .denied, .restricted:
                 locationStatus = .denied
             case .notDetermined:
                 locationStatus = .unknown
-            @unknown default:
-                locationStatus = .unknown
+            default:
+                locationStatus = .granted
             }
         }
     }

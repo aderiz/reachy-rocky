@@ -75,10 +75,20 @@ final class LocationProvider: NSObject, CLLocationManagerDelegate {
     /// since the WeatherTool is in-line in a tool call and the user
     /// is waiting on a reply.
     func currentLocation(timeout: TimeInterval = 6) async throws -> CLLocation {
-        guard authorizationStatus == .authorized
-              || authorizationStatus == .authorizedAlways
-        else {
+        // Inverted check — fail only on EXPLICITLY bad states.
+        // CLAuthorizationStatus on macOS Sequoia can return raw
+        // values that don't map cleanly to the named cases the
+        // Swift overlay exposes (`.authorizedWhenInUse` is marked
+        // unavailable on macOS but the runtime can still return
+        // its raw value 4 from the OS layer). Matching on the bad
+        // states explicitly avoids "we got authorization but the
+        // tool says denied" footguns.
+        switch authorizationStatus {
+        case .notDetermined, .denied, .restricted:
+            NSLog("Rocky location: refusing with status raw=\(authorizationStatus.rawValue)")
             throw LocationError.notAuthorized(authorizationStatus)
+        default:
+            break
         }
         if continuation != nil {
             throw LocationError.busy
@@ -148,8 +158,8 @@ enum LocationError: Error, CustomStringConvertible {
 
     var description: String {
         switch self {
-        case .notAuthorized:
-            return "Location access not granted. Open System Settings → Privacy & Security → Location Services and enable Rocky."
+        case .notAuthorized(let status):
+            return "Location access not granted (status raw=\(status.rawValue)). Open System Settings → Privacy & Security → Location Services and enable Rocky."
         case .timeout: return "Location fix timed out."
         case .busy:    return "Another location request is already in flight."
         case .cancelled: return "Location request cancelled."
