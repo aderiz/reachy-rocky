@@ -47,7 +47,7 @@ struct PortraitView: View {
             bodyYaw: services.lastRobotState?.bodyYaw
         )
         .aspectRatio(1, contentMode: .fit)
-        .frame(maxWidth: 360, maxHeight: 360)
+        .frame(maxWidth: 520, maxHeight: 520)
         .accessibilityElement()
         .accessibilityLabel(accessibilityState)
         .accessibilityAddTraits(.updatesFrequently)

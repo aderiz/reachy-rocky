@@ -47,25 +47,42 @@ struct ReachyMiniAvatar: NSViewRepresentable {
         let scene = SCNScene()
         view.scene = scene
 
+        // Wrap the URDF root in a "presentation" node so we can apply
+        // a yaw without fighting the URDF's own Z-up → Y-up correction
+        // (which sits on `robot.rootNode.simdOrientation`). The URDF
+        // imports facing away from the camera; a 180° yaw around the
+        // world Y axis turns the bot to face us.
+        let presentation = SCNNode()
+        presentation.name = "presentation"
+        presentation.simdOrientation = simd_quatf(
+            angle: .pi, axis: SIMD3<Float>(0, 1, 0)
+        )
         if let robot = Self.loadRobot() {
-            // Place the loaded robot under our own poseRig so we can
-            // tweak orientation without fighting the URDF Z-up → Y-up
-            // rotation the loader already applied.
-            scene.rootNode.addChildNode(robot.rootNode)
+            presentation.addChildNode(robot.rootNode)
             context.coordinator.robot = robot
         }
+        scene.rootNode.addChildNode(presentation)
 
-        // Camera, framed on the head — close in so the (mis-IK'd)
-        // Stewart legs and the body fall outside the viewport.
+        // Camera, framed on the full bot. Reachy Mini is roughly 0.40 m
+        // tall standing on its foot. Pulling the camera back to ~1.0 m
+        // with a 30° FOV gives ~0.54 m of vertical visible extent —
+        // bot + comfortable margin. Look-at is mid-body so the head
+        // sits in the upper third.
+        let lookAtTarget = SCNNode()
+        lookAtTarget.position = SCNVector3(0, 0.20, 0)
+        scene.rootNode.addChildNode(lookAtTarget)
+
         let cameraNode = SCNNode()
         cameraNode.name = "camera"
         let camera = SCNCamera()
-        camera.fieldOfView = 30
+        camera.fieldOfView = 32
         camera.zNear = 0.01
         camera.zFar = 5
         cameraNode.camera = camera
-        cameraNode.position = SCNVector3(0.18, 0.30, 0.55)
-        cameraNode.eulerAngles = SCNVector3(-0.05, 0.32, 0)
+        cameraNode.position = SCNVector3(0, 0.22, 0.95)
+        let lookAt = SCNLookAtConstraint(target: lookAtTarget)
+        lookAt.isGimbalLockEnabled = true
+        cameraNode.constraints = [lookAt]
         scene.rootNode.addChildNode(cameraNode)
 
         // Lighting — soft 3-point. Same intent as the previous avatar:

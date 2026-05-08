@@ -74,7 +74,7 @@ struct MotionCard: View {
             bodyYaw: services.lastRobotState?.bodyYaw
         )
         .aspectRatio(1, contentMode: .fit)
-        .frame(maxWidth: 280)
+        .frame(maxWidth: 360)
         .frame(maxWidth: .infinity)
         .background(.regularMaterial,
                     in: RoundedRectangle(cornerRadius: 14, style: .continuous))
