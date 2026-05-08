@@ -146,6 +146,7 @@ private struct BrainSettingsTab: View {
     @Environment(AppServices.self) private var services
     @State private var lmURLDraft: String = ""
     @State private var lmApiKeyDraft: String = ""
+    @State private var braveKeyDraft: String = ""
 
     var body: some View {
         Form {
@@ -165,6 +166,18 @@ private struct BrainSettingsTab: View {
                     .foregroundStyle(.secondary)
             }
 
+            Section {
+                SecureField("Brave Search API key", text: $braveKeyDraft,
+                            prompt: Text("paste from search.brave.com/api"))
+                    .onSubmit { commitBraveKey() }
+            } header: {
+                Text("Web search")
+            } footer: {
+                Text("Used by the `search_web` tool. Free tier allows 1 query/sec; leave blank to disable web search.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Status") {
                 LabeledContent("Brain") { llmLabel }
                 LabeledContent("Re-probe") {
@@ -180,7 +193,13 @@ private struct BrainSettingsTab: View {
         .onAppear {
             lmURLDraft = services.settings.lmStudioURL
             lmApiKeyDraft = services.settings.lmStudioApiKey
+            braveKeyDraft = services.settings.braveSearchAPIKey
         }
+    }
+
+    private func commitBraveKey() {
+        guard braveKeyDraft != services.settings.braveSearchAPIKey else { return }
+        services.settings.braveSearchAPIKey = braveKeyDraft
     }
 
     private var modelPicker: some View {

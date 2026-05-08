@@ -58,6 +58,13 @@ final class SettingsStore {
     /// gains focus.
     var firstRunCompleted: Bool { didSet { save() } }
 
+    /// Brave Search API subscription token. Empty = `search_web` is
+    /// effectively disabled (the tool returns a "no key configured"
+    /// error rather than calling the network). Stored in UserDefaults
+    /// for now; could move to Keychain when we have more than one
+    /// secret-shaped setting and the friction is justified.
+    var braveSearchAPIKey: String { didSet { save() } }
+
     init() {
         let d = UserDefaults.standard
         self.robotHost = d.string(forKey: Keys.robotHost) ?? "reachy-mini.local"
@@ -86,6 +93,7 @@ final class SettingsStore {
         self.memoryRecallEnabled = (d.object(forKey: Keys.memoryRecallEnabled) as? Bool) ?? true
         self.memoryTopK = (d.object(forKey: Keys.memoryTopK) as? Int) ?? 5
         self.firstRunCompleted = (d.object(forKey: Keys.firstRunCompleted) as? Bool) ?? false
+        self.braveSearchAPIKey = d.string(forKey: Keys.braveSearchAPIKey) ?? ""
     }
 
     /// Pick robot if the robot-mic sidecar venv has been built; otherwise mac.
@@ -128,6 +136,7 @@ final class SettingsStore {
         d.set(memoryRecallEnabled, forKey: Keys.memoryRecallEnabled)
         d.set(memoryTopK, forKey: Keys.memoryTopK)
         d.set(firstRunCompleted, forKey: Keys.firstRunCompleted)
+        d.set(braveSearchAPIKey, forKey: Keys.braveSearchAPIKey)
     }
 
     func robotEndpoint() -> RobotEndpoint {
@@ -228,5 +237,6 @@ final class SettingsStore {
         static let memoryRecallEnabled = "rocky.memory.recall.enabled"
         static let memoryTopK = "rocky.memory.topk"
         static let firstRunCompleted = "rocky.first.run.completed"
+        static let braveSearchAPIKey = "rocky.brave.search.apikey"
     }
 }

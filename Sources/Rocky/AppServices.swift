@@ -1890,6 +1890,13 @@ final class AppServices {
         // against the same `ToolRegistry` so the LLM sees them in the
         // same `tools` array as the robot-control tools above.
         await TimeTool.register(in: toolRegistry)
+        let store = settings
+        await WebSearchTool.register(
+            in: toolRegistry,
+            keyProvider: { @Sendable in
+                await MainActor.run { store.braveSearchAPIKey }
+            }
+        )
     }
 
     private func probeRobot() async {
