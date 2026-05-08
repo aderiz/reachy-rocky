@@ -60,8 +60,45 @@ struct MotionCard: View {
                         maxRad: antennaMaxRad,
                         tint: .green)
             }
+            stewartDebugSection
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// Diagnostic — surface the daemon's reported Stewart motor
+    /// angles + passive joints. The avatar's elevation depends on
+    /// these arriving from the daemon. nil means we drop back to
+    /// URDF rest (which on this URDF is the fully retracted "ship"
+    /// pose, not the elevated home pose).
+    private var stewartDebugSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("STEWART (DAEMON)")
+                .font(.caption2.weight(.semibold))
+                .tracking(0.6)
+                .foregroundStyle(.secondary)
+            if let motors = services.lastRobotState?.headJoints {
+                Text("head_joints: " + motors.map {
+                    String(format: "%+.2f", $0)
+                }.joined(separator: " "))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("head_joints: nil")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+            }
+            if let passive = services.lastRobotState?.passiveJoints {
+                Text("passive_joints: \(passive.count) values")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.primary)
+            } else {
+                Text("passive_joints: nil")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+            }
+        }
     }
 
     // MARK: - Preview

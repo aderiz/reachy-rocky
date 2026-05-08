@@ -213,29 +213,19 @@ struct ReachyMiniAvatar: NSViewRepresentable {
             passiveJoints: [Double]?
         ) {
             guard let robot else { return }
-            _ = state  // sleep state no longer drives the avatar
+            _ = state
+            _ = pose
 
-            // Always show the rod meshes — they're load-bearing
-            // visually (without them the gap between motor arms and
-            // upper plate looks broken). Whether they animate
-            // correctly depends on whether the daemon (or the WASM
-            // IK below) is providing passive-joint angles.
             robot.setStewartLinkageHidden(false)
-
-            // Body yaw — always live.
             robot.setBodyYaw(Float(bodyYaw ?? 0))
-
-            // Antennas — daemon-reported angles. Composed on top of
-            // each joint's URDF rest in the loader.
             let leftAngle  = Float(antennas?.left  ?? 0)
             let rightAngle = Float(antennas?.right ?? 0)
             robot.setAntennas(left: leftAngle, right: rightAngle)
 
             // Stewart platform — drive from the daemon's 6 motor
-            // angles when available, exactly as the Pollen Tauri app
-            // does: setStewartActuators + apply 18 passive joints.
-            // The head pose then follows from the kinematic chain;
-            // no setHeadEuler shortcut.
+            // angles when available. Without them the platform sits
+            // at URDF rest (which on this URDF is the fully
+            // retracted "shipping" pose, not the elevated home).
             if let motors = headJoints, motors.count == 6 {
                 robot.setStewartActuators(motors.map { Float($0) })
 
@@ -262,10 +252,6 @@ struct ReachyMiniAvatar: NSViewRepresentable {
                     }
                 }
             }
-            // No fallback setHeadEuler. When the daemon doesn't
-            // provide motor angles, the URDF rest pose stands — the
-            // bot sits at its CAD-authored at-rest configuration,
-            // which is the most honest visual we can show.
         }
     }
 }
