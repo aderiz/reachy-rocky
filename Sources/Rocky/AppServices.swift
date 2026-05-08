@@ -39,6 +39,12 @@ final class AppServices {
     let mediaClient: MediaClient
     let robotTTS: RobotTTS
 
+    /// Single source of truth for permission status across every UI
+    /// surface (FirstRunOverlay, Settings → Permissions, Health
+    /// rows). Tools also read through it so the user-visible label
+    /// matches what the tool actually sees.
+    let permissions = PermissionsAuthority()
+
     // Cognition
     let llm: LMStudioClient
     let toolRegistry: ToolRegistry

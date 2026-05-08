@@ -567,89 +567,47 @@ struct FirstRunOverlay: View {
 
     // MARK: - Permission requests
 
+    /// Map the authority's 5-state Status to the overlay's local
+    /// 3-state PermissionStatus. `.limited` is a partial grant
+    /// (Calendar `.writeOnly`) that we surface as `.denied` here so
+    /// the row prompts the user to upgrade — the row's "Open
+    /// Settings" button gives them the path.
+    private func map(_ s: PermissionsAuthority.Status) -> PermissionStatus {
+        switch s {
+        case .granted:                return .granted
+        case .limited:                return .denied  // shown as "Limited" via subtitle below
+        case .denied, .restricted:    return .denied
+        case .notDetermined:          return .unknown
+        }
+    }
+
     private func refreshStatuses() {
-        micStatus = currentMicStatus()
-        speechStatus = currentSpeechStatus()
-        calendarStatus = currentCalendarStatus()
-        locationStatus = currentLocationStatus()
-    }
-
-    private func currentLocationStatus() -> PermissionStatus {
-        // Map by exclusion: anything that isn't explicitly bad is
-        // treated as granted, mirroring `LocationProvider.currentLocation()`'s
-        // guard. Necessary because `CLAuthorizationStatus` on macOS
-        // can return raw values the named cases don't cover.
-        switch LocationProvider.shared.authorizationStatus {
-        case .denied, .restricted:
-            return .denied
-        case .notDetermined:
-            return .unknown
-        default:
-            return .granted
-        }
-    }
-
-    private func currentMicStatus() -> PermissionStatus {
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized:                 return .granted
-        case .denied, .restricted:        return .denied
-        case .notDetermined:              return .unknown
-        @unknown default:                 return .unknown
-        }
-    }
-
-    private func currentSpeechStatus() -> PermissionStatus {
-        switch SFSpeechRecognizer.authorizationStatus() {
-        case .authorized:                 return .granted
-        case .denied, .restricted:        return .denied
-        case .notDetermined:              return .unknown
-        @unknown default:                 return .unknown
-        }
-    }
-
-    private func currentCalendarStatus() -> PermissionStatus {
-        switch EKEventStore.authorizationStatus(for: .event) {
-        case .fullAccess, .authorized:    return .granted
-        case .denied, .restricted, .writeOnly: return .denied
-        case .notDetermined:              return .unknown
-        @unknown default:                 return .unknown
-        }
+        let auth = services.permissions
+        auth.refresh()
+        micStatus      = map(auth.microphone)
+        speechStatus   = map(auth.speechRecognition)
+        calendarStatus = map(auth.calendar)
+        locationStatus = map(auth.location)
     }
 
     private func requestMic() async {
-        let granted = await AVCaptureDevice.requestAccess(for: .audio)
-        await MainActor.run { micStatus = granted ? .granted : .denied }
+        _ = await services.permissions.request(.microphone)
+        micStatus = map(services.permissions.microphone)
     }
 
     private func requestSpeech() async {
-        let resolved = await services.appleSTT.requestAuthorization()
-        await MainActor.run {
-            speechStatus = (resolved == .ready) ? .granted : .denied
-        }
+        _ = await services.permissions.request(.speechRecognition)
+        speechStatus = map(services.permissions.speechRecognition)
     }
 
     private func requestCalendar() async {
-        do {
-            let store = EKEventStore()
-            let granted = try await store.requestFullAccessToEvents()
-            await MainActor.run { calendarStatus = granted ? .granted : .denied }
-        } catch {
-            await MainActor.run { calendarStatus = .denied }
-        }
+        _ = await services.permissions.request(.calendar)
+        calendarStatus = map(services.permissions.calendar)
     }
 
     private func requestLocation() async {
-        let status = await LocationProvider.shared.requestAuthorization()
-        await MainActor.run {
-            switch status {
-            case .denied, .restricted:
-                locationStatus = .denied
-            case .notDetermined:
-                locationStatus = .unknown
-            default:
-                locationStatus = .granted
-            }
-        }
+        _ = await services.permissions.request(.location)
+        locationStatus = map(services.permissions.location)
     }
 
     /// Sequential because macOS only displays one TCC prompt at a

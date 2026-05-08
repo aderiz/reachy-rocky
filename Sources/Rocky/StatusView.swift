@@ -438,16 +438,18 @@ struct StatusView: View {
     }
 
     private var sttRow: HealthRow {
-        // Read TCC state directly each render so the row reflects the
-        // authorization grant immediately after the user resolves the
-        // system prompt — `services.sttBackendName` is set once in
-        // `warmUpSTT` at launch and would otherwise stay "pending"
-        // forever after a granted permission.
-        let auth = SFSpeechRecognizer.authorizationStatus()
+        // Read through the PermissionsAuthority so the row matches
+        // the FirstRunOverlay and Settings → Permissions tab. The
+        // authority routes Speech reads through
+        // `requestAuthorization` (no prompt once determined) which
+        // dodges `SFSpeechRecognizer.authorizationStatus()`'s
+        // per-process cache that doesn't pick up grants from
+        // System Settings.
+        let status = services.permissions.speechRecognition
         let state: HealthState
         let subtitle: String
-        switch auth {
-        case .authorized:
+        switch status {
+        case .granted:
             state = .ok
             subtitle = services.sttBackendName.contains("Apple Speech")
                 ? services.sttBackendName
@@ -455,15 +457,15 @@ struct StatusView: View {
         case .notDetermined:
             state = .warn
             subtitle = "permission pending"
-        case .denied:
+        case .limited(let reason):
             state = .warn
+            subtitle = reason
+        case .denied:
+            state = .bad
             subtitle = "permission denied"
         case .restricted:
             state = .bad
             subtitle = "restricted"
-        @unknown default:
-            state = .unknown
-            subtitle = "unknown"
         }
         return HealthRow(
             id: "stt",
@@ -473,7 +475,7 @@ struct StatusView: View {
             state: state,
             action: state == .warn
                 ? HealthAction(label: "Authorize") {
-                    Task { _ = await services.appleSTT.requestAuthorization() }
+                    Task { _ = await services.permissions.request(.speechRecognition) }
                 }
                 : nil
         )

@@ -1050,42 +1050,40 @@ private struct PermissionsSettingsTab: View {
     var body: some View {
         Form {
             Section {
+                let auth = services.permissions
                 if services.settings.micSource != "robot" {
                     permissionRow(
                         icon: "mic.fill",
                         title: "Microphone",
-                        rationale: "So Rocky can hear you say his name.",
+                        rationale: PermissionsAuthority.Permission.microphone.rationale,
                         status: micStatus,
-                        anchor: "Privacy_Microphone",
-                        grant: { _ = await AVCaptureDevice.requestAccess(for: .audio) }
+                        anchor: PermissionsAuthority.Permission.microphone.settingsAnchor,
+                        grant: { _ = await auth.request(.microphone) }
                     )
                 }
                 permissionRow(
                     icon: "waveform",
-                    title: "Speech recognition",
-                    rationale: "So your words become text Rocky can act on.",
+                    title: PermissionsAuthority.Permission.speechRecognition.displayName,
+                    rationale: PermissionsAuthority.Permission.speechRecognition.rationale,
                     status: speechStatus,
-                    anchor: "Privacy_SpeechRecognition",
-                    grant: { _ = await services.appleSTT.requestAuthorization() }
+                    anchor: PermissionsAuthority.Permission.speechRecognition.settingsAnchor,
+                    grant: { _ = await auth.request(.speechRecognition) }
                 )
                 permissionRow(
                     icon: "calendar",
-                    title: "Calendar",
-                    rationale: "So Rocky can answer \"what's on tomorrow?\" without guessing.",
+                    title: PermissionsAuthority.Permission.calendar.displayName,
+                    rationale: PermissionsAuthority.Permission.calendar.rationale,
                     status: calendarStatus,
-                    anchor: "Privacy_Calendars",
-                    grant: {
-                        let store = EKEventStore()
-                        _ = try? await store.requestFullAccessToEvents()
-                    }
+                    anchor: PermissionsAuthority.Permission.calendar.settingsAnchor,
+                    grant: { _ = await auth.request(.calendar) }
                 )
                 permissionRow(
                     icon: "location.fill",
-                    title: "Location",
-                    rationale: "So \"what's the weather?\" works without naming the city.",
+                    title: PermissionsAuthority.Permission.location.displayName,
+                    rationale: PermissionsAuthority.Permission.location.rationale,
                     status: locationStatus,
-                    anchor: "Privacy_LocationServices",
-                    grant: { _ = await LocationProvider.shared.requestAuthorization() }
+                    anchor: PermissionsAuthority.Permission.location.settingsAnchor,
+                    grant: { _ = await auth.request(.location) }
                 )
             } header: {
                 Text("System permissions")
@@ -1096,14 +1094,17 @@ private struct PermissionsSettingsTab: View {
             }
         }
         .formStyle(.grouped)
-        .id(refreshTick)
         .onReceive(NotificationCenter.default.publisher(
             for: NSApplication.didBecomeActiveNotification
         )) { _ in
-            // Trigger a re-render so the row reads fresh TCC state
-            // when the user returns from System Settings.
+            // The authority listens for `didBecomeActive` itself and
+            // re-reads, but bumping the explicit refreshTick makes
+            // the SwiftUI re-render deterministic in case @Observable
+            // doesn't pick up a same-value mutation.
+            services.permissions.refresh()
             refreshTick &+= 1
         }
+        .id(refreshTick)
     }
 
     @ViewBuilder
@@ -1130,6 +1131,30 @@ private struct PermissionsSettingsTab: View {
                 Label("Granted", systemImage: "checkmark.circle.fill")
                     .foregroundStyle(.green)
                     .font(.caption.weight(.medium))
+            case .limited(let reason):
+                // Calendar `.writeOnly` is the canonical case. Show
+                // the macOS-shaped label rather than collapsing to
+                // "Denied" — the user granted *something*, just not
+                // what Rocky needs.
+                VStack(alignment: .trailing, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Label("Limited", systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .font(.caption.weight(.medium))
+                        Button("Open Settings") {
+                            let url = URL(string:
+                                "x-apple.systempreferences:com.apple.preference.security?\(anchor)"
+                            )!
+                            NSWorkspace.shared.open(url)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                    Text(reason)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.trailing)
+                }
             case .denied:
                 HStack(spacing: 6) {
                     Label("Denied", systemImage: "xmark.circle.fill")
@@ -1154,43 +1179,40 @@ private struct PermissionsSettingsTab: View {
     }
 
     // MARK: - Status readers
+    //
+    // All four permissions route through `services.permissions` so
+    // the labels here match what the FirstRunOverlay shows AND what
+    // the tools actually see. The mapping below is the only place
+    // in this file that knows about the 5-state authority enum;
+    // the row UI deals with three local cases plus a `.limited`
+    // subtitle.
 
-    private enum PermissionRowStatus { case granted, denied, unknown }
+    private enum PermissionRowStatus: Equatable {
+        case granted
+        case limited(reason: String)
+        case denied
+        case unknown
+    }
+
+    private func mapStatus(_ s: PermissionsAuthority.Status) -> PermissionRowStatus {
+        switch s {
+        case .granted:                  return .granted
+        case .limited(let reason):      return .limited(reason: reason)
+        case .denied, .restricted:      return .denied
+        case .notDetermined:            return .unknown
+        }
+    }
 
     private var micStatus: PermissionRowStatus {
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized:                 return .granted
-        case .denied, .restricted:        return .denied
-        case .notDetermined:              return .unknown
-        @unknown default:                 return .unknown
-        }
+        mapStatus(services.permissions.microphone)
     }
-
     private var speechStatus: PermissionRowStatus {
-        switch SFSpeechRecognizer.authorizationStatus() {
-        case .authorized:                 return .granted
-        case .denied, .restricted:        return .denied
-        case .notDetermined:              return .unknown
-        @unknown default:                 return .unknown
-        }
+        mapStatus(services.permissions.speechRecognition)
     }
-
     private var calendarStatus: PermissionRowStatus {
-        switch EKEventStore.authorizationStatus(for: .event) {
-        case .fullAccess, .authorized:    return .granted
-        case .denied, .restricted, .writeOnly: return .denied
-        case .notDetermined:              return .unknown
-        @unknown default:                 return .unknown
-        }
+        mapStatus(services.permissions.calendar)
     }
-
     private var locationStatus: PermissionRowStatus {
-        // Inverted check matches `LocationProvider.currentLocation()` —
-        // anything that isn't explicitly bad reads as granted.
-        switch LocationProvider.shared.authorizationStatus {
-        case .denied, .restricted: return .denied
-        case .notDetermined:       return .unknown
-        default:                   return .granted
-        }
+        mapStatus(services.permissions.location)
     }
 }
