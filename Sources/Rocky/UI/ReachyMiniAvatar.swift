@@ -58,6 +58,11 @@ struct ReachyMiniAvatar: NSViewRepresentable {
             angle: .pi, axis: SIMD3<Float>(0, 1, 0)
         )
         if let robot = Self.loadRobot() {
+            // Until the Stewart IK is wired (WASM bridge or Swift port),
+            // hide the leg rods + balls — they can't track head motion
+            // when we drive head pose directly. Better to show no rods
+            // than disconnected ones.
+            robot.setStewartLinkageHidden(true)
             presentation.addChildNode(robot.rootNode)
             context.coordinator.robot = robot
         }

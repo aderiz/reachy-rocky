@@ -70,30 +70,69 @@ public final class ReachyMini {
     }
 
     /// Antenna angles in radians. Left rotates around the antenna's revolute axis, similarly for right.
+    /// Antenna angles in radians, composed on top of each joint's
+    /// URDF rest pose. Passing 0 leaves the antenna at its
+    /// CAD-authored mounting orientation rather than snapping to the
+    /// world axes.
     public func setAntennas(left: Float, right: Float) {
-        leftAntennaNode?.simdOrientation = simd_quatf(angle: left,  axis: joints["left_antenna"]?.axis  ?? [0,0,1])
-        rightAntennaNode?.simdOrientation = simd_quatf(angle: right, axis: joints["right_antenna"]?.axis ?? [0,0,1])
-    }
-
-    /// Body yaw — rotates the entire upper body around the foot.
-    public func setBodyYaw(_ angle: Float) {
-        bodyYawNode?.simdOrientation = simd_quatf(angle: angle, axis: joints["yaw_body"]?.axis ?? [0,0,1])
-    }
-
-    /// Set the 6 Stewart actuator angles (radians). Indices 0..5 → joints stewart_1..stewart_6.
-    /// Without computing the passive joints, the rod linkages will *not* close — the legs will look
-    /// visually wrong unless you also drive the passive joints (use the bundled WASM kinematics).
-    public func setStewartActuators(_ angles: [Float]) {
-        for (i, angle) in angles.prefix(6).enumerated() {
-            guard let joint = joints["stewart_\(i+1)"] else { continue }
-            joint.node.simdOrientation = simd_quatf(angle: angle, axis: joint.axis)
+        if let j = joints["left_antenna"] {
+            j.node.simdOrientation = j.restOrientation
+                * simd_quatf(angle: left, axis: j.axis)
+        }
+        if let j = joints["right_antenna"] {
+            j.node.simdOrientation = j.restOrientation
+                * simd_quatf(angle: right, axis: j.axis)
         }
     }
 
-    /// Set arbitrary named joint angle. Useful when driving passive joints from external IK.
+    /// Body yaw — rotates the entire upper body around the foot.
+    /// Composed with the joint's URDF rest pose.
+    public func setBodyYaw(_ angle: Float) {
+        guard let j = joints["yaw_body"] else { return }
+        j.node.simdOrientation = j.restOrientation
+            * simd_quatf(angle: angle, axis: j.axis)
+    }
+
+    /// Set the 6 Stewart actuator angles (radians). Indices 0..5 →
+    /// joints stewart_1..stewart_6. Without computing the passive
+    /// joints, the rod linkages will *not* close — the legs will
+    /// look visually wrong unless you also drive the passive joints
+    /// (use the bundled WASM kinematics). Composed with each joint's
+    /// URDF rest pose.
+    public func setStewartActuators(_ angles: [Float]) {
+        for (i, angle) in angles.prefix(6).enumerated() {
+            guard let joint = joints["stewart_\(i+1)"] else { continue }
+            joint.node.simdOrientation = joint.restOrientation
+                * simd_quatf(angle: angle, axis: joint.axis)
+        }
+    }
+
+    /// Set arbitrary named joint angle. Useful when driving passive
+    /// joints from external IK. Composed with the joint's URDF rest
+    /// pose.
     public func setJoint(_ name: String, angle: Float) {
         guard let joint = joints[name] else { return }
-        joint.node.simdOrientation = simd_quatf(angle: angle, axis: joint.axis)
+        joint.node.simdOrientation = joint.restOrientation
+            * simd_quatf(angle: angle, axis: joint.axis)
+    }
+
+    // MARK: - Visual cleanups for partial IK
+
+    /// Hide the Stewart-platform rod / ball linkage meshes. While the
+    /// driver only sets `setHeadEuler` (no Stewart IK), the rods and
+    /// balls don't track the head — they stay at rest while the upper
+    /// plate moves elsewhere. Hiding them keeps the visual honest:
+    /// the head moves, the body and motor arms stay still, and
+    /// nothing's visibly disconnected. Restore the rods by calling
+    /// this with `hidden = false` once the IK is wired.
+    public func setStewartLinkageHidden(_ hidden: Bool) {
+        let prefixes = ["stewart_link_rod", "stewart_link_ball"]
+        for link in links.values {
+            let name = link.name
+            if prefixes.contains(where: { name.hasPrefix($0) }) {
+                link.node.isHidden = hidden
+            }
+        }
     }
 
     // MARK: URDF model
@@ -113,6 +152,12 @@ public final class ReachyMini {
         public let type: String   // "revolute" | "fixed" | "continuous" | ...
         public let axis: SIMD3<Float>
         public let node: SCNNode  // joint node sits between parent link's node and child link's node
+        /// URDF `<origin rpy="...">` for this joint, captured at load
+        /// time. Motion API methods compose `restOrientation * rotation`
+        /// so a zero-angle setAntennas/setBodyYaw leaves the joint at
+        /// its CAD mounting pose instead of snapping to world axes.
+        public var restOrientation: simd_quatf =
+            simd_quatf(angle: 0, axis: SIMD3<Float>(1, 0, 0))
         init(name: String, type: String, axis: SIMD3<Float>) {
             self.name = name
             self.type = type
@@ -146,6 +191,7 @@ public final class ReachyMini {
         for jd in parser.joints {
             let joint = Joint(name: jd.name, type: jd.type, axis: jd.axis)
             applyOrigin(to: joint.node, xyz: jd.originXYZ, rpy: jd.originRPY)
+            joint.restOrientation = joint.node.simdOrientation
 
             guard let parentLink = links[jd.parent], let childLink = links[jd.child] else { continue }
             // joint node is child of parent link's node, and child link's node is child of joint node
