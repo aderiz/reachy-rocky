@@ -69,6 +69,9 @@ public actor RobotCameraService {
     public func stop() async {
         pumpTask?.cancel(); pumpTask = nil
         isStreaming = false
+        // Reset for the next start() — see RobotMicService.stop()
+        // for the same rationale.
+        seenInitialReady = false
         struct Empty: Encodable, Sendable {}
         struct R: Decodable, Sendable { let streaming: Bool }
         let _: R? = try? await sidecar.send(method: "stop_streaming", params: Empty())

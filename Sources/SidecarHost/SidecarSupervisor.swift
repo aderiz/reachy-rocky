@@ -9,6 +9,10 @@ public actor SidecarSupervisor {
     public let logBus: LogBus
     private var sidecars: [String: any Sidecar] = [:]
     private var watchers: [String: Task<Void, Never>] = [:]
+    /// Per-sidecar consecutive-restart counter, cleared on a
+    /// successful start. Drives the exponential backoff so rapid
+    /// restart loops don't hammer the daemon at full rate.
+    private var consecutiveRestarts: [String: Int] = [:]
     private let circuitCooldownS: Double = 60
 
     public init(logBus: LogBus) {
@@ -103,12 +107,18 @@ public actor SidecarSupervisor {
                     return
                 }
             }
-            // Backoff: 250ms, 500ms, 1s, 2s, 4s, capped.
-            let backoff = max(0.25, min(4.0, 0.25 * pow(2.0, Double(0))))
+            // Exponential backoff: 250ms, 500ms, 1s, 2s, 4s, capped.
+            // Counter clears on a successful start (see below) so a
+            // sidecar that's been healthy for a while doesn't carry
+            // a stale backoff into its next failure.
+            let attempt = consecutiveRestarts[sidecar.name] ?? 0
+            consecutiveRestarts[sidecar.name] = attempt + 1
+            let backoff = max(0.25, min(4.0, 0.25 * pow(2.0, Double(attempt))))
             try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
 
             do {
                 try await sidecar.start()
+                consecutiveRestarts[sidecar.name] = 0
                 await logBus.publish(.sidecarState(
                     sidecar: sidecar.name, transition: "restarted"
                 ))

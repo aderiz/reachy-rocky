@@ -109,6 +109,12 @@ public actor RobotMicService {
         pumpTask?.cancel()
         pumpTask = nil
         isRunning = false
+        // Reset so the NEXT start() correctly treats its first
+        // observed `.ready` as the initial start (issue
+        // start_recording ourselves) rather than a restart-resume
+        // (which would skip the explicit RPC and rely on the
+        // initial-start path's own send).
+        seenInitialReady = false
         struct Empty: Encodable, Sendable {}
         struct R: Decodable, Sendable { let recording: Bool }
         do {

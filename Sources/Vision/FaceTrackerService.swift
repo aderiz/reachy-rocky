@@ -91,7 +91,14 @@ public actor FaceTrackerService {
     public func start() async throws {
         try await sidecar.start()
         pumpTask?.cancel()
-        let stream = sidecar.events
+        // The face-tracker sidecar emits target / detection events
+        // autonomously after init — no explicit "start tracking" RPC
+        // is required, so a supervisor-driven restart resumes the
+        // event stream naturally without needing a re-arm pass.
+        // Use `subscribe()` for synchronous insert so the few
+        // events emitted right after the sidecar's ready signal
+        // aren't lost.
+        let stream = await sidecar.subscribe()
         pumpTask = Task { [weak self] in
             await self?.pump(stream: stream)
         }
