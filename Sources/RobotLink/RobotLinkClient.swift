@@ -40,9 +40,17 @@ public actor RobotLinkClient {
 
     // MARK: - State
 
-    /// `GET /api/state/full`
+    /// `GET /api/state/full` with the four `with_*=true` flags so the
+    /// daemon actually populates `head_joints` (7 floats: index 0 =
+    /// body_yaw, 1..6 = stewart motor angles), `body_yaw`,
+    /// `antennas_position`, and `passive_joints`. Without these flags
+    /// the daemon returns those fields as `null` — that's why the
+    /// avatar's Stewart linkage couldn't animate before.
     public func fullState() async throws -> RobotState {
-        let (data, status) = try await get(path: "/api/state/full")
+        let (data, status) = try await get(
+            path: "/api/state/full",
+            query: Self.fullStateQuery
+        )
         try ensureOK(status: status, body: data)
         do {
             return try JSONDecoder().decode(RobotState.self, from: data)
@@ -50,6 +58,10 @@ public actor RobotLinkClient {
             throw RobotLinkError.decode(message: "fullState: \(error)")
         }
     }
+
+    /// Query string for state fetches. Shared by REST + WS.
+    public static let fullStateQuery =
+        "with_head_joints=true&with_body_yaw=true&with_antenna_positions=true&with_passive_joints=true"
 
     // MARK: - Motion
 
@@ -223,8 +235,10 @@ public actor RobotLinkClient {
 
     // MARK: - Internals
 
-    private func get(path: String) async throws -> (Data, Int) {
-        var req = URLRequest(url: endpoint.apiURL(path))
+    private func get(path: String, query: String? = nil) async throws -> (Data, Int) {
+        let url = query.map { endpoint.apiURL(path, query: $0) }
+                   ?? endpoint.apiURL(path)
+        var req = URLRequest(url: url)
         req.httpMethod = "GET"
         return try await perform(req, label: path)
     }

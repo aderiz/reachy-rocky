@@ -65,19 +65,22 @@ struct MotionCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    /// Diagnostic — surface the daemon's reported Stewart motor
-    /// angles + passive joints. The avatar's elevation depends on
-    /// these arriving from the daemon. nil means we drop back to
-    /// URDF rest (which on this URDF is the fully retracted "ship"
-    /// pose, not the elevated home pose).
+    /// Diagnostic — what the daemon is actually publishing for the
+    /// Stewart linkage. `head_joints` is 7 floats: index 0 = body_yaw,
+    /// indices 1..6 = stewart motor angles. `passive_joints` is 21
+    /// floats covering passive_1..7 × {x,y,z}; when the daemon
+    /// reports `nil` the avatar runs the bundled WASM forward
+    /// kinematics locally instead.
     private var stewartDebugSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("STEWART (DAEMON)")
                 .font(.caption2.weight(.semibold))
                 .tracking(0.6)
                 .foregroundStyle(.secondary)
-            if let motors = services.lastRobotState?.headJoints {
-                Text("head_joints: " + motors.map {
+            if let hj = services.lastRobotState?.headJoints, hj.count == 7 {
+                Text("body_yaw: " + String(format: "%+.2f", hj[0]))
+                    .font(.caption.monospacedDigit())
+                Text("motors: " + hj[1...6].map {
                     String(format: "%+.2f", $0)
                 }.joined(separator: " "))
                     .font(.caption.monospacedDigit())
@@ -85,18 +88,18 @@ struct MotionCard: View {
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
-                Text("head_joints: nil")
+                Text("head_joints: nil — query flags missing?")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.tertiary)
             }
             if let passive = services.lastRobotState?.passiveJoints {
-                Text("passive_joints: \(passive.count) values")
+                Text("passive_joints: \(passive.count) (daemon)")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.primary)
             } else {
-                Text("passive_joints: nil")
+                Text("passive_joints: nil — WASM IK locally")
                     .font(.caption.monospacedDigit())
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
             }
         }
     }

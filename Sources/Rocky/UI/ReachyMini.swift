@@ -114,12 +114,16 @@ public final class ReachyMini {
         }
     }
 
-    /// Set arbitrary named joint angle. OVERWRITE — used for the 18
-    /// passive-joint angles returned by the WASM kinematics module.
-    /// See `setStewartActuators` for why we don't compose with rest.
+    /// Set an arbitrary named joint angle. Composes with the joint's
+    /// URDF rest origin rotation — `rest * axis_angle_rotation` —
+    /// matching gkjohnson's URDFLoader semantics that the bundled
+    /// Pollen WASM was authored against. (Earlier this overwrote the
+    /// quaternion, which destroyed the URDF origin and made every
+    /// passive joint rotate around the wrong axis.)
     public func setJoint(_ name: String, angle: Float) {
         guard let joint = joints[name] else { return }
-        joint.node.simdOrientation = simd_quatf(angle: angle, axis: joint.axis)
+        joint.node.simdOrientation = joint.restOrientation
+            * simd_quatf(angle: angle, axis: joint.axis)
     }
 
     // MARK: - Visual cleanups for partial IK

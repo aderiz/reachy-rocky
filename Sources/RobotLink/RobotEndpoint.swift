@@ -22,6 +22,18 @@ public struct RobotEndpoint: Sendable, Equatable, Hashable {
     public func apiURL(_ path: String) -> URL {
         baseURL.appendingPathComponent(path)
     }
+
+    /// `apiURL` plus a query string. Path segments still go through
+    /// `appendingPathComponent`, so the query is appended manually.
+    /// The daemon's `/api/state/full` only populates `head_joints`,
+    /// `body_yaw`, `antennas_position` and `passive_joints` when the
+    /// matching `with_*=true` flags are set.
+    public func apiURL(_ path: String, query: String) -> URL {
+        var s = baseURL.appendingPathComponent(path).absoluteString
+        s += s.contains("?") ? "&" : "?"
+        s += query
+        return URL(string: s)!
+    }
 }
 
 public enum RobotLinkError: Error, Sendable {

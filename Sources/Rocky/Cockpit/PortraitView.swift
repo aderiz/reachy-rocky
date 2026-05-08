@@ -34,7 +34,13 @@ struct PortraitView: View {
                 .padding(.bottom, 24)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(.background)
+        // Full-column gradient — the avatar itself is transparent so
+        // antennas silhouette against the lighter crown of the
+        // gradient as the column extends to the top of the window.
+        // The stops descend through slate to near-black so the name
+        // and primary action sit on dark, readable territory at the
+        // base.
+        .background(ReachyMiniAvatar.backdrop)
     }
 
     // MARK: - Head

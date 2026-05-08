@@ -9,15 +9,30 @@ import JavaScriptCore
 /// The wasm module is built with wasm-bindgen (Rust → wasm). Its only
 /// exported function we need is:
 ///
-///     calculate_passive_joints(headJoints, antennas) -> [18 doubles]
+///     calculate_passive_joints(headJoints, headPoseMatrix) -> [21 doubles]
 ///
-/// Inputs are two `Float64Array`s. The output is a flat 18-element
-/// array in URDF order:
+/// Inputs:
+///   - `headJoints`: 7 floats — the daemon's full `head_joints` array
+///     (index 0 = body_yaw, 1..6 = stewart motor angles). The wasm
+///     enforces `len >= 7` and silently returns zeros below that.
+///   - `headPoseMatrix`: 16 floats — desired head pose as a 4×4
+///     row-major homogeneous transform. Index 3,7,11 are Tx,Ty,Tz;
+///     indices 0..2,4..6,8..10 are the rotation matrix. The wasm
+///     enforces `len > 15` and silently returns zeros below that.
+///
+/// (The `HOW_IT_WORKS.md` in the Pollen bundle calls the second arg
+/// "antennas" — that's a mis-label from minified-JS reverse-engineering.
+/// Empirically the wasm reads it as a transform matrix: identity
+/// produces non-zero `passive_7`, all-zeros produces `passive_7 = 0`,
+/// and a Z translation at index 11 changes every output.)
+///
+/// The output is a flat 21-element array in URDF order:
 ///
 ///     [passive_1_x, passive_1_y, passive_1_z,
 ///      passive_2_x, passive_2_y, passive_2_z,
 ///      ...
-///      passive_6_x, passive_6_y, passive_6_z]
+///      passive_6_x, passive_6_y, passive_6_z,
+///      passive_7_x, passive_7_y, passive_7_z]
 ///
 /// Loading is synchronous — we use `new WebAssembly.Module` /
 /// `new WebAssembly.Instance` instead of the async `instantiate`
@@ -66,20 +81,25 @@ final class StewartIK {
         context.evaluateScript("_rockyWasmBytes = null;")
     }
 
-    /// Run the wasm IK. Returns 18 passive-joint angles, or nil on
-    /// failure (wasm exception, bad input length, JSC error). The
-    /// avatar treats nil as "skip the passive joint update this
-    /// tick" — better than freezing the rods at a stale value.
+    /// Run the wasm IK. Returns 21 passive-joint angles, or nil on
+    /// failure. The avatar treats nil as "skip the passive joint
+    /// update this tick" — better than freezing the rods at a stale
+    /// value.
+    ///
+    /// `headJoints` must be exactly 7 floats (the daemon's full array)
+    /// and `headPoseMatrix` exactly 16 floats (4×4 row-major). The
+    /// wasm gates the computation on these counts and silently
+    /// returns zeros otherwise.
     func calculatePassiveJoints(
-        headJoints: [Double], antennas: [Double]
+        headJoints: [Double], headPoseMatrix: [Double]
     ) -> [Double]? {
-        guard headJoints.count == 6, antennas.count == 2 else { return nil }
+        guard headJoints.count == 7, headPoseMatrix.count == 16 else { return nil }
         guard let result = stewart.invokeMethod(
-            "calculatePassive", withArguments: [headJoints, antennas]
+            "calculatePassive", withArguments: [headJoints, headPoseMatrix]
         ), !result.isUndefined, !result.isNull else {
             return nil
         }
-        guard let array = result.toArray() as? [Double], array.count == 18 else {
+        guard let array = result.toArray() as? [Double], array.count == 21 else {
             return nil
         }
         return array
@@ -99,23 +119,25 @@ final class StewartIK {
     private static let jsShim = """
     var Stewart = (function() {
         var exports = null;
-        var memCache = null;
 
-        function mem() {
-            if (memCache === null || memCache.byteLength === 0) {
-                memCache = new Float64Array(exports.memory.buffer);
-            }
-            return memCache;
-        }
-
+        // JSC detaches Float64Array views over WASM memory the moment
+        // the WASM grows its memory page (more strictly than V8/Node),
+        // so we never cache the view. Each operation gets a fresh
+        // `new Float64Array(exports.memory.buffer)` AFTER any malloc /
+        // wasm-call that could have triggered growth. Caching it once
+        // returns silent zeros after the first allocation — that was
+        // the bug that left the Stewart linkage flat.
         function passIn(arr) {
             var ptr = exports.__wbindgen_malloc(arr.length * 8, 8) >>> 0;
-            mem().set(arr, ptr / 8);
+            new Float64Array(exports.memory.buffer)
+                .set(arr, ptr / 8);
             return [ptr, arr.length];
         }
 
         function getOut(ptr, len) {
-            return mem().subarray(ptr / 8, ptr / 8 + len).slice();
+            return new Float64Array(exports.memory.buffer)
+                .subarray(ptr / 8, ptr / 8 + len)
+                .slice();
         }
 
         return {
@@ -136,9 +158,11 @@ final class StewartIK {
                 var module = new WebAssembly.Module(wasmBytes);
                 var instance = new WebAssembly.Instance(module, imports);
                 exports = instance.exports;
-                memCache = null;
                 if (typeof exports.__wbindgen_start === 'function') {
                     exports.__wbindgen_start();
+                }
+                if (typeof exports.init === 'function') {
+                    exports.init();
                 }
             },
             calculatePassive: function(headJoints, antennas) {
