@@ -47,6 +47,19 @@ public actor VoiceCoordinator {
     private var vad: EnergyVAD
     private var pendingSegment: [Float] = []
     private var segmentStart: Date?
+    /// Rolling buffer of the last few audio frames. Prepended to
+    /// `pendingSegment` when the VAD's `.speechStart` transition
+    /// fires, so the first ~90 ms of speech (which the VAD needed
+    /// to confirm `minSpeechFrames` consecutive loud frames before
+    /// transitioning) isn't lost. Without this, every utterance
+    /// has its leading plosive/fricative clipped — turning
+    /// "Rocky" into "ocky", which Apple Speech often transcribes
+    /// as "okay" / "hockey" / "key" and the wake filter misses.
+    private var preRoll: [Float] = []
+    /// One queued segment that's still waiting for STT to free up.
+    /// Single slot — replaces the previous "drop new" behaviour
+    /// that ate every other utterance during a fast back-and-forth.
+    private var queuedSegment: (samples: [Float], started: Date)?
     private var pumpTask: Task<Void, Never>?
     /// In-flight STT task. The pump never awaits transcription directly —
     /// it spawns this task and continues draining frames. If a second
@@ -131,6 +144,13 @@ public actor VoiceCoordinator {
     private func pumpLoop() async {
         let frameSamples = (config.sampleRate * config.frameMs) / 1000
         let maxSegmentSamples = Int(config.maxSegmentS * Double(config.sampleRate))
+        // Pre-roll buffer holds enough audio to cover the VAD's
+        // confirmation latency (`minSpeechFrames` × frameMs). 6
+        // frames at 30 ms = 180 ms, comfortably more than the
+        // ~90 ms VAD onset window. Larger doesn't hurt — the
+        // buffer is cheap and only flushed forward on .speechStart.
+        let preRollFrames = 6
+        let preRollSamples = preRollFrames * frameSamples
 
         while !Task.isCancelled {
             let chunk = await source.nextFrame(maxSamples: frameSamples)
@@ -142,11 +162,24 @@ public actor VoiceCoordinator {
             let transition = vad.ingest(samples: chunk, at: now)
 
             if vad.inSpeech || transition == .speechStart(at: now) {
+                // First frame of a new speech segment — flush the
+                // pre-roll buffer ahead of the chunk so the start
+                // of "Rocky" isn't lost to VAD onset latency.
+                if pendingSegment.isEmpty, !preRoll.isEmpty {
+                    pendingSegment.append(contentsOf: preRoll)
+                }
                 pendingSegment.append(contentsOf: chunk)
                 if segmentStart == nil { segmentStart = now }
 
                 if pendingSegment.count >= maxSegmentSamples {
                     await flushSegment(forceEnd: true)
+                }
+            } else {
+                // Not in speech — keep this frame in the rolling
+                // pre-roll. Drop oldest to maintain capacity.
+                preRoll.append(contentsOf: chunk)
+                if preRoll.count > preRollSamples {
+                    preRoll.removeFirst(preRoll.count - preRollSamples)
                 }
             }
 
@@ -157,6 +190,10 @@ public actor VoiceCoordinator {
                                                  endMs: 0))
             case .speechEnd:
                 await flushSegment(forceEnd: false)
+                // Pre-roll is consumed once a segment ends — start
+                // the next pre-roll fresh so we don't include
+                // tail audio from the previous utterance.
+                preRoll.removeAll(keepingCapacity: true)
             case nil:
                 break
             }
@@ -177,13 +214,25 @@ public actor VoiceCoordinator {
         segmentStart = nil
         if forceEnd { vad.reset() }
 
-        // Single in-flight STT. If one is already running, drop this
-        // segment. Latest user audio matters more than backed-up
-        // history; queueing turns N segments into N × 1.5 s of latency.
+        // STT is single-in-flight (Apple Speech doesn't pipeline a
+        // second request well). Earlier behaviour was "drop new
+        // segment if STT is busy", which silently ate every other
+        // utterance during a fast back-and-forth — the user said
+        // "Rocky" then "what time is it" 400 ms later, the second
+        // segment was dropped, and Rocky responded to just "Rocky"
+        // with a generic acknowledgement.
+        //
+        // New behaviour: keep one queued segment. If a third
+        // arrives while the first is still in flight, the second
+        // (queued) is replaced — under sustained pressure we'd
+        // rather process the most recent utterance than a stale
+        // one. When the in-flight STT finishes, the queued
+        // segment is dispatched immediately.
         if sttTask != nil {
+            queuedSegment = (samples: segment, started: started)
             await logBus.publish(.sidecarLog(
-                sidecar: "voice", level: .info,
-                message: "stt busy — dropped \(segment.count) samples",
+                sidecar: "voice", level: .debug,
+                message: "stt busy — queued \(segment.count) samples",
                 fields: [:]
             ))
             return
@@ -195,13 +244,12 @@ public actor VoiceCoordinator {
     }
 
     private func runSTT(segment: [Float], started: Date) async {
-        defer { sttTask = nil }
-        if Task.isCancelled { return }
+        if Task.isCancelled { sttTask = nil; return }
         do {
             let transcript = try await stt.transcribe(
                 samples: segment, at: config.sampleRate
             )
-            if Task.isCancelled { return }
+            if Task.isCancelled { sttTask = nil; return }
             let totalMs = Date().timeIntervalSince(started) * 1000
             await logBus.publish(.sttFinal(text: transcript.text, totalMs: totalMs))
             await dispatchFinal(transcript.text)
@@ -209,6 +257,19 @@ public actor VoiceCoordinator {
             await logBus.publish(.error(
                 scope: "stt", message: "\(error)", recoverable: true
             ))
+        }
+        sttTask = nil
+
+        // Drain any segment that arrived while we were busy. Single
+        // slot — if a third arrived during the second's STT, the
+        // queue holds the most recent only. This is the path that
+        // turns the previous "drop new" behaviour into "process
+        // both back-to-back".
+        if let next = queuedSegment {
+            queuedSegment = nil
+            sttTask = Task { [weak self] in
+                await self?.runSTT(segment: next.samples, started: next.started)
+            }
         }
     }
 

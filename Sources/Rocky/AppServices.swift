@@ -1041,11 +1041,18 @@ final class AppServices {
                 // speaking (or in a small tail after). Without this the
                 // robot speaker bleeds into the mic, STT transcribes
                 // Rocky's own voice, and every reply triggers another —
-                // feedback loop. The tail (0.3 s) is small enough that
-                // an immediate user follow-up gets through.
+                // feedback loop. The tail covers Apple Speech's
+                // post-roll latency: a final transcript from the
+                // last bit of TTS audio takes ~600–1500 ms to emerge
+                // from the recognizer after the audio itself has
+                // stopped. 1.5 s is wide enough to catch that
+                // without unduly blocking a fast user follow-up;
+                // `ttsBusyUntil` itself already includes a 1.5 s
+                // tail past playback end (see say handler), so the
+                // total window from end-of-playback is ~3 s.
                 let now = Date()
                 let inEcho = ttsBusyUntil.map {
-                    now < $0.addingTimeInterval(0.3)
+                    now < $0.addingTimeInterval(1.5)
                 } ?? false
                 if inEcho {
                     await logBus.publish(.sidecarLog(
@@ -1898,11 +1905,29 @@ final class AppServices {
                     return .object(["ok": .bool(false),
                                     "error": .string("tts muted (or quiet mode)")])
                 }
-                let stats = try await tts.speak(text)
-                // Drive the "speaking" hero state: report busy through the
-                // duration of the synthesized clip + a small tail.
+                // Stamp `ttsBusyUntil` BEFORE awaiting `speak` so the
+                // echo gate covers the start of TTS playback. Earlier
+                // code set this AFTER speak returned — by which point
+                // the daemon had already begun emitting the first
+                // syllables, the bot mic captured them, and STT
+                // transcribed Rocky's own voice as a user follow-up.
+                // Use a generous estimate based on word count
+                // (~0.4 s/word, +1 s for synthesis ramp); refine to
+                // the real duration once `speak` returns.
+                let estimateS = max(2.0, Double(text.split(separator: " ").count) * 0.4 + 1.0)
                 if let self {
-                    let until = Date().addingTimeInterval(stats.durationS + 0.2)
+                    let until = Date().addingTimeInterval(estimateS)
+                    await MainActor.run { self.ttsBusyUntil = until }
+                }
+                let stats = try await tts.speak(text)
+                // Refine the busy window with the real synth duration
+                // + a 1.5 s post-roll tail. The tail covers Apple
+                // Speech's STT post-processing latency: a final from
+                // the last bit of TTS audio takes ~600–1500 ms to
+                // emerge from the recognizer, after the audio itself
+                // has stopped.
+                if let self {
+                    let until = Date().addingTimeInterval(stats.durationS + 1.5)
                     await MainActor.run { self.ttsBusyUntil = until }
                 }
                 return .object([
