@@ -81,52 +81,10 @@ struct InspectorView: View {
         switch selection {
         case .health:   StatusView()
         case .activity: ActivityTab()
-        case .memory:   MemoryTabPlaceholder()
+        case .memory:   MemoryTab()
         case .motion:   MotionCard()
         case .vision:   VisionCard()
         case .raw:      LogsView()
-        }
-    }
-}
-
-/// Memory tab placeholder. Today's memory controls live in Settings;
-/// Wave 4 surfaces them here with recent-drawers preview, "remember:"
-/// inline write, and pin management. Until then this tab is a pointer.
-private struct MemoryTabPlaceholder: View {
-    @Environment(AppServices.self) private var services
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Label("Memory", systemImage: "brain")
-                .font(.headline)
-            Text("Drawer count, recall toggle, top-K, and forget-everything " +
-                 "live in Settings → Memory until Wave 4 ships the " +
-                 "dedicated tab.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            HStack {
-                Text("Drawers stored")
-                Spacer()
-                Text(services.memoryDrawerCount < 0
-                     ? "—"
-                     : "\(services.memoryDrawerCount)")
-                    .font(.body.monospacedDigit())
-                    .foregroundStyle(.primary)
-            }
-            HStack {
-                Text("Recall on each turn")
-                Spacer()
-                Text(services.settings.memoryRecallEnabled ? "on" : "off")
-                    .font(.body.monospacedDigit())
-                    .foregroundStyle(services.settings.memoryRecallEnabled
-                                       ? .green : .secondary)
-            }
-            HStack {
-                Text("Top-K")
-                Spacer()
-                Text("\(services.settings.memoryTopK)")
-                    .font(.body.monospacedDigit())
-            }
-            Spacer(minLength: 0)
         }
     }
 }

@@ -3,301 +3,392 @@ import RobotLink
 import SidecarHost
 import Speech
 
-/// Single-glance health panel. Lists every dependency Rocky needs and what's
-/// wrong (if anything). Each row uses the unified Card chrome.
+/// Inspector → Health. Severity-first triage view.
+///
+/// Per `docs/concepts/cockpit-design.md` §1.9 + §3.4: rows are
+/// reordered with the worst issue at the top; healthy items collapse
+/// into a single "All other systems healthy" disclosure (default
+/// closed when nothing's wrong). The colour state is carried by the
+/// row's leading icon; the wallpaper "ok ok ok ok" pills are gone.
+///
+/// Inline actions ("Probe", "Authorize", "Disable") sit on the
+/// trailing edge as compact bordered buttons. Inspector tabs render
+/// inside a 12pt-padded ScrollView, so this view doesn't add an
+/// outer header / page padding — the InspectorView already provides
+/// the context.
 struct StatusView: View {
     @Environment(AppServices.self) private var services
+    @State private var healthyCollapsed: Bool = true
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                header
-
-                groupCard(title: "Connections") {
-                    row(title: "Robot daemon",
-                        subtitle: robotDetail,
-                        state: robotState,
-                        icon: "antenna.radiowaves.left.and.right") {
-                        Button("Probe") {
-                            Task { await services.probeRobotPublic() }
-                        }
-                        .controlSize(.small)
-                    }
-                    Divider().opacity(0.06)
-                    row(title: "LM Studio",
-                        subtitle: llmDetail,
-                        state: llmState,
-                        icon: "brain") {
-                        Button("Probe") {
-                            Task { await services.probeLMStudioPublic() }
-                        }
-                        .controlSize(.small)
-                    }
-                }
-
-                groupCard(title: "Audio") {
-                    row(title: "Microphone",
-                        subtitle: micDetail,
-                        state: micState,
-                        icon: services.micEnabled ? "mic.fill" : "mic.slash") {
-                        Button(services.micEnabled ? "Disable" : "Enable") {
-                            Task { await services.toggleMic() }
-                        }
-                        .controlSize(.small)
-                    }
-                    Divider().opacity(0.06)
-                    row(title: "Speech recognition",
-                        subtitle: sttDetail,
-                        state: sttState,
-                        icon: "waveform.badge.mic") {
-                        Button("Authorize") {
-                            Task { _ = await services.appleSTT.requestAuthorization() }
-                        }
-                        .controlSize(.small)
-                    }
-                }
-
-                groupCard(title: "Sidecars") {
-                    row(title: "Face tracker",
-                        subtitle: faceTrackerDetail,
-                        state: sidecarState(services.faceTrackerSidecarState),
-                        icon: "eye") { EmptyView() }
-                    Divider().opacity(0.06)
-                    row(title: "TTS",
-                        subtitle: ttsDetail,
-                        state: sidecarState(services.ttsSidecarState),
-                        icon: "speaker.wave.2") { EmptyView() }
-                    Divider().opacity(0.06)
-                    row(title: "Memory",
-                        subtitle: memoryDetail,
-                        state: sidecarState(services.memorySidecarState),
-                        icon: "brain") { EmptyView() }
-                }
-            }
-            .padding(.horizontal, 24)
-            .padding(.vertical, 22)
-            .frame(maxWidth: 980, alignment: .topLeading)
-            .frame(maxWidth: .infinity)
+        VStack(alignment: .leading, spacing: 14) {
+            headerRow
+            issuesSection
+            healthySection
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     // MARK: - Header
 
-    private var header: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Status")
-                .font(.title.weight(.semibold))
-            HStack(spacing: 10) {
-                Text(summaryText).foregroundStyle(.secondary)
-                StatusPill(text: "\(healthyCount) / \(totalCount) healthy",
-                           tint: healthyCount == totalCount ? .green : .orange,
-                           systemImage: healthyCount == totalCount ? "checkmark.circle.fill" : "exclamationmark.circle")
+    private var headerRow: some View {
+        HStack(alignment: .firstTextBaseline) {
+            Label("Health", systemImage: "heart.text.square")
+                .font(.headline)
+            Spacer()
+            Text(summary)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(summaryTint)
+        }
+    }
+
+    private var summary: String {
+        let issues = rowsByCategory.lazy.flatMap(\.1).filter { !$0.state.isHealthy }
+        let issueCount = issues.count
+        if issueCount == 0 { return "All clear" }
+        return issueCount == 1 ? "1 issue" : "\(issueCount) issues"
+    }
+
+    private var summaryTint: Color {
+        rowsByCategory.lazy.flatMap(\.1).contains { !$0.state.isHealthy }
+            ? .orange : .green
+    }
+
+    // MARK: - Sections
+
+    /// Rows that are not currently healthy, sorted worst-first. These
+    /// appear at the top of the tab so the eye lands on the problem.
+    @ViewBuilder
+    private var issuesSection: some View {
+        let issues = allRows
+            .filter { !$0.state.isHealthy }
+            .sorted { $0.state.severity > $1.state.severity }
+        if issues.isEmpty {
+            allClearCallout
+        } else {
+            VStack(spacing: 0) {
+                ForEach(issues) { entry in
+                    rowView(entry)
+                    if entry.id != issues.last?.id {
+                        Divider().padding(.leading, 46)
+                    }
+                }
             }
-            .font(.subheadline)
+            .padding(.vertical, 4)
+            .background(.regularMaterial,
+                        in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
     }
 
-    private var summaryText: String {
-        if healthyCount == totalCount { return "Everything Rocky needs is online." }
-        return "Some pieces need attention."
+    /// Healthy rows folded into a single disclosure. Open it when you
+    /// want to see "yes the robot is online" reassurance, otherwise
+    /// keep your eye on the issues above.
+    @ViewBuilder
+    private var healthySection: some View {
+        let healthy = allRows.filter(\.state.isHealthy)
+        if healthy.isEmpty {
+            EmptyView()
+        } else {
+            DisclosureGroup(isExpanded: $healthyCollapsed.invertedBinding) {
+                VStack(spacing: 0) {
+                    ForEach(healthy) { entry in
+                        rowView(entry)
+                        if entry.id != healthy.last?.id {
+                            Divider().padding(.leading, 46)
+                        }
+                    }
+                }
+                .padding(.top, 6)
+            } label: {
+                Text("\(healthy.count) system\(healthy.count == 1 ? "" : "s") healthy")
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(10)
+            .background(.regularMaterial,
+                        in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        }
     }
 
-    private var totalCount: Int { 7 }
-
-    private var healthyCount: Int {
-        var n = 0
-        if robotState == .ok { n += 1 }
-        if llmState == .ok { n += 1 }
-        if micState == .ok { n += 1 }
-        if sttState == .ok { n += 1 }
-        if sidecarState(services.faceTrackerSidecarState) == .ok { n += 1 }
-        if sidecarState(services.ttsSidecarState) == .ok { n += 1 }
-        if sidecarState(services.memorySidecarState) == .ok { n += 1 }
-        return n
+    private var allClearCallout: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+            Text("All systems healthy. Rocky's body, brain, ears, voice, and memory are online.")
+                .font(.callout)
+                .foregroundStyle(.primary)
+                .lineLimit(3)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.regularMaterial,
+                    in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 
-    // MARK: - Group card
+    // MARK: - Row view
 
     @ViewBuilder
-    private func groupCard<Content: View>(
-        title: String,
-        @ViewBuilder content: () -> Content
-    ) -> some View {
-        Card {
-            CardHeader(title, icon: groupIcon(for: title))
-        } content: {
-            VStack(spacing: 0) { content() }
-                .padding(.horizontal, -8)
-                .padding(.vertical, -4)
-        }
-    }
-
-    private func groupIcon(for title: String) -> String {
-        switch title {
-        case "Connections":  return "link"
-        case "Audio":        return "ear"
-        case "Sidecars":     return "shippingbox"
-        default:             return "checkmark.shield"
-        }
-    }
-
-    // MARK: - Row
-
-    @ViewBuilder
-    private func row<Trailing: View>(
-        title: String,
-        subtitle: String,
-        state: RowState,
-        icon: String,
-        @ViewBuilder trailing: () -> Trailing
-    ) -> some View {
+    private func rowView(_ entry: HealthRow) -> some View {
         HStack(spacing: 14) {
             ZStack {
                 Circle()
-                    .fill(state.color.opacity(0.14))
+                    .fill(entry.state.color.opacity(0.14))
                     .frame(width: 32, height: 32)
-                Image(systemName: icon)
+                Image(systemName: entry.icon)
                     .font(.callout.weight(.semibold))
-                    .foregroundStyle(state.color)
+                    .foregroundStyle(entry.state.color)
             }
             VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 8) {
-                    Text(title).font(.body.weight(.semibold))
-                    statePill(state: state)
-                }
-                Text(subtitle)
+                Text(entry.title).font(.body.weight(.medium))
+                Text(entry.subtitle)
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            Spacer()
-            trailing()
+            Spacer(minLength: 8)
+            entry.action.map { action in
+                Button(action.label) { action.run() }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 12)
+        .padding(.vertical, 10)
     }
 
-    @ViewBuilder
-    private func statePill(state: RowState) -> some View {
-        switch state {
-        case .ok:      StatusPill(text: "ok",        tint: .green,    systemImage: "checkmark")
-        case .warn:    StatusPill(text: "warning",   tint: .orange,   systemImage: "exclamationmark")
-        case .bad:     StatusPill(text: "down",      tint: .red,      systemImage: "xmark")
-        case .unknown: StatusPill(text: "—",         tint: .secondary)
+    // MARK: - Row data model
+
+    private struct HealthRow: Identifiable {
+        let id: String
+        let title: String
+        let subtitle: String
+        let icon: String
+        let state: HealthState
+        let action: HealthAction?
+    }
+
+    private struct HealthAction {
+        let label: String
+        let run: () -> Void
+    }
+
+    private enum HealthState {
+        case ok
+        case warn
+        case bad
+        case unknown
+
+        var isHealthy: Bool {
+            switch self {
+            case .ok: return true
+            default:  return false
+            }
         }
-    }
 
-    // MARK: - Per-row state classification
+        var severity: Int {
+            switch self {
+            case .bad:     return 3
+            case .warn:    return 2
+            case .unknown: return 1
+            case .ok:      return 0
+            }
+        }
 
-    private enum RowState: Equatable {
-        case ok, warn, bad, unknown
         var color: Color {
             switch self {
-            case .ok:      .green
-            case .warn:    .orange
-            case .bad:     .red
-            case .unknown: .gray
+            case .ok:      return .green
+            case .warn:    return .orange
+            case .bad:     return .red
+            case .unknown: return .gray
             }
         }
     }
 
-    private var robotState: RowState {
-        switch services.daemonReachability {
-        case .online:  .ok
-        case .offline: .bad
-        case .unknown: .unknown
-        }
+    // MARK: - Row computation
+
+    private var rowsByCategory: [(String, [HealthRow])] {
+        [
+            ("Connections", [robotRow, llmRow]),
+            ("Audio",       [micRow, sttRow]),
+            ("Sidecars",    [faceSidecarRow, ttsSidecarRow, memorySidecarRow]),
+        ]
     }
-    private var robotDetail: String {
+
+    private var allRows: [HealthRow] {
+        rowsByCategory.flatMap(\.1)
+    }
+
+    private var robotRow: HealthRow {
+        let state: HealthState
+        let subtitle: String
         switch services.daemonReachability {
         case .online:
-            let endpoint = services.robotEndpoint
-            return "\(endpoint.host):\(endpoint.port) · \(services.stateUpdateCount) state frames"
-        case .offline(let reason): return reason
-        case .unknown:             return "checking…"
+            state = .ok
+            subtitle = "\(services.robotEndpoint.host):\(services.robotEndpoint.port)" +
+                       " · \(services.stateUpdateCount) state frames"
+        case .offline(let reason):
+            state = .bad
+            subtitle = reason
+        case .unknown:
+            state = .unknown
+            subtitle = "checking…"
         }
+        return HealthRow(
+            id: "robot",
+            title: "Robot daemon",
+            subtitle: subtitle,
+            icon: "antenna.radiowaves.left.and.right",
+            state: state,
+            action: HealthAction(label: "Probe") {
+                Task { await services.probeRobotPublic() }
+            }
+        )
     }
 
-    private var llmState: RowState {
+    private var llmRow: HealthRow {
+        let state: HealthState
+        let subtitle: String
         switch services.llmStatus {
-        case .online:  .ok
-        case .offline: .warn
-        case .unknown: .unknown
+        case .online(let model):
+            state = .ok
+            subtitle = "model: \(model)"
+        case .offline(let reason):
+            state = .warn
+            subtitle = reason
+        case .unknown:
+            state = .unknown
+            subtitle = "checking…"
         }
-    }
-    private var llmDetail: String {
-        switch services.llmStatus {
-        case .online(let model):  return "model: \(model)"
-        case .offline(let reason): return reason
-        case .unknown:             return "checking…"
-        }
+        return HealthRow(
+            id: "llm",
+            title: "LM Studio",
+            subtitle: subtitle,
+            icon: "brain",
+            state: state,
+            action: HealthAction(label: "Probe") {
+                Task { await services.probeLMStudioPublic() }
+            }
+        )
     }
 
-    private var micState: RowState { services.micEnabled ? .ok : .unknown }
-    private var micDetail: String {
-        services.micEnabled
+    private var micRow: HealthRow {
+        let state: HealthState = services.micEnabled ? .ok : .unknown
+        let subtitle = services.micEnabled
             ? String(format: "live · RMS %.3f", services.lastMicRMS)
             : "not listening"
+        return HealthRow(
+            id: "mic",
+            title: "Microphone",
+            subtitle: subtitle,
+            icon: services.micEnabled ? "mic.fill" : "mic.slash",
+            state: state,
+            action: HealthAction(label: services.micEnabled ? "Disable" : "Enable") {
+                Task { await services.toggleMic() }
+            }
+        )
     }
 
-    private var sttState: RowState {
+    private var sttRow: HealthRow {
+        let state: HealthState
         switch services.sttBackendName {
-        case let n where n.contains("Apple Speech"): .ok
-        case "unauthorized": .warn
-        case "unavailable":  .bad
-        default:             .unknown
+        case let n where n.contains("Apple Speech"): state = .ok
+        case "unauthorized": state = .warn
+        case "unavailable":  state = .bad
+        default:             state = .unknown
         }
-    }
-    private var sttDetail: String { services.sttBackendName }
-
-    private func sidecarState(_ s: SidecarState) -> RowState {
-        switch s {
-        case .ready:        .ok
-        case .starting:     .warn
-        case .stopped:      .unknown
-        case .failing:      .bad
-        case .circuitOpen:  .bad
-        }
-    }
-
-    private var faceTrackerDetail: String {
-        let s = services.faceTrackerSidecarState
-        let extra = "\(services.faceTargetCount) targets · \(services.faceDetectionCount) detections"
-        switch s {
-        case .stopped:                 return "stopped"
-        case .starting:                return "starting…"
-        case .ready:                   return "ready · " + extra
-        case .failing(let reason):     return "failing · \(reason)"
-        case .circuitOpen(let until):
-            let s = max(0, Int(until.timeIntervalSinceNow))
-            return "cooldown · \(s)s"
-        }
+        return HealthRow(
+            id: "stt",
+            title: "Speech recognition",
+            subtitle: services.sttBackendName,
+            icon: "waveform.badge.mic",
+            state: state,
+            action: state == .warn
+                ? HealthAction(label: "Authorize") {
+                    Task { _ = await services.appleSTT.requestAuthorization() }
+                }
+                : nil
+        )
     }
 
-    private var ttsDetail: String {
-        switch services.ttsSidecarState {
-        case .stopped:                 return "stopped"
-        case .starting:                return "starting…"
-        case .ready:                   return "ready"
-        case .failing(let reason):     return "failing · \(reason)"
-        case .circuitOpen(let until):
-            let s = max(0, Int(until.timeIntervalSinceNow))
-            return "cooldown · \(s)s"
-        }
+    private var faceSidecarRow: HealthRow {
+        sidecarRow(
+            id: "sidecar.face",
+            title: "Face tracker",
+            icon: "eye",
+            state: services.faceTrackerSidecarState,
+            extra: "\(services.faceTargetCount) targets · " +
+                   "\(services.faceDetectionCount) detections"
+        )
     }
 
-    private var memoryDetail: String {
+    private var ttsSidecarRow: HealthRow {
+        sidecarRow(
+            id: "sidecar.tts",
+            title: "TTS",
+            icon: "speaker.wave.2",
+            state: services.ttsSidecarState
+        )
+    }
+
+    private var memorySidecarRow: HealthRow {
         let count = services.memoryDrawerCount
-        let countText = count < 0 ? "—"
-            : (count == 1 ? "1 drawer" : "\(count) drawers")
-        switch services.memorySidecarState {
-        case .stopped:                 return "stopped · run Sidecars/mempalace/setup.sh"
-        case .starting:                return "starting…"
-        case .ready:                   return "ready · " + countText
-        case .failing(let reason):     return "failing · \(reason)"
+        let extra: String? = (count >= 0)
+            ? (count == 1 ? "1 drawer" : "\(count) drawers")
+            : nil
+        return sidecarRow(
+            id: "sidecar.memory",
+            title: "Memory",
+            icon: "tray.full",
+            state: services.memorySidecarState,
+            extra: extra
+        )
+    }
+
+    private func sidecarRow(
+        id: String,
+        title: String,
+        icon: String,
+        state s: SidecarState,
+        extra: String? = nil
+    ) -> HealthRow {
+        let healthState: HealthState
+        let subtitle: String
+        switch s {
+        case .ready:
+            healthState = .ok
+            subtitle = ["ready", extra].compactMap { $0 }.joined(separator: " · ")
+        case .starting:
+            healthState = .warn
+            subtitle = "starting…"
+        case .stopped:
+            healthState = .unknown
+            subtitle = "stopped"
+        case .failing(let reason):
+            healthState = .bad
+            subtitle = "failing · \(reason)"
         case .circuitOpen(let until):
+            healthState = .bad
             let s = max(0, Int(until.timeIntervalSinceNow))
-            return "cooldown · \(s)s"
+            subtitle = "cooldown · \(s)s"
         }
+        return HealthRow(id: id, title: title, subtitle: subtitle,
+                         icon: icon, state: healthState, action: nil)
+    }
+}
+
+// MARK: - Helpers
+
+private extension Binding where Value == Bool {
+    /// Returns a binding that reads/writes the negation of the source.
+    /// Used so a `DisclosureGroup(isExpanded:)` can drive a
+    /// "collapsed" state variable without flipping signs at the
+    /// callsite.
+    var invertedBinding: Binding<Bool> {
+        Binding<Bool>(
+            get: { !self.wrappedValue },
+            set: { self.wrappedValue = !$0 }
+        )
     }
 }

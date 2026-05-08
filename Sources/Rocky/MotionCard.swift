@@ -61,17 +61,23 @@ struct MotionCard: View {
             Label("Motion", systemImage: "figure.stand")
                 .font(.headline)
             Spacer()
-            HStack(spacing: 6) {
+            // Per the inspector principles, only Health keeps status
+            // pills — here motors mode and frame count are quiet caption
+            // text on the trailing edge instead.
+            HStack(spacing: 8) {
                 if let mode = services.lastRobotState?.controlMode {
-                    StatusPill(
-                        text: "motors: \(mode.rawValue)",
-                        tint: mode == .enabled ? .green : .gray,
-                        systemImage: mode == .enabled
-                            ? "bolt.fill" : "pause.circle"
-                    )
+                    Label(mode.rawValue,
+                          systemImage: mode == .enabled
+                              ? "bolt.fill" : "pause.circle")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(mode == .enabled
+                                            ? AnyShapeStyle(.green)
+                                            : AnyShapeStyle(.secondary))
+                        .labelStyle(.titleAndIcon)
                 }
-                StatusPill(text: "\(services.stateUpdateCount) frames",
-                           tint: .secondary)
+                Text("\(services.stateUpdateCount.formatted()) frames")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -133,7 +139,7 @@ private struct AngleRow: View {
         ZStack {
             Circle()
                 .trim(from: 0.625, to: 0.875)
-                .stroke(.tertiary.opacity(0.4),
+                .stroke(.tertiary,
                         style: StrokeStyle(lineWidth: 4, lineCap: .round))
                 .rotationEffect(.degrees(180))
             Circle()
@@ -159,7 +165,7 @@ private struct AntennaRow: View {
         VStack(spacing: 6) {
             ZStack {
                 Capsule()
-                    .fill(.tertiary.opacity(0.4))
+                    .fill(.tertiary)
                     .frame(width: 4, height: 32)
                 Capsule()
                     .fill(.green.opacity(0.8))

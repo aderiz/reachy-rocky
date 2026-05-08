@@ -57,10 +57,11 @@ struct ActivityTab: View {
                         .padding(.vertical, 4)
                         .background(
                             Capsule()
-                                .fill(on ? Color.accentColor.opacity(0.18)
-                                          : Color.gray.opacity(0.10))
+                                .fill(on ? AnyShapeStyle(.tint.opacity(0.18))
+                                          : AnyShapeStyle(.quaternary))
                         )
-                        .foregroundStyle(on ? Color.accentColor : Color.secondary)
+                        .foregroundStyle(on ? AnyShapeStyle(.tint)
+                                          : AnyShapeStyle(.secondary))
                 }
                 .buttonStyle(.plain)
                 .help(on ? "Hide \(label(cat).lowercased()) moments"
@@ -100,6 +101,7 @@ struct ActivityTab: View {
                      : "No moments match the active filters.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 40)
