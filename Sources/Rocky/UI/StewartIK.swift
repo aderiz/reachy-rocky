@@ -221,16 +221,17 @@ final class StewartIK {
                 var ant  = passIn(new Float64Array(antennas));
                 var r = exports.calculate_passive_joints(head[0], head[1], ant[0], ant[1]);
                 var out = getOut(r[0], r[1]);
-                // Free ALL three wasm allocations — input arrays
-                // and result. Earlier shim only freed the result,
-                // leaking inputs at ~1.8 KB/s when the avatar
-                // polls at 10 Hz. Pressure on linear memory was
-                // the real reason JSC kept detaching the cached
-                // typed-array views. `slice()` in getOut copied
-                // the result already, so freeing now is safe.
-                exports.__wbindgen_free(head[0], head[1] * 8, 8);
-                exports.__wbindgen_free(ant[0],  ant[1]  * 8, 8);
-                exports.__wbindgen_free(r[0],    r[1]    * 8, 8);
+                // Only free the OUTPUT. wasm-bindgen's `Vec<f64>`
+                // parameter convention is consume-by-move: the Rust
+                // function takes ownership of the input buffers and
+                // frees them internally. Calling `__wbindgen_free`
+                // on the inputs from JS is a double-free that
+                // corrupts the wasm heap and silently breaks
+                // calculate_passive_joints (the avatar slumps
+                // because passive joints come back as garbage).
+                // Output Vec<f64> is owned by the caller — the
+                // existing single free is correct.
+                exports.__wbindgen_free(r[0], r[1] * 8, 8);
                 return Array.prototype.slice.call(out);
             }
         };
