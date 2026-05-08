@@ -16,6 +16,13 @@ public actor RobotMicService {
     public private(set) var lastSampleRate: Int = 16_000
     public private(set) var lastDoaRad: Double?
     public private(set) var lastDoaIsSpeech: Bool = false
+    /// First `.state(.ready)` corresponds to the initial start in
+    /// `start()` — we already issued `start_recording` synchronously
+    /// for that one. Subsequent `.ready` transitions mean the
+    /// supervisor respawned the sidecar (e.g. after the runner's
+    /// stall watchdog fired), and the new process is sitting idle
+    /// waiting for `start_recording` to be re-issued.
+    private var seenInitialReady: Bool = false
 
     public init(buffer: AudioRingBuffer, sidecar: any Sidecar, logBus: LogBus) {
         self.buffer = buffer
@@ -35,22 +42,59 @@ public actor RobotMicService {
             // sidecar already up — continue to start_recording.
         }
 
-        struct Empty: Encodable, Sendable {}
-        struct R: Decodable, Sendable { let recording: Bool }
-        let _: R = try await sidecar.send(method: "start_recording", params: Empty())
+        try await issueStartRecording()
 
         // Pump unsolicited events into the ring buffer.
         let events = sidecar.events
         pumpTask?.cancel()
         pumpTask = Task { [weak self] in
             for await event in events {
-                if case .event(let name, let payload) = event {
-                    await self?.handleEvent(name: name, payload: payload)
-                }
+                await self?.handleSidecarEvent(event)
                 if Task.isCancelled { break }
             }
         }
         isRunning = true
+    }
+
+    private func issueStartRecording() async throws {
+        struct Empty: Encodable, Sendable {}
+        struct R: Decodable, Sendable { let recording: Bool }
+        let _: R = try await sidecar.send(method: "start_recording", params: Empty())
+    }
+
+    private func handleSidecarEvent(_ event: SidecarOutboundEvent) async {
+        switch event {
+        case .event(let name, let payload):
+            await handleEvent(name: name, payload: payload)
+        case .state(let s):
+            // Resume recording on supervisor-driven restarts. The
+            // Python `start_recording` is idempotent (it no-ops if
+            // already recording), so this is safe even if a
+            // transient `.ready` comes through that wasn't a restart.
+            if s == .ready {
+                if !seenInitialReady {
+                    seenInitialReady = true
+                } else if isRunning {
+                    do {
+                        try await issueStartRecording()
+                        await logBus.publish(.sidecarLog(
+                            sidecar: "robot-mic",
+                            level: .info,
+                            message: "resumed recording after sidecar restart",
+                            fields: [:]
+                        ))
+                    } catch {
+                        await logBus.publish(.error(
+                            scope: "robot-mic",
+                            message: "restart resume failed: \(error)",
+                            recoverable: true
+                        ))
+                    }
+                }
+            }
+        case .log:
+            break
+        }
     }
 
     public func stop() async {
