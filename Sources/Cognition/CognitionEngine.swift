@@ -492,18 +492,42 @@ public actor CognitionEngine {
     /// form natively, but small models forget; cleanup at the
     /// boundary is the reliable fix.
     public static func cleanupForTTS(_ text: String) -> String {
-        // 1. Drop straight + curly quote characters. We keep the
+        var out = text
+
+        // 1. Strip chat-template artifacts. Some models (Gemma 4
+        // running through harmony-style chat templates, certain
+        // misconfigured tokenizers) leak template tokens into the
+        // user-visible text: `<|channel|>final<|message|>...`,
+        // `<channel|>`, `<|im_start|>`, etc. They make the chat
+        // unreadable and confuse the TTS engine.
+        out = out.replacingOccurrences(
+            of: "<[^>]*\\|[^>]*>",
+            with: "",
+            options: .regularExpression
+        )
+
+        // 2. Strip a leading `=` that some templates put before
+        // function-call values (e.g. `="Rocky ready..."`). After
+        // template tokens are gone this is sometimes the only
+        // remaining artifact.
+        out = out.replacingOccurrences(
+            of: "^\\s*=\\s*",
+            with: "",
+            options: .regularExpression
+        )
+
+        // 3. Drop straight + curly quote characters. We keep the
         // punctuation between phrases (the period at the end of
         // each quoted segment), so the resulting prose still has
         // sentence breaks: `"Foo." "Bar."` → `Foo. Bar.`.
-        var out = text
+        out = out
             .replacingOccurrences(of: "\"", with: "")
             .replacingOccurrences(of: "\u{201C}", with: "") // U+201C left "
             .replacingOccurrences(of: "\u{201D}", with: "") // U+201D right "
             .replacingOccurrences(of: "\u{2018}", with: "") // U+2018 left '
             .replacingOccurrences(of: "\u{2019}", with: "") // U+2019 right '
 
-        // 2. Symbol / abbreviation expansion. Order matters — do
+        // 4. Symbol / abbreviation expansion. Order matters — do
         // the multi-char patterns before the single-char ones so
         // `°C` becomes "degrees" not "degrees C".
         out = out
@@ -530,6 +554,15 @@ public actor CognitionEngine {
             )
         }
 
+        // 5. Acronym spacing — split runs of 2-5 uppercase letters
+        // surrounded by word boundaries with a thin space, so TTS
+        // engines pronounce them letter-by-letter (`CNN` →
+        // `C N N`) instead of as a mangled syllable. The 2-5 cap
+        // skips long all-caps shouts (rare in Rocky's persona);
+        // word-boundary anchors skip embedded sequences inside
+        // CamelCase or URLs.
+        out = Self.spaceAcronyms(in: out)
+
         // Collapse runs of whitespace introduced by the
         // replacements above.
         out = out.replacingOccurrences(
@@ -538,6 +571,44 @@ public actor CognitionEngine {
             options: .regularExpression
         )
         return out.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Insert spaces between letters of any 2-5-character all-caps
+    /// word so TTS reads it letter-by-letter. `CNN` → `C N N`,
+    /// `BBC` → `B B C`. Two-letter combinations like `OK` /
+    /// `UK` / `US` are also spaced — TTS engines render them
+    /// either way (`OK` is usually `O-K` regardless), and the
+    /// uniformity is worth the slight redundancy.
+    private static func spaceAcronyms(in text: String) -> String {
+        let pattern = "\\b[A-Z]{2,5}\\b"
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return text
+        }
+        let nsText = text as NSString
+        let range = NSRange(location: 0, length: nsText.length)
+        let matches = regex.matches(in: text, range: range)
+        guard !matches.isEmpty else { return text }
+
+        var result = ""
+        var lastEnd = 0
+        for match in matches {
+            let r = match.range
+            if r.location > lastEnd {
+                result += nsText.substring(
+                    with: NSRange(
+                        location: lastEnd,
+                        length: r.location - lastEnd
+                    )
+                )
+            }
+            let acronym = nsText.substring(with: r)
+            result += acronym.map(String.init).joined(separator: " ")
+            lastEnd = r.location + r.length
+        }
+        if lastEnd < nsText.length {
+            result += nsText.substring(from: lastEnd)
+        }
+        return result
     }
 
     public static func stripFencedJSONBlocks(from text: String) -> String {
