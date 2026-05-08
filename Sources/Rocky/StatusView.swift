@@ -296,10 +296,28 @@ struct StatusView: View {
     }
 
     private var micRow: HealthRow {
-        let state: HealthState = services.micEnabled ? .ok : .unknown
-        let subtitle = services.micEnabled
-            ? String(format: "live · RMS %.3f", services.lastMicRMS)
-            : "not listening"
+        // Distinguishes three live states: off, listening with frames
+        // arriving, listening but stalled (sidecar respawning, WebRTC
+        // dropped, etc — Health was reading green here before because
+        // it only checked sidecar lifecycle, not actual data flow).
+        let state: HealthState
+        let subtitle: String
+        if !services.micEnabled {
+            state = .unknown
+            subtitle = "not listening"
+        } else if let last = services.lastMicFrameAt,
+                  Date().timeIntervalSince(last) < 3 {
+            state = .ok
+            subtitle = String(format: "live · RMS %.3f", services.lastMicRMS)
+        } else {
+            state = .warn
+            if let last = services.lastMicFrameAt {
+                let s = Int(Date().timeIntervalSince(last))
+                subtitle = "stalled · last frame \(s)s ago"
+            } else {
+                subtitle = "stalled · no frames yet"
+            }
+        }
         return HealthRow(
             id: "mic",
             title: "Microphone",

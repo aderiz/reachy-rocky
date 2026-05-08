@@ -16,6 +16,10 @@ public actor RobotMicService {
     public private(set) var lastSampleRate: Int = 16_000
     public private(set) var lastDoaRad: Double?
     public private(set) var lastDoaIsSpeech: Bool = false
+    /// Wall-clock timestamp of the most recent audio frame from the
+    /// sidecar. Health surfaces use this to distinguish "mic enabled,
+    /// frames flowing" from "mic enabled, sidecar respawning silently".
+    public private(set) var lastFrameAt: Date?
     /// First `.state(.ready)` corresponds to the initial start in
     /// `start()` — we already issued `start_recording` synchronously
     /// for that one. Subsequent `.ready` transitions mean the
@@ -132,6 +136,7 @@ public actor RobotMicService {
                 }
             }
             floats.withUnsafeBufferPointer { buffer.write($0) }
+            lastFrameAt = Date()
 
         case "doa":
             if let dict = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] {

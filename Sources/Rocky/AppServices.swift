@@ -94,6 +94,12 @@ final class AppServices {
     // Live voice state
     var micEnabled: Bool = false
     var lastMicRMS: Float = 0
+    /// Wall-clock timestamp of the most recent audio frame the Health
+    /// surfaces should treat as "alive". Mirror of `RobotMicService.lastFrameAt`
+    /// (or `MicService.lastFrameAt` for the Mac mic). When `micEnabled`
+    /// is true but this is older than ~3s, the mic is silently stalled
+    /// and the Health row reflects warning, not green.
+    var lastMicFrameAt: Date?
     var lastTranscript: String = ""
     var lastDispatched: String?
     var conversationOpenUntil: Date?
@@ -948,6 +954,7 @@ final class AppServices {
             _ = audioBuffer.drain()
             micEnabled = false
             lastMicRMS = 0
+            lastMicFrameAt = nil
             lastTranscript = ""
         } else {
             do {
@@ -976,8 +983,12 @@ final class AppServices {
                         let rms: Float = useRobot
                             ? await self.robotMic.lastRMS
                             : self.mic.lastRMS
+                        let frameAt: Date? = useRobot
+                            ? await self.robotMic.lastFrameAt
+                            : self.mic.lastFrameAt
                         await MainActor.run {
                             self.lastMicRMS = rms
+                            self.lastMicFrameAt = frameAt
                         }
                         // 10 Hz: smooth-enough VU without thrashing redraws.
                         try? await Task.sleep(nanoseconds: 100_000_000)

@@ -27,6 +27,11 @@ public final class MicService: @unchecked Sendable {
     /// Latest RMS over the most recently delivered frame. Useful for VU meters.
     public private(set) var lastRMS: Float = 0
 
+    /// Wall-clock timestamp of the most recent audio frame written to
+    /// the buffer. Mirrors `RobotMicService.lastFrameAt` so the Health
+    /// surface can detect a stalled mic regardless of source.
+    public private(set) var lastFrameAt: Date?
+
     /// Construct with a caller-supplied shared buffer (Mac mic + robot mic
     /// write into the same buffer so `VoiceCoordinator` reads one source).
     public init(buffer: AudioRingBuffer, logBus: LogBus) {
@@ -116,6 +121,7 @@ public final class MicService: @unchecked Sendable {
         var sumSq: Double = 0
         for i in 0..<frames { sumSq += Double(bytes[i]) * Double(bytes[i]) }
         lastRMS = Float((sumSq / Double(max(1, frames))).squareRoot())
+        lastFrameAt = Date()
 
         buffer.write(bytes)
     }
