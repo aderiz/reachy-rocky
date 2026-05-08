@@ -428,37 +428,68 @@ public actor CognitionEngine {
         return (resolvedName, "{}")
     }
 
-    /// Removes any fenced JSON block from the assistant text. We don't want
-    /// the raw JSON cluttering the displayed transcript when we've already
-    /// dispatched it as a tool call.
+    /// Removes JSON-tagged fenced blocks (``` ```json … ``` ```) from
+    /// the assistant text. Tightened from "any fenced block" to
+    /// "json-tagged only" because the previous version stripped
+    /// legitimate `bash` / `python` code blocks the assistant might
+    /// emit when explaining code — the user would type "show me a
+    /// Bash one-liner" and the rendered chat showed nothing.
     public static func stripFencedJSONBlocks(from text: String) -> String {
         var out = text
-        // Match ```json ... ``` and ``` ... ``` (optional language tag).
-        let pattern = "```(?:[a-zA-Z0-9_-]*)\\s*[\\s\\S]*?```"
-        if let regex = try? NSRegularExpression(pattern: pattern) {
-            let range = NSRange(out.startIndex..., in: out)
-            out = regex.stringByReplacingMatches(in: out, range: range, withTemplate: "")
-        }
+        let range = NSRange(out.startIndex..., in: out)
+        out = Self.fenceJSONTaggedRegex.stringByReplacingMatches(
+            in: out, range: range, withTemplate: ""
+        )
         return out.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Pulls the body of every fenced code block from `text`.
+    /// Pulls the body of every fenced JSON code block from `text`.
     private static func fencedJSONBodies(in text: String) -> [String] {
         var bodies: [String] = []
-        let pattern = "```(?:json|JSON)?\\s*([\\s\\S]*?)```"
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return bodies }
         let nsRange = NSRange(text.startIndex..., in: text)
-        for match in regex.matches(in: text, range: nsRange) {
+        for match in Self.fenceJSONBodyRegex.matches(in: text, range: nsRange) {
             if match.numberOfRanges >= 2,
                let r = Range(match.range(at: 1), in: text) {
                 bodies.append(String(text[r]).trimmingCharacters(in: .whitespacesAndNewlines))
             }
         }
-        // Also accept a bare top-level JSON object if the entire reply is one.
+        // Also accept a bare top-level JSON object if the entire reply
+        // is one — but only when the object has a tool-call-shaped key
+        // at the top level. Without that gate, an assistant reply that
+        // *describes* JSON ("the request body is `{...}`") could
+        // accidentally fire a tool call against a tool name embedded
+        // in the example.
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.hasPrefix("{") && trimmed.hasSuffix("}") && bodies.isEmpty {
+        if bodies.isEmpty,
+           trimmed.hasPrefix("{"), trimmed.hasSuffix("}"),
+           Self.bareJsonHasToolCallShape(trimmed) {
             bodies.append(trimmed)
         }
         return bodies
     }
+
+    /// Cheap structural check: does the bare JSON have at least one of
+    /// the keys we recognise as a tool-call shape? Avoids parsing
+    /// twice (the caller will JSONSerialization-decode it again
+    /// regardless) but is enough to gate accidental dispatch on
+    /// example JSON.
+    private static func bareJsonHasToolCallShape(_ text: String) -> Bool {
+        for needle in ["\"tool\"", "\"name\"", "\"function\"", "\"tool_calls\""] {
+            if text.contains(needle) { return true }
+        }
+        return false
+    }
+
+    // Compiled once — patterns are constant. NSRegularExpression is
+    // safe to share across threads per Apple's docs.
+    private static let fenceJSONBodyRegex: NSRegularExpression = {
+        // swiftlint:disable:next force_try
+        try! NSRegularExpression(pattern: "```(?:json|JSON)?\\s*([\\s\\S]*?)```")
+    }()
+    private static let fenceJSONTaggedRegex: NSRegularExpression = {
+        // Only json-tagged fences — not bare ``` … ``` and not
+        // ```python / ```bash / etc.
+        // swiftlint:disable:next force_try
+        try! NSRegularExpression(pattern: "```(?:json|JSON)\\s*[\\s\\S]*?```")
+    }()
 }
