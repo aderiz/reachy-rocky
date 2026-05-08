@@ -227,8 +227,15 @@ public actor CognitionEngine {
                     // the assistant message instead of calling the
                     // tool, leaving Rocky silent while the chat shows
                     // text.
+                    // Auto-say only when the cleaned text contains
+                    // actual letters. The strip passes above can
+                    // leave punctuation residue (`. ,` etc.) when
+                    // the model emitted nothing but tool-code
+                    // artifacts; saying that aloud is worse than
+                    // saying nothing.
                     let toSpeak = cleanedText
-                    if !spokeThisTurn, !toSpeak.isEmpty {
+                    let hasLetters = toSpeak.contains(where: \.isLetter)
+                    if !spokeThisTurn, !toSpeak.isEmpty, hasLetters {
                         struct SayArgs: Encodable { let text: String }
                         let args = (try? JSONEncoder().encode(SayArgs(text: toSpeak)))
                             .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
@@ -506,7 +513,26 @@ public actor CognitionEngine {
             options: .regularExpression
         )
 
-        // 2. Strip a leading `=` that some templates put before
+        // 2. Strip Gemma's `tool_code` channel format. Gemma 4
+        // sometimes emits tool calls as TEXT in this shape:
+        //     ="tool_code"
+        //     search_web{query: top news today}
+        // The OpenAI tool_calls path catches the structured
+        // version, but the text channel still leaks the same
+        // call as gibberish. Drop the `tool_code` literal AND
+        // any function-call-shaped text (`name{args}`).
+        out = out.replacingOccurrences(
+            of: "(?:=\\s*)?\"?tool_code\"?",
+            with: "",
+            options: .regularExpression
+        )
+        out = out.replacingOccurrences(
+            of: "[a-zA-Z_][a-zA-Z0-9_]*\\s*\\{[^}]*\\}",
+            with: "",
+            options: .regularExpression
+        )
+
+        // 3. Strip a leading `=` that some templates put before
         // function-call values (e.g. `="Rocky ready..."`). After
         // template tokens are gone this is sometimes the only
         // remaining artifact.
