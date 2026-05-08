@@ -148,27 +148,43 @@ struct StatusView: View {
         }
     }
 
-    /// Healthy rows folded into a single disclosure. Open it when you
-    /// want to see "yes the robot is online" reassurance, otherwise
-    /// keep your eye on the issues above.
+    /// Healthy rows folded into a single disclosure, grouped by the
+    /// capability headings that match the hero strip. Open it for the
+    /// "yes the robot is online" reassurance — and to see exactly
+    /// which sub-component sits under each capability tile.
     @ViewBuilder
     private var healthySection: some View {
-        let healthy = allRows.filter(\.state.isHealthy)
-        if healthy.isEmpty {
+        let groups = rowsByCategory
+            .map { ($0.0, $0.1.filter(\.state.isHealthy)) }
+            .filter { !$0.1.isEmpty }
+        let total = groups.reduce(0) { $0 + $1.1.count }
+        if total == 0 {
             EmptyView()
         } else {
             DisclosureGroup(isExpanded: $healthyCollapsed.invertedBinding) {
-                VStack(spacing: 0) {
-                    ForEach(healthy) { entry in
-                        rowView(entry)
-                        if entry.id != healthy.last?.id {
-                            Divider().padding(.leading, 46)
+                VStack(spacing: 14) {
+                    ForEach(groups, id: \.0) { (heading, rows) in
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text(heading.uppercased())
+                                .font(.caption2.weight(.semibold))
+                                .tracking(0.6)
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 4)
+                                .padding(.bottom, 4)
+                            VStack(spacing: 0) {
+                                ForEach(rows) { entry in
+                                    rowView(entry)
+                                    if entry.id != rows.last?.id {
+                                        Divider().padding(.leading, 46)
+                                    }
+                                }
+                            }
                         }
                     }
                 }
                 .padding(.top, 6)
             } label: {
-                Text("\(healthy.count) system\(healthy.count == 1 ? "" : "s") healthy")
+                Text("\(total) system\(total == 1 ? "" : "s") healthy")
                     .font(.callout.weight(.medium))
                     .foregroundStyle(.secondary)
             }
@@ -277,11 +293,18 @@ struct StatusView: View {
     // MARK: - Row computation
 
     fileprivate var rowsByCategory: [(String, [HealthRow])] {
+        // Section headings match the capability strip 1:1 — each
+        // tile up top corresponds to exactly one section here. A
+        // user reading "Listen is yellow" can scan straight down
+        // to the Listen section and see whether it's the mic or
+        // speech recognition that failed.
         [
-            ("Connections", [robotRow, llmRow]),
-            ("Audio",       [micRow, sttRow]),
-            ("Vision",      [cameraRow, faceSidecarRow]),
-            ("Sidecars",    [ttsSidecarRow, memorySidecarRow]),
+            ("Body",   [robotRow]),
+            ("Listen", [micRow, sttRow]),
+            ("See",    [cameraRow, faceSidecarRow]),
+            ("Think",  [llmRow]),
+            ("Speak",  [ttsSidecarRow]),
+            ("Memory", [memorySidecarRow]),
         ]
     }
 
