@@ -52,8 +52,10 @@ public actor RobotCameraService {
         // state changes — AsyncStream is effectively single-consumer,
         // so two iterators competing over `sidecar.events` would
         // race for each item and randomly drop frames or state
-        // transitions.
-        let events = sidecar.events
+        // transitions. `subscribe()` registers synchronously on
+        // the runtime's actor so frame events between subscribe
+        // and the first iteration are not lost.
+        let events = await sidecar.subscribe()
         pumpTask?.cancel()
         pumpTask = Task { [weak self] in
             for await event in events {

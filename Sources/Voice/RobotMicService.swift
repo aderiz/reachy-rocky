@@ -48,8 +48,12 @@ public actor RobotMicService {
 
         try await issueStartRecording()
 
-        // Pump unsolicited events into the ring buffer.
-        let events = sidecar.events
+        // Subscribe BEFORE start_recording to ensure no audio events
+        // are lost. Use `subscribe()` (synchronous insert on the
+        // actor) rather than `events` so the brief Task-scheduling
+        // window can't drop a frame between subscribe and first
+        // iteration.
+        let events = await sidecar.subscribe()
         pumpTask?.cancel()
         pumpTask = Task { [weak self] in
             for await event in events {

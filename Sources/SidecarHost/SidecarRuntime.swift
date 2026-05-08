@@ -15,7 +15,7 @@ public actor SidecarRuntime: Sidecar {
     public nonisolated let manifest: SidecarManifest
     public var state: SidecarState { _state }
 
-    /// Multicast event source. Each access returns a fresh
+    /// Multicast event source. Each call returns a fresh
     /// `AsyncStream` subscribed to a single internal broadcast point;
     /// every emitted event is delivered to every active subscriber in
     /// order. Supports the supervisor watcher, the per-sidecar Swift
@@ -28,7 +28,34 @@ public actor SidecarRuntime: Sidecar {
     /// `.state(.ready)` events landed unpredictably and either the
     /// restart never fired or the new sidecar never got
     /// `start_recording` re-issued.
+    ///
+    /// Subscriber registration runs synchronously inside the actor
+    /// (the call is `async` and inserts the continuation before
+    /// returning), so events emitted between `subscribe()` returning
+    /// and the consumer's first iteration are NOT lost. The
+    /// non-throwing `events` property keeps the older synchronous
+    /// API for code paths that can tolerate the brief insertion
+    /// race; new code should prefer `subscribe()`.
+    public func subscribe() -> AsyncStream<SidecarOutboundEvent> {
+        AsyncStream(bufferingPolicy: .bufferingNewest(256)) { continuation in
+            let id = UUID()
+            // Synchronous insert — we're already on the actor.
+            self.subscribers[id] = continuation
+            continuation.yield(.state(self._state))
+            continuation.onTermination = { [weak self] _ in
+                Task { [weak self] in
+                    await self?.removeSubscriber(id: id)
+                }
+            }
+        }
+    }
+
     public nonisolated var events: AsyncStream<SidecarOutboundEvent> {
+        // Bridge to the actor-isolated `subscribe()` for callsites
+        // that haven't migrated. There is a small window between this
+        // returning and the Task running where state-only events can
+        // land in the buffer (state replay handles `.state`); for
+        // exact-ordering guarantees use `subscribe()`.
         AsyncStream(bufferingPolicy: .bufferingNewest(256)) { continuation in
             let id = UUID()
             Task { [weak self] in
