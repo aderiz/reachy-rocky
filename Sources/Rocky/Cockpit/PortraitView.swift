@@ -24,7 +24,7 @@ struct PortraitView: View {
         VStack(spacing: 0) {
             Spacer(minLength: 0)
             head
-                .padding(.horizontal, 24)
+                .padding(.horizontal, 12)
             Spacer(minLength: 0)
             namePlate
                 .padding(.horizontal, 24)
@@ -55,7 +55,7 @@ struct PortraitView: View {
             passiveJoints: services.lastRobotState?.passiveJoints
         )
         .aspectRatio(1, contentMode: .fit)
-        .frame(maxWidth: 520, maxHeight: 520)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .accessibilityElement()
         .accessibilityLabel(accessibilityState)
         .accessibilityAddTraits(.updatesFrequently)

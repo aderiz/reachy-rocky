@@ -122,15 +122,21 @@ private struct AvatarSceneView: NSViewRepresentable {
         }
         scene.rootNode.addChildNode(presentation)
 
-        // Camera framed on the full bot.
+        // Camera framed on the full bot. The lookAt target sits a
+        // touch above the head plate's vertical centre so the bot
+        // doesn't visually sink in the frame as the column gets
+        // taller. FOV is narrower than a typical 35-mm-equivalent
+        // so the bot fills more of its container — the cockpit
+        // column gives it the whole left half, and a tight portrait
+        // crop reads better than a wide-angle "scene" feel here.
         let lookAtTarget = SCNNode()
-        lookAtTarget.position = SCNVector3(0, 0.20, 0)
+        lookAtTarget.position = SCNVector3(0, 0.18, 0)
         scene.rootNode.addChildNode(lookAtTarget)
 
         let cameraNode = SCNNode()
         cameraNode.name = "camera"
         let camera = SCNCamera()
-        camera.fieldOfView = 32
+        camera.fieldOfView = 26
         camera.zNear = 0.01
         camera.zFar = 5
         cameraNode.camera = camera
