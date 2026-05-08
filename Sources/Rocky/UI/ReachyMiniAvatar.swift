@@ -213,55 +213,39 @@ struct ReachyMiniAvatar: NSViewRepresentable {
             passiveJoints: [Double]?
         ) {
             guard let robot else { return }
+            _ = state  // sleep state no longer drives the avatar
 
-            let isSleeping = (state == .sleeping)
+            // Always show the rod meshes — they're load-bearing
+            // visually (without them the gap between motor arms and
+            // upper plate looks broken). Whether they animate
+            // correctly depends on whether the daemon (or the WASM
+            // IK below) is providing passive-joint angles.
+            robot.setStewartLinkageHidden(false)
 
-            // Antennas — sleep folds them down regardless of live
-            // values; awake uses the daemon's reported angles.
-            let antennaPair: (left: Float, right: Float)
-            if isSleeping {
-                let fold = Float.pi
-                antennaPair = (left: fold, right: fold)
-            } else {
-                antennaPair = (
-                    left: Float(antennas?.left ?? 0),
-                    right: Float(antennas?.right ?? 0)
-                )
-            }
-
-            // Body yaw — single rotation around the foot, always live.
+            // Body yaw — always live.
             robot.setBodyYaw(Float(bodyYaw ?? 0))
 
-            // Stewart platform — preferred path. When motor angles are
-            // available we drive the URDF as the Pollen app does:
-            //   1. setStewartActuators(headJoints)
-            //   2. compute passive joints (use daemon's if present;
-            //      fall back to local WASM IK; fall back to zeros)
-            //   3. setJoint(passive_N_x|y|z, ...) for each
-            // Sleep state ignores motor angles and uses the head-Euler
-            // override so the bot looks visibly slumped — the rods
-            // would visually disconnect, so we hide the linkage too.
-            if isSleeping {
-                robot.setStewartLinkageHidden(true)
-                robot.setHeadEuler(roll: 0.05, pitch: 0.55, yaw: 0)
-                robot.setAntennas(left: antennaPair.left,
-                                   right: antennaPair.right)
-                return
-            }
+            // Antennas — daemon-reported angles. Composed on top of
+            // each joint's URDF rest in the loader.
+            let leftAngle  = Float(antennas?.left  ?? 0)
+            let rightAngle = Float(antennas?.right ?? 0)
+            robot.setAntennas(left: leftAngle, right: rightAngle)
 
+            // Stewart platform — drive from the daemon's 6 motor
+            // angles when available, exactly as the Pollen Tauri app
+            // does: setStewartActuators + apply 18 passive joints.
+            // The head pose then follows from the kinematic chain;
+            // no setHeadEuler shortcut.
             if let motors = headJoints, motors.count == 6 {
-                robot.setStewartLinkageHidden(false)
                 robot.setStewartActuators(motors.map { Float($0) })
 
-                // Passive joints — daemon-provided or computed locally.
                 let passive: [Double]?
                 if let provided = passiveJoints, provided.count == 18 {
                     passive = provided
                 } else if let ik = ReachyMiniAvatar.loadIK() {
                     passive = ik.calculatePassiveJoints(
                         headJoints: motors,
-                        antennas: [Double(antennaPair.left),
-                                    Double(antennaPair.right)]
+                        antennas: [Double(leftAngle), Double(rightAngle)]
                     )
                 } else {
                     passive = nil
@@ -277,20 +261,11 @@ struct ReachyMiniAvatar: NSViewRepresentable {
                                         angle: Float(passive[base + 2]))
                     }
                 }
-            } else {
-                // Fallback: no motor angles from the daemon. Hide the
-                // linkage (it can't follow the head pose without IK)
-                // and animate the head directly. Honest stub until the
-                // daemon reports head_joints.
-                robot.setStewartLinkageHidden(true)
-                let p = pose ?? RPYPose(roll: 0, pitch: 0, yaw: 0)
-                robot.setHeadEuler(roll: Float(p.roll),
-                                    pitch: Float(p.pitch),
-                                    yaw: Float(p.yaw))
             }
-
-            robot.setAntennas(left: antennaPair.left,
-                               right: antennaPair.right)
+            // No fallback setHeadEuler. When the daemon doesn't
+            // provide motor angles, the URDF rest pose stands — the
+            // bot sits at its CAD-authored at-rest configuration,
+            // which is the most honest visual we can show.
         }
     }
 }
