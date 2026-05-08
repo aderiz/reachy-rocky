@@ -334,14 +334,39 @@ struct StatusView: View {
         )
     }
 
+    /// The Mac-side face tracker (Vision framework) is the source of
+    /// truth for `set_target` now — the deprecated Python sidecar
+    /// reads as `.stopped` even when the bot is actively tracking
+    /// the user, which read as a broken health row. Reflect the Mac
+    /// tracker's live state instead: paused / tracking <name> /
+    /// watching, with the same target+detection counters in the
+    /// inspector via the Activity tab if the user wants the raw
+    /// numbers.
     private var faceSidecarRow: HealthRow {
-        sidecarRow(
-            id: "sidecar.face",
+        let healthState: HealthState
+        let subtitle: String
+        if !services.faceTrackingEnabled {
+            healthState = .unknown
+            subtitle = "paused"
+        } else if let last = services.lastFaceDetectionAt,
+                  Date().timeIntervalSince(last) < 3 {
+            healthState = .ok
+            if let who = services.lastFaceDetection?.identity {
+                subtitle = "tracking \(who)"
+            } else {
+                subtitle = "tracking"
+            }
+        } else {
+            healthState = .ok
+            subtitle = "watching"
+        }
+        return HealthRow(
+            id: "facetracker",
             title: "Face tracker",
+            subtitle: subtitle,
             icon: "eye",
-            state: services.faceTrackerSidecarState,
-            extra: "\(services.faceTargetCount) targets · " +
-                   "\(services.faceDetectionCount) detections"
+            state: healthState,
+            action: nil
         )
     }
 
@@ -438,7 +463,7 @@ private struct SubsystemTile: View {
         case "llm":            return "Brain"
         case "mic":            return "Mic"
         case "stt":            return "Speech"
-        case "sidecar.face":   return "Eyes"
+        case "facetracker":    return "Eyes"
         case "sidecar.tts":    return "Voice"
         case "sidecar.memory": return "Memory"
         default:               return entry.title
