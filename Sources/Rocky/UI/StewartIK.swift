@@ -43,24 +43,29 @@ import JavaScriptCore
 /// via the `JSObjectMakeTypedArrayWithBytesNoCopy` C API — base64
 /// trips the bundle's size into the 50 KB range and adds a parse
 /// hop for no benefit.
+@MainActor
 final class StewartIK {
-    private let context = JSContext()!
+    private let context: JSContext
     private let stewart: JSValue
+    /// Captured by the JSContext exception handler so each call can
+    /// detect and clear errors. Reset before each request and read
+    /// after — without resetting, a stale exception from a previous
+    /// call would mask new failures.
+    private var jsError: Error?
 
     init(wasmURL: URL) throws {
-        // Quiet exception trap — surface anything the JS side throws
-        // as a Swift error rather than silently failing.
-        var jsError: Error?
-        context.exceptionHandler = { _, exc in
-            let msg = exc?.toString() ?? "unknown JS exception"
-            jsError = StewartIKError.jsException(msg)
+        guard let ctx = JSContext() else {
+            throw StewartIKError.contextUnavailable
         }
+        self.context = ctx
 
-        // 1. Define the JS shim that wraps the wasm exports. Bound to a
-        // global `Stewart` object so we can call methods on it
-        // synchronously from Swift.
+        // 1. Define the JS shim. We read `context.exception` directly
+        // during init rather than installing the self-capturing
+        // handler — the latter can't run until all stored properties
+        // are initialised, and we want exception detection during
+        // shim evaluation too.
         context.evaluateScript(Self.jsShim)
-        if let jsError { throw jsError }
+        try Self.throwIfException(context)
 
         guard let stewart = context.objectForKeyedSubscript("Stewart") else {
             throw StewartIKError.shimUnavailable
@@ -74,11 +79,43 @@ final class StewartIK {
 
         // 3. Init the wasm module synchronously.
         context.evaluateScript("Stewart.init(_rockyWasmBytes);")
-        if let jsError { throw jsError }
+        try Self.throwIfException(context)
         // Drop the bytes from the global scope — they're inside the
         // wasm module's memory now and the JS reference would just
         // pin a copy.
         context.evaluateScript("_rockyWasmBytes = null;")
+
+        // 4. Now that all stored properties are initialised, install
+        // the per-call handler that captures self. JSContext fires
+        // exception callbacks synchronously on the calling thread,
+        // and we only drive this from @MainActor — the
+        // `assumeIsolated` is safe under that contract.
+        context.exceptionHandler = { [weak self] _, exc in
+            let msg = exc?.toString() ?? "unknown JS exception"
+            MainActor.assumeIsolated {
+                self?.jsError = StewartIKError.jsException(msg)
+            }
+        }
+    }
+
+    /// Throw if a JS exception is currently parked on the context.
+    /// Used during init when the per-call handler isn't wired yet.
+    private static func throwIfException(_ context: JSContext) throws {
+        if let exc = context.exception {
+            let msg = exc.toString() ?? "unknown JS exception"
+            context.exception = nil
+            throw StewartIKError.jsException(msg)
+        }
+    }
+
+    /// Reset `jsError`, run `body`, throw if the handler captured one.
+    /// Used so each entry-point checks for fresh exceptions instead
+    /// of inheriting stale ones from a prior call.
+    private func evaluate<T>(_ body: () -> T) throws -> T {
+        jsError = nil
+        let result = body()
+        if let jsError { throw jsError }
+        return result
     }
 
     /// Run the wasm IK. Returns 21 passive-joint angles, or nil on
@@ -94,9 +131,22 @@ final class StewartIK {
         headJoints: [Double], headPoseMatrix: [Double]
     ) -> [Double]? {
         guard headJoints.count == 7, headPoseMatrix.count == 16 else { return nil }
-        guard let result = stewart.invokeMethod(
-            "calculatePassive", withArguments: [headJoints, headPoseMatrix]
-        ), !result.isUndefined, !result.isNull else {
+        // Wrap in `evaluate` so the per-call jsError reset triggers
+        // — a JS exception thrown inside `calculatePassive` would
+        // otherwise stick in the captured slot and silently mask
+        // future failures.
+        let result: JSValue?
+        do {
+            result = try evaluate {
+                stewart.invokeMethod(
+                    "calculatePassive",
+                    withArguments: [headJoints, headPoseMatrix]
+                )
+            }
+        } catch {
+            return nil
+        }
+        guard let result, !result.isUndefined, !result.isNull else {
             return nil
         }
         guard let array = result.toArray() as? [Double], array.count == 21 else {
@@ -171,7 +221,16 @@ final class StewartIK {
                 var ant  = passIn(new Float64Array(antennas));
                 var r = exports.calculate_passive_joints(head[0], head[1], ant[0], ant[1]);
                 var out = getOut(r[0], r[1]);
-                exports.__wbindgen_free(r[0], r[1] * 8, 8);
+                // Free ALL three wasm allocations — input arrays
+                // and result. Earlier shim only freed the result,
+                // leaking inputs at ~1.8 KB/s when the avatar
+                // polls at 10 Hz. Pressure on linear memory was
+                // the real reason JSC kept detaching the cached
+                // typed-array views. `slice()` in getOut copied
+                // the result already, so freeing now is safe.
+                exports.__wbindgen_free(head[0], head[1] * 8, 8);
+                exports.__wbindgen_free(ant[0],  ant[1]  * 8, 8);
+                exports.__wbindgen_free(r[0],    r[1]    * 8, 8);
                 return Array.prototype.slice.call(out);
             }
         };
@@ -206,6 +265,7 @@ final class StewartIK {
 }
 
 enum StewartIKError: Error {
+    case contextUnavailable
     case shimUnavailable
     case jsException(String)
     case wasmMissing
