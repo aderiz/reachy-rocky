@@ -910,28 +910,35 @@ final class AppServices {
     }
 
     /// Defensive shutdown for app quit. Stops the target streamer
-    /// FIRST so no more `set_target` writes go out, then disables
-    /// the daemon's motor controller so the bot doesn't keep
-    /// absorbing whatever pose was last commanded. Each step is
-    /// best-effort with a hard timeout — Rocky must exit promptly
-    /// even if the daemon is unreachable.
+    /// first (no more `set_target` writes), then plays the daemon's
+    /// `goto_sleep` recorded move so the head eases down before
+    /// motors release — letting it free-fall would damage the
+    /// neck Stewart linkage and is jarring to watch.
+    /// `goToSleep()` itself handles the disable at the end of
+    /// the animation; we only need a 4s budget to cover the ~2.7s
+    /// move plus daemon round-trip. NSApplicationMain waits up to
+    /// 5s for `reply(toApplicationShouldTerminate:)` so this fits.
     func safeShutdown() async {
         await targetStreamer.stop()
         do {
             try await withThrowingTaskGroup(of: Void.self) { group in
                 group.addTask { [robotLink] in
-                    try await robotLink.setMotorMode(.disabled)
+                    try await robotLink.goToSleep()
                 }
                 group.addTask {
-                    try await Task.sleep(nanoseconds: 1_500_000_000)
+                    try await Task.sleep(nanoseconds: 4_000_000_000)
                     throw CancellationError()
                 }
                 try await group.next()
                 group.cancelAll()
             }
         } catch {
-            // Best-effort. Daemon offline / timeout is fine — the
-            // important thing is that no more writes leave Rocky.
+            // Best-effort. Daemon offline / timeout — fall through
+            // to a hard disable so the bot doesn't keep absorbing
+            // the last commanded pose. If the daemon is reachable
+            // but the move fails, this still puts motors at rest;
+            // if the daemon is unreachable, both calls no-op.
+            try? await robotLink.setMotorMode(.disabled)
         }
         await stop()
     }
