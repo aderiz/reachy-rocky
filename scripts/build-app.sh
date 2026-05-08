@@ -68,6 +68,12 @@ cat > "$CONTENTS/Info.plist" <<'PLIST'
     <key>NSCameraUsageDescription</key>
     <string>Rocky may use the Mac camera as a fallback when the robot's camera isn't available.</string>
 
+    <key>NSCalendarsUsageDescription</key>
+    <string>Rocky reads your calendar so he can answer questions about your schedule and what's coming up.</string>
+
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>Rocky reads your calendar so he can answer questions about your schedule and what's coming up.</string>
+
     <!-- Allow plain HTTP to the local-network daemon and LM Studio. -->
     <key>NSAppTransportSecurity</key>
     <dict>

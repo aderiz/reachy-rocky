@@ -1898,6 +1898,8 @@ final class AppServices {
             }
         )
         await RememberTool.register(in: toolRegistry, memory: memory)
+        await CalendarTool.register(in: toolRegistry)
+        await WeatherTool.register(in: toolRegistry)
     }
 
     private func probeRobot() async {
