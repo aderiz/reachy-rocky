@@ -2,6 +2,79 @@
 
 Append-only chronological record. Each entry: `## [YYYY-MM-DD] <op> | <subject>`. Run `grep "^## \[" log.md | tail -20` for the recent timeline.
 
+## [2026-05-08] doc | Top-level README + wiki catch-up
+
+The wiki had drifted out of date; the last log entry before this was
+2026-05-07 (cockpit design), but several substantial surfaces shipped
+between then and now without docs. Catch-up pass:
+
+- `README.md` (new, repo root) — what Rocky is, hardware/software
+  prerequisites, install + first-run + day-to-day commands, the LM
+  Studio / sidecar / voice-reference setup, troubleshooting, pointers
+  into `docs/`.
+- `docs/concepts/voice-pipeline.md` (new) — the listen path from mic
+  → ring buffer → VAD → STT → wake filter → cognition. Includes the
+  pre-roll buffer, queued-segment logic, mic-source switch, and the
+  calibration model now exposed via Settings → Voice → Calibrate.
+- `docs/concepts/tools-registry.md` (new) — schema/handler shape,
+  dispatch path including the fenced-JSON fallback for Gemma, and an
+  inventory of the shipped tool surface.
+- `docs/concepts/permissions-authority.md` (new) — single-source-of-
+  truth model, the 5-state enum (granted/limited/denied/notDetermined/
+  restricted), the "permission against the debug binary" pitfall and
+  the signing flow that fixes it.
+- `docs/index.md` — added the three new concept pages, removed the
+  stale "dashboard fills in M3+" stub.
+
+What had landed since 2026-05-07 and was not yet documented:
+
+- **Cockpit waves**. `CockpitView` + `PortraitView` + `MomentStrip` +
+  `ConversationView` replaced the old card stack. `Inspector*` is the
+  drawer (Activity/Memory tabs).
+- **Voice loop end-to-end**. `MicService` / `RobotMicService` →
+  `AudioRingBuffer` (drop-newest under saturation) → `EnergyVAD` (live-
+  tunable threshold) → `AppleSpeechSTT` (with first-launch retry for
+  locale-data race) → `WakeFilter` → `VoiceCoordinator`.
+- **Microphone calibration**. New Settings → Voice → "Sensitivity"
+  section with manual slider + guided 2-phase calibration sheet
+  (`MicCalibrationView`). Persists `micVADThreshold` in UserDefaults;
+  applied live to the running VAD via `voice.setVADThreshold(_)`.
+- **Tools registry — full set**. `look_at`, `set_motor_mode`,
+  `wake_up`, `go_to_sleep`, `stop_motion`, `play_emotion`, `express`,
+  `pause_face_tracking`, `resume_face_tracking`, `say`, `stop_speaking`,
+  `get_state`, plus `Sources/Rocky/Tools/`: `get_current_time`,
+  `read_calendar`, `get_weather`, `search_web`, `remember`. Each tool
+  has its own static `register(in:)` entry point.
+- **Cognition resilience**. `CognitionEngine.extractFencedToolCalls`
+  recovers Gemma's markdown-wrapped invocations; `cleanupForTTS`
+  strips quotes / template tokens / abbreviations before TTS so the
+  spoken output sounds natural.
+- **Permissions authority**. `Sources/Rocky/Permissions/
+  PermissionsAuthority.swift` is the single source of truth for mic /
+  speech / calendar / location, with the 5-state enum and per-process
+  cache pitfall handled via `requestAuthorization`.
+- **Stewart-platform 3D avatar**. `RockyAvatar` + `StewartIK` (WASM
+  via JavaScriptCore) — head pose drives an inverse-kinematics linkage
+  in the portrait. `wasm-bindgen Vec<f64>` consume-by-move convention
+  documented in source.
+- **Single-instance guard + clean shutdown**. `RockyApp.init` enforces
+  one running instance; `applicationShouldTerminate` plays
+  `goToSleep` instead of an abrupt motor disable.
+- **Memory sidecar**. `Sources/Memory/MemoryService.swift` wraps the
+  `mempalace` sidecar; recall + record stitched into the LLM turn loop.
+- **Robot-camera + robot-mic sidecars**. WebRTC over the `reachy_mini`
+  SDK with three-tier (mic) and two-tier (camera) recovery. Mutex
+  around the shared media handle so the two sidecars don't tear each
+  other's session down.
+- **Build/sign flow**. `scripts/build-app.sh` prefers Apple Development /
+  Developer ID over ad-hoc, intentionally drops `--options runtime`
+  (hardened runtime + ad-hoc + no entitlements silently refused
+  Calendar TCC on Sequoia).
+
+The CLAUDE.md rule — "Anything you learn from a source, the user, or
+your own work goes there per `docs/WIKI.md`" — applies going forward,
+including a `log.md` entry per non-trivial session.
+
 ## [2026-05-07] doc | Cockpit design — UI design contract
 
 A HIG-grounded design pass for Rocky's user-facing surface, after multiple

@@ -1,7 +1,7 @@
 ---
 title: Wiki Index
 type: index
-last_updated: 2026-05-07
+last_updated: 2026-05-08
 ---
 
 # Index
@@ -19,6 +19,9 @@ The catalog of every page in the wiki.
 - [Media architecture](concepts/media-architecture.md) — `local`/`webrtc`/`no_media` backends, GStreamer/IPC.
 - [App lifecycle](concepts/app-lifecycle.md) — entry points, single-app constraint, SIGINT shutdown.
 - [Cockpit design](concepts/cockpit-design.md) — UI design contract: stage + margin + drawer + toolbar window, menu bar as persistent surface, six-wave roadmap.
+- [Voice / listen pipeline](concepts/voice-pipeline.md) — mic → ring buffer → VAD → STT → wake filter → cognition; pre-roll buffer, queued segment, calibration, echo gate.
+- [Tools registry](concepts/tools-registry.md) — schema/handler shape, dispatch path, fenced-JSON fallback for Gemma, inventory of the shipped tools.
+- [Permissions authority](concepts/permissions-authority.md) — single source of truth, 5-state enum, TCC + signing pitfalls, debug-binary trap.
 
 ## Reference
 
@@ -53,15 +56,35 @@ The catalog of every page in the wiki.
 
 ## Rocky implementation
 
-The Rocky macOS app lives in `Sources/`, `Tests/`, `Sidecars/`. Plan: `~/.claude/plans/i-d-like-this-to-swirling-octopus.md`.
+The Rocky macOS app lives in `Sources/`, `Tests/`, `Sidecars/`. Top-level
+README: `README.md` (install + day-to-day commands). Plan:
+`~/.claude/plans/i-d-like-this-to-swirling-octopus.md` (historical).
 
-Foundational packages landed in M1 first-pass scaffold (see `log.md`):
+Swift packages (see `Package.swift`):
 
-- `RockyKit` — types: `HeadPose`, `Antennas`, `MotorMode`, `SafetyLimits`, `RobotState`, `MotionTarget`, units.
+- `RockyKit` — value types: `HeadPose`, `Antennas`, `MotorMode`, `SafetyLimits`, `RobotState`, `MotionTarget`, units.
 - `Telemetry` — `LogBus`, `TelemetryEvent` taxonomy.
-- `SidecarHost` — `Sidecar` protocol, `SidecarManifest`, `JSONLineCodec`. Runtime/supervisor M2.
-- `RobotLink` — `RobotLinkClient`, `TargetStreamer`. Endpoints verified live in M1.
-- `Rocky` — app shell (`WindowGroup` + `MenuBarExtra`); dashboard fills in M3+.
+- `SidecarHost` — `Sidecar` protocol, `SidecarManifest`, `JSONLineCodec`, `SidecarRuntime`, `SidecarSupervisor`.
+- `RobotLink` — `RobotLinkClient`, `TargetStreamer`, `StateSubscriber`, `MediaClient`.
+- `RockyVision` — `FaceTrackerService`, `RobotCameraService`, `FaceTargetBridge`.
+- `Voice` — `MicService` / `RobotMicService`, `AudioRingBuffer`, `EnergyVAD`, `AppleSpeechSTT`, `WakeFilter`, `VoiceCoordinator`, `RobotTTS`.
+- `Cognition` — `LMStudioClient`, `SSEParser`, `ToolRegistry`, `CognitionEngine`, `JSONValue`.
+- `Memory` — `MemoryService` (mempalace sidecar wrapper).
+- `Perception` — `MacFaceTracker`, `FaceLibrary` (Apple Vision feature-print enrolment).
+
+Sidecars (`Sidecars/`):
+
+- `face-tracker` — SAM 3.1 + 50 Hz critically-damped controller (default `synthetic` mode without ML extras).
+- `robot-mic` — 4-mic ReSpeaker array via WebRTC + reachy_mini SDK.
+- `robot-camera` — RGB stream via WebRTC.
+- `mlx-tts` — Chatterbox FP16 voice cloning (default `say` backend without ML extras).
+- `mempalace` — local memory store (recall + record).
+- `echo` — reference / contract test.
+
+Rocky app (`Sources/Rocky/`): cockpit window with portrait + conversation +
+moment strip, inspector drawer, menu-bar extra, Settings tabs (Brain,
+Voice, Memory, Faces, Permissions). First-run overlay walks new owners
+through prerequisites.
 
 ## Open gaps
 
