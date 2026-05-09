@@ -700,6 +700,8 @@ private struct MicSensitivityRow: View {
 
     var body: some View {
         let threshold = services.settings.micVADThreshold
+        let previous = services.settings.micVADThresholdPrevious
+        let canRevert = abs(previous - threshold) > 0.0001
         let live = Double(services.lastMicRMS)
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .firstTextBaseline) {
@@ -716,7 +718,9 @@ private struct MicSensitivityRow: View {
                 value: Binding(
                     get: { services.settings.micVADThreshold },
                     set: { newValue in
-                        services.settings.micVADThreshold = newValue
+                        // Direct slider drags also stamp `previous`
+                        // so the user can undo a manual nudge.
+                        services.settings.applyCalibratedThreshold(newValue)
                         let v = Float(newValue)
                         Task { await services.voice.setVADThreshold(v) }
                     }
@@ -735,6 +739,19 @@ private struct MicSensitivityRow: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 8)
+                if canRevert {
+                    // Surfaces only when there's something to undo.
+                    // Tooltip carries the value so the user knows
+                    // what they're going back to.
+                    Button {
+                        services.settings.applyCalibratedThreshold(previous)
+                        let v = Float(previous)
+                        Task { await services.voice.setVADThreshold(v) }
+                    } label: {
+                        Label("Revert", systemImage: "arrow.uturn.backward")
+                    }
+                    .help(String(format: "Restore previous threshold (%.4f)", previous))
+                }
                 Button { calibrating = true } label: {
                     Label("Calibrate…", systemImage: "mic.and.signal.meter")
                 }

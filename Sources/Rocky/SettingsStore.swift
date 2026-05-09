@@ -71,9 +71,18 @@ final class SettingsStore {
     /// rooms with a HVAC fan, a noisy desktop, or a far-field bot
     /// position need tuning. The Settings → Voice tab's "Calibrate"
     /// flow records a few seconds of the user's normal speaking
-    /// voice and sets this to a safe fraction of their measured
-    /// speech RMS.
+    /// voice (plus ambient room + robot noise) and sets this to a
+    /// safe fraction of their measured speech RMS.
     var micVADThreshold: Double { didSet { save() } }
+
+    /// The threshold value that was active *before* the last
+    /// calibration / slider change. Persisted so the Settings UI can
+    /// surface a one-click "Revert" if a calibration produced a worse
+    /// value. Stays in sync with `micVADThreshold` via the explicit
+    /// `applyCalibratedThreshold(_:)` helper — direct slider drags
+    /// also stamp it. Equal to `micVADThreshold` when there's nothing
+    /// to revert to.
+    var micVADThresholdPrevious: Double { didSet { save() } }
 
     init() {
         let d = UserDefaults.standard
@@ -104,7 +113,23 @@ final class SettingsStore {
         self.memoryTopK = (d.object(forKey: Keys.memoryTopK) as? Int) ?? 5
         self.firstRunCompleted = (d.object(forKey: Keys.firstRunCompleted) as? Bool) ?? false
         self.braveSearchAPIKey = d.string(forKey: Keys.braveSearchAPIKey) ?? ""
-        self.micVADThreshold = (d.object(forKey: Keys.micVADThreshold) as? Double) ?? 0.008
+        let storedVAD = (d.object(forKey: Keys.micVADThreshold) as? Double) ?? 0.008
+        self.micVADThreshold = storedVAD
+        // First launch / migration: previous == current so the UI
+        // shows no Revert affordance until a calibration moves the
+        // value.
+        self.micVADThresholdPrevious = (d.object(forKey: Keys.micVADThresholdPrevious) as? Double)
+            ?? storedVAD
+    }
+
+    /// Stamp `micVADThreshold` from a calibration / slider commit, and
+    /// snapshot the prior value into `micVADThresholdPrevious` so the
+    /// user can revert. Idempotent on a no-op change (avoids burning
+    /// the revert slot when the slider wiggles back to the same value).
+    func applyCalibratedThreshold(_ newValue: Double) {
+        guard newValue != micVADThreshold else { return }
+        micVADThresholdPrevious = micVADThreshold
+        micVADThreshold = newValue
     }
 
     /// Pick robot if the robot-mic sidecar venv has been built; otherwise mac.
@@ -149,6 +174,7 @@ final class SettingsStore {
         d.set(firstRunCompleted, forKey: Keys.firstRunCompleted)
         d.set(braveSearchAPIKey, forKey: Keys.braveSearchAPIKey)
         d.set(micVADThreshold, forKey: Keys.micVADThreshold)
+        d.set(micVADThresholdPrevious, forKey: Keys.micVADThresholdPrevious)
     }
 
     func robotEndpoint() -> RobotEndpoint {
@@ -283,5 +309,6 @@ final class SettingsStore {
         static let firstRunCompleted = "rocky.first.run.completed"
         static let braveSearchAPIKey = "rocky.brave.search.apikey"
         static let micVADThreshold = "rocky.mic.vad.threshold"
+        static let micVADThresholdPrevious = "rocky.mic.vad.threshold.previous"
     }
 }
