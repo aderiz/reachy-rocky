@@ -278,6 +278,7 @@ private struct BrainSettingsTab: View {
 /// during synthesis.
 private struct VoiceSettingsTab: View {
     @Environment(AppServices.self) private var services
+    @State private var calibrating: Bool = false
 
     var body: some View {
         Form {
@@ -292,6 +293,19 @@ private struct VoiceSettingsTab: View {
                 Text("Robot mic uses Reachy's 4-mic ReSpeaker array via WebRTC. " +
                      "Run ./Sidecars/robot-mic/setup.sh once. Source change " +
                      "applies on the next Listen toggle.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                MicSensitivityRow(calibrating: $calibrating)
+            } header: {
+                Text("Sensitivity")
+            } footer: {
+                Text("Rocky listens for speech that's louder than this " +
+                     "threshold. Click Calibrate to set it from your " +
+                     "voice and your room — recommended after moving the " +
+                     "mic, swapping rooms, or changing the source above.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -313,6 +327,10 @@ private struct VoiceSettingsTab: View {
             }
         }
         .formStyle(.grouped)
+        .sheet(isPresented: $calibrating) {
+            MicCalibrationView()
+                .environment(services)
+        }
     }
 
     private var micSourceBinding: Binding<String> {
@@ -672,6 +690,60 @@ private struct EnrollFaceForm: View {
 /// Robot speaker output volume. Drags apply live by scaling the next
 /// synthesized WAV's PCM samples — no daemon round-trip needed. The
 /// underlying setting persists immediately.
+/// Sensitivity row: live RMS readout, current threshold, manual
+/// slider, and a Calibrate button. The slider lets the user fine-tune
+/// after calibration; calibration produces a sane starting value, the
+/// slider trims it.
+private struct MicSensitivityRow: View {
+    @Environment(AppServices.self) private var services
+    @Binding var calibrating: Bool
+
+    var body: some View {
+        let threshold = services.settings.micVADThreshold
+        let live = Double(services.lastMicRMS)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline) {
+                SectionLabel(text: "VAD threshold")
+                Spacer()
+                Text(String(format: "%.4f", threshold))
+                    .font(.caption.monospacedDigit().weight(.medium))
+                    .foregroundStyle(.primary)
+                Text(String(format: "live %.4f", live))
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(live >= threshold ? .green : .secondary)
+            }
+            Slider(
+                value: Binding(
+                    get: { services.settings.micVADThreshold },
+                    set: { newValue in
+                        services.settings.micVADThreshold = newValue
+                        let v = Float(newValue)
+                        Task { await services.voice.setVADThreshold(v) }
+                    }
+                ),
+                in: 0.001...0.05,
+                step: 0.001
+            ) {
+                Text("Threshold")
+            } minimumValueLabel: {
+                Text("loud").font(.caption2).foregroundStyle(.secondary)
+            } maximumValueLabel: {
+                Text("quiet").font(.caption2).foregroundStyle(.secondary)
+            }
+            HStack {
+                Text("Watch the \u{201C}live\u{201D} number while speaking — it should sit comfortably above the threshold for normal speech and drop below it during silence.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 8)
+                Button { calibrating = true } label: {
+                    Label("Calibrate…", systemImage: "mic.and.signal.meter")
+                }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+}
+
 private struct BotVolumeSlider: View {
     @Environment(AppServices.self) private var services
 

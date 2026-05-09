@@ -65,6 +65,16 @@ final class SettingsStore {
     /// secret-shaped setting and the friction is justified.
     var braveSearchAPIKey: String { didSet { save() } }
 
+    /// Voice-activity-detection RMS threshold. Audio frames louder
+    /// than this are treated as speech; quieter frames as silence.
+    /// Default 0.008 covers most desk-mic / robot-array setups but
+    /// rooms with a HVAC fan, a noisy desktop, or a far-field bot
+    /// position need tuning. The Settings → Voice tab's "Calibrate"
+    /// flow records a few seconds of the user's normal speaking
+    /// voice and sets this to a safe fraction of their measured
+    /// speech RMS.
+    var micVADThreshold: Double { didSet { save() } }
+
     init() {
         let d = UserDefaults.standard
         self.robotHost = d.string(forKey: Keys.robotHost) ?? "reachy-mini.local"
@@ -94,6 +104,7 @@ final class SettingsStore {
         self.memoryTopK = (d.object(forKey: Keys.memoryTopK) as? Int) ?? 5
         self.firstRunCompleted = (d.object(forKey: Keys.firstRunCompleted) as? Bool) ?? false
         self.braveSearchAPIKey = d.string(forKey: Keys.braveSearchAPIKey) ?? ""
+        self.micVADThreshold = (d.object(forKey: Keys.micVADThreshold) as? Double) ?? 0.008
     }
 
     /// Pick robot if the robot-mic sidecar venv has been built; otherwise mac.
@@ -137,6 +148,7 @@ final class SettingsStore {
         d.set(memoryTopK, forKey: Keys.memoryTopK)
         d.set(firstRunCompleted, forKey: Keys.firstRunCompleted)
         d.set(braveSearchAPIKey, forKey: Keys.braveSearchAPIKey)
+        d.set(micVADThreshold, forKey: Keys.micVADThreshold)
     }
 
     func robotEndpoint() -> RobotEndpoint {
@@ -270,5 +282,6 @@ final class SettingsStore {
         static let memoryTopK = "rocky.memory.topk"
         static let firstRunCompleted = "rocky.first.run.completed"
         static let braveSearchAPIKey = "rocky.brave.search.apikey"
+        static let micVADThreshold = "rocky.mic.vad.threshold"
     }
 }

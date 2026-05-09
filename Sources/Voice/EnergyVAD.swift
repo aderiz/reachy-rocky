@@ -49,7 +49,12 @@ public struct EnergyVAD: VAD {
         }
     }
 
-    private(set) public var config: Config
+    /// Live-mutable so callers (e.g. a calibration flow) can retune
+    /// the threshold without restarting the listen pipeline. The
+    /// frame-counting state (`loudFrames`/`quietFrames`) is intentionally
+    /// not reset on threshold change — a re-tune mid-utterance just
+    /// shifts the cutoff for subsequent frames.
+    public var config: Config
     private(set) public var inSpeech: Bool = false
     private var loudFrames: Int = 0
     private var quietFrames: Int = 0

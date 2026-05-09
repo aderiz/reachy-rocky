@@ -135,6 +135,22 @@ public actor VoiceCoordinator {
         self.stt = engine
     }
 
+    /// Live-update the VAD's RMS threshold. Called by AppServices
+    /// after the user runs the calibration flow or moves the
+    /// sensitivity slider. Threshold change takes effect on the
+    /// very next frame; the in-flight VAD state (loud/quiet frame
+    /// counters) is preserved so a re-tune mid-utterance doesn't
+    /// drop the user's speech segment.
+    public func setVADThreshold(_ rms: Float) {
+        vad.config.rmsThreshold = rms
+    }
+
+    /// Snapshot of the current VAD threshold. Useful for the
+    /// calibration UI to show the current value before/after.
+    public func currentVADThreshold() -> Float {
+        vad.config.rmsThreshold
+    }
+
     public func openConversationWindow() async {
         await wake.openWindow()
         if case .open(let until) = await wake.state {

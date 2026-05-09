@@ -470,8 +470,18 @@ final class AppServices {
         )
 
         let micSource = SharedBufferAudioSource(buffer: buf)
+        // Seed the VAD with the user's calibrated threshold (or
+        // 0.008 default). applySettings() will live-update it on
+        // subsequent setting changes; passing it here ensures the
+        // threshold is right from the very first frame, instead
+        // of running 0.008 until applySettings runs.
+        let vadConfig = EnergyVAD.Config(
+            rmsThreshold: Float(settings.micVADThreshold)
+        )
         self.voice = VoiceCoordinator(
-            source: micSource, stt: self.appleSTT, wake: self.wakeFilter, logBus: bus
+            source: micSource, stt: self.appleSTT,
+            wake: self.wakeFilter, logBus: bus,
+            vad: EnergyVAD(config: vadConfig)
         )
 
         // Voice out (TTS): mlx-tts sidecar. `say` backend uses /usr/bin/python3
@@ -1651,6 +1661,7 @@ final class AppServices {
         ))
         await faceLibrary.setAcceptThreshold(settings.faceMatchThreshold)
         await robotTTS.setVolume(settings.audioVolume)
+        await voice.setVADThreshold(Float(settings.micVADThreshold))
         await probeLMStudio()
     }
 
