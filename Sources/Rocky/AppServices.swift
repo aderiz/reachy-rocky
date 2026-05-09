@@ -1535,9 +1535,12 @@ final class AppServices {
     }
 
     func wakeRobot() async {
-        // wakeUp now runs two goto segments (yawn lift + settle), total
-        // ~2.6–3 s of motion. transitioningUntil suppresses the face
-        // tracker streamer and shows "Waking" in the UI for the duration.
+        // wakeUp pre-seeds set_target to the current physical pose,
+        // enables motors (at-rest, no snap), and runs a single ~2 s
+        // minjerk goto to neutral. transitioningUntil suppresses the
+        // face-tracker streamer (and TargetStreamer.setPrimaryMoveActive)
+        // for the full window so the goto isn't fought by streaming
+        // updates.
         await MainActor.run {
             self.transitioningUntil = Date().addingTimeInterval(3.2)
         }

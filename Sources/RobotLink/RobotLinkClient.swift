@@ -183,12 +183,41 @@ public actor RobotLinkClient {
     /// gotos (which were a behaviour change just before "no video /
     /// no audio" started — keeping the move minimal so the daemon
     /// can't get confused).
+    ///
+    /// Pre-seed step explained: the daemon stores a commanded
+    /// `set_target` independent of motor mode. While motors are
+    /// disabled (sleeping) it sits at whatever was last sent —
+    /// typically (0, 0, 0) at boot or a stale face-tracker pose. When
+    /// `setMotorMode(.enabled)` fires, motors snap from physical
+    /// position (slumped) to that stale target *instantly*. That
+    /// snap is the visible "pop" the user reported, after which the
+    /// goto from (0, 0, 0) to (0, 0, 0) had nothing to interpolate.
+    /// Pre-seeding `set_target` with the current physical head pose
+    /// makes motor engagement a no-op transition, so the goto can
+    /// own the entire visible motion.
+    ///
     /// `setMotorMode` errors are swallowed (`try?`): if the daemon
     /// rejects the mode change transiently, the goto still attempts
     /// and the second `setMotorMode` re-asserts.
     public func wakeUp() async throws {
+        // Pre-seed: anchor the daemon's commanded pose to where the
+        // head physically is. Best-effort — if `state/full` fails
+        // we fall back to neutral, which at worst reproduces the old
+        // pop (never something worse). The 50 ms settle gives the
+        // daemon a tick to register the new target before we hand
+        // motors over.
+        let anchor: RPYPose
+        if let snapshot = try? await fullState() {
+            anchor = snapshot.headPose
+        } else {
+            anchor = RPYPose(roll: 0, pitch: 0, yaw: 0)
+        }
+        try? await setTarget(MotionTarget(headPose: anchor))
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
         try? await setMotorMode(.enabled)
         try? await Task.sleep(nanoseconds: 150_000_000)
+
         try await goto(
             headPose: RPYPose(roll: 0, pitch: 0, yaw: 0),
             durationS: 2.0,
