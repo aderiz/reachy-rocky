@@ -558,3 +558,10 @@ A few load-bearing ones:
 - **Update the wiki.** Anything you learn from a source, the user, or
   your own work goes into `docs/` per `docs/WIKI.md`. Add an entry
   to `docs/log.md` for each non-trivial session.
+
+---
+
+## License
+
+[MIT](LICENSE) — do anything you like with the code, just keep the
+copyright notice and don't sue me when something breaks.
