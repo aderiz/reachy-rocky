@@ -16,6 +16,25 @@ when you close the lid.
 
 > Rocky is a personal project, not a Pollen Robotics product.
 
+> 🪨 **About the name and voice.** This Rocky talks in the
+> broken-English style of [Rocky in Andy Weir's *Project Hail
+> Mary*](https://en.wikipedia.org/wiki/Project_Hail_Mary) — third
+> person, no articles, base-form verbs, `, question?` suffix on
+> questions, and a few catchphrases borrowed straight from the book
+> ("Amaze amaze amaze!", "Fist my bump.", "It is time go."). Example
+> exchange:
+>
+> > **You:** I just shipped the feature.
+> >
+> > **Rocky:** Amaze amaze amaze! Fist my bump.
+>
+> It's an intentional persona, defined as `defaultPersona` in
+> [`Sources/Rocky/SettingsStore.swift`](Sources/Rocky/SettingsStore.swift).
+> Edit in Settings → Brain → Persona if you'd rather a different
+> voice. The robot the app drives is a Reachy Mini Wireless from
+> Pollen Robotics; the *Rocky* name and voice are an homage, not
+> affiliated with the book or its author.
+
 > ⚠️ **Early stage — expect bugs.** Rocky is a personal experiment
 > shared in case it's useful to others. It is not a finished product.
 > Things will break: voice mishears, the LLM hallucinates tool calls,
@@ -40,9 +59,11 @@ when you close the lid.
   `get_weather`, `read_calendar`, `search_web`, `remember`).
 - **Fenced-JSON fallback.** Recovers tool calls from models like
   Gemma that don't reliably emit OpenAI `tool_calls`.
-- **Persona that holds.** Rocky speaks in third person with dropped
-  articles ("Rocky see sun. Warm."), maintained via a versioned
-  persona prompt that auto-migrates across upgrades.
+- **Persona that holds.** Rocky speaks in the third-person,
+  dropped-article style of Rocky from Andy Weir's *Project Hail
+  Mary* ("Rocky see sun. Warm."), maintained via a versioned persona
+  prompt that auto-migrates across upgrades. Editable in
+  Settings → Brain → Persona.
 - **Local memory** via the `mempalace` sidecar. Top-K relevant
   snippets are injected into each LLM turn; toggle off in
   `Settings → Memory`.
