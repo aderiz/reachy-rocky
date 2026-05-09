@@ -2,6 +2,51 @@
 
 Append-only chronological record. Each entry: `## [YYYY-MM-DD] <op> | <subject>`. Run `grep "^## \[" log.md | tail -20` for the recent timeline.
 
+## [2026-05-09] doc | Correction — face tracking is Apple Vision, not SAM 3.1
+
+The README and several docs claimed face tracking ran on SAM 3.1 via
+the `face-tracker` Python sidecar. That was the M3 *plan*; it was never
+implemented (see `Sidecars/face-tracker/rocky_face_tracker/runner.py`
+lines 92-94 — `sam` mode falls through to the synthetic detector with
+a `"non-synthetic detector not yet implemented"` log line).
+
+What actually ships:
+
+- Real face tracking is Swift-side in
+  `Sources/Perception/MacFaceTracker.swift`. It pulls JPEG frames from
+  the `robot-camera` sidecar, runs Apple Vision's
+  `VNDetectFaceRectanglesRequest`, picks the largest bbox, converts to
+  world-frame yaw/pitch using the camera's 65°/39° FOV, smooths with
+  EMA + a critically-damped 50 Hz controller, and pushes the smoothed
+  pose into `TargetStreamer`.
+- The Python `face-tracker` sidecar is now correctly described as a
+  **synthetic-target test scaffold** (Lissajous pattern) used during
+  development without a robot or camera. It's still wired through
+  `FaceTrackerService` → `FaceTargetBridge` for that purpose, but the
+  shipped path is `robot-camera` → `MacFaceTracker` → `TargetStreamer`.
+- The `[sam]` extras in `pyproject.toml` and the `ROCKY_FT_MODE=sam`
+  manifest knob are kept (so a future ML detector can slot in via the
+  same sidecar without churn) but are now flagged as unimplemented in
+  every doc that mentioned them.
+
+Files corrected:
+
+- `README.md` — Vision feature bullet, sidecar setup commands,
+  robot-camera comment.
+- `CLAUDE.md` — face-tracker target-loop description, sidecar setup
+  block, validated-implementation pointer.
+- `docs/index.md` — face-tracker sidecar entry; robot-camera entry.
+- `docs/concepts/rocky-architecture.md` — block diagram (added
+  `Perception/MacFaceTracker`, expanded sidecar list); face-tracker
+  loop description.
+- `docs/concepts/sidecar-convention.md` — sidecars-in-the-tree table.
+- `docs/decisions/0002-rocky-app.md` — context paragraph on the
+  project memory that drove the decision (plan said SAM,
+  implementation chose Apple Vision; the design constraints held).
+- `docs/decisions/0003-sidecar-convention.md` — context paragraph and
+  the `mlx-swift`-rejected alternative footnote.
+- `Sidecars/face-tracker/pyproject.toml` — package description.
+
 ## [2026-05-08] doc | Top-level README + wiki catch-up
 
 The wiki had drifted out of date; the last log entry before this was

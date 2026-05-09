@@ -49,9 +49,17 @@ Rocky is a native macOS app that acts as the *nervous system* for a Reachy Mini 
 |     |     |- ToolRegistry   (8+ handlers wired into RobotLink/Voice)    |
 |     |     \- CognitionEngine (turn loop, tool dispatch, transcript)     |
 |     |                                                                   |
+|     |                                                                   |
+|     |--- Perception                                                     |
+|     |     \- MacFaceTracker  (Apple Vision; consumes robot-camera frames|
+|     |                         and pushes targets into TargetStreamer)   |
+|     |                                                                   |
 |     \--- SidecarSupervisor                                              |
-|           |- face-tracker  (Python + SAM 3.1 [or synthetic])            |
-|           \- mlx-tts       (Python + F5-TTS-MLX [or `say`])             |
+|           |- face-tracker  (Python; synthetic-target test scaffold)     |
+|           |- robot-camera  (Python; WebRTC RGB stream)                  |
+|           |- robot-mic     (Python; WebRTC 4-mic ReSpeaker)             |
+|           |- mempalace     (Python; local memory store)                 |
+|           \- mlx-tts       (Python + Chatterbox FP16 [or `say`])        |
 |                                                                         |
 +-------------------------------------------------------------------------+
         |                                |                       |
@@ -65,7 +73,7 @@ Rocky is a native macOS app that acts as the *nervous system* for a Reachy Mini 
 Live data flows in **three independent loops**, each with its own cadence and ownership:
 
 1. **Robot state loop** (~10 Hz). `StateSubscriber` reads the daemon's `WS /api/state/ws/full` stream → `LogBus.motorState` → `AppServices.lastRobotState` → `MotionCard` redraws.
-2. **Face-tracker target loop** (50 Hz). `face-tracker` sidecar emits `target` events → `FaceTrackerService` → `FaceTargetBridge` → `TargetStreamer` → `POST /api/move/set_target`.
+2. **Face-tracker target loop** (50 Hz). Active path: `robot-camera` JPEG stream → `MacFaceTracker` (Apple Vision `VNDetectFaceRectanglesRequest`) → EMA + critically-damped controller → `TargetStreamer` → `POST /api/move/set_target`. The Python `face-tracker` sidecar is a synthetic-target test scaffold (Lissajous), wired in via `FaceTrackerService` → `FaceTargetBridge` for development without a robot or camera.
 3. **Voice / brain / TTS loop** (event-driven). Mic → VAD → STT → WakeFilter → CognitionEngine → tool dispatch (which may invoke `RobotTTS.speak` → mlx-tts → MediaClient.upload + play_sound).
 
 These loops never call into each other directly. Cross-loop signaling happens through `LogBus`, Observable mirrors on the main actor, or actor-message methods (e.g. `setSuppressed`).

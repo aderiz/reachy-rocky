@@ -14,11 +14,15 @@ tags: [decision, sidecar, ipc]
 
 ## Context
 
-Rocky needs to run multiple external processes — face-tracker (SAM 3.1 on
-MLX), TTS (F5-TTS-MLX), and likely more (emotion classifier, vision pipeline,
-etc.) over time. Each is Python-based, may need MLX or other heavy
-dependencies, and must integrate cleanly with Swift's structured concurrency
-model.
+Rocky needs to run multiple external processes. The original plan
+called out SAM 3.1 face tracking and F5-TTS-MLX as the canonical
+examples; in practice the shipped sidecars are TTS (Chatterbox FP16
+via `mlx-audio`), the WebRTC audio/video bridges to the robot
+(`robot-mic`, `robot-camera`), the local memory store (`mempalace`),
+and a synthetic-target test scaffold for the face-tracker. The
+rationale stands regardless of which detector lives where: each is
+Python-based, may need MLX or other heavy dependencies, and must
+integrate cleanly with Swift's structured concurrency model.
 
 The user specified explicitly: every wrapped process must follow the **same**
 convention so Swift calls them identically. No ad-hoc `Process.run`. No
@@ -68,9 +72,12 @@ Key decisions:
   concurrency to a single Python interpreter, making crash recovery and
   per-sidecar venvs basically impossible. Rejected.
 - **`mlx-swift` for everything.** Genuinely interesting; can run small
-  models in-process. But MLX-Swift's coverage of SAM 3.1 / F5-TTS-MLX is
-  unverified, and even if it worked, we'd lose process-level isolation.
-  Will revisit per-feature once `mlx-swift` matures.
+  models in-process. But MLX-Swift's coverage of the model families we
+  need (Chatterbox / Whisper / SAM-class detectors, etc.) was unverified
+  at the time, and even if it worked we'd lose process-level isolation.
+  Will revisit per-feature once `mlx-swift` matures. (As of 2026-05, the
+  one ML model that actually moved into Swift in-process was Apple
+  Vision face detection — but that's the system framework, not MLX.)
 
 ## See also
 

@@ -104,12 +104,15 @@ Rules:
 
 `SidecarRuntime.send(method:params:)` correlates the request `id` against a `[id: continuation]` table; the `JSONLineCodec` dispatches incoming envelopes back to the right continuation. Streams use `AsyncThrowingStream` and end on a matching `stream_end`.
 
-## Two real sidecars in the tree
+## Sidecars in the tree
 
 | Sidecar | Methods | Backends |
 |---|---|---|
-| `Sidecars/face-tracker/` | `set_enabled`, `set_prompt`, `update_commanded_pose`, `health` | `synthetic` (default; stdlib only) ↔ `sam` (MLX + Reachy SDK; `[sam]` extras) |
-| `Sidecars/mlx-tts/` | `synthesize`, `set_voice_ref`, `health`, `warm_up` | `say` (default; macOS bundled TTS) ↔ `f5-tts-mlx` (`[mlx]` extras + voice ref) |
+| `Sidecars/face-tracker/` | `set_enabled`, `set_prompt`, `update_commanded_pose`, `health` | `synthetic` only (Lissajous test pattern, stdlib). `sam` mode + `[sam]` extras are unimplemented stubs (`runner.py:92-94`); the runner falls through to synthetic. Real face tracking is Swift-side in `Sources/Perception/MacFaceTracker.swift`. |
+| `Sidecars/robot-camera/` | `start`, `stop`, `health`; emits `frame` JPEG events | `reachy_mini` SDK over WebRTC. Frames feed `MacFaceTracker`. |
+| `Sidecars/robot-mic/` | `start`, `stop`, `health`; emits PCM frames | `reachy_mini` SDK over WebRTC, 4-mic ReSpeaker array. |
+| `Sidecars/mlx-tts/` | `synthesize`, `set_voice_ref`, `health`, `warm_up` | `say` (default; macOS bundled TTS) ↔ `chatterbox` (`[mlx]` extras + voice ref; FP16 via `mlx-audio`). |
+| `Sidecars/mempalace/` | `recall`, `record`, `health` | local memory store. |
 
 The `echo` sidecar at `Sidecars/echo/` exists only as a contract-conformance test (`Tests/SidecarHostTests/EchoSidecarIntegrationTests.swift`).
 

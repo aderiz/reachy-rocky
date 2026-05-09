@@ -20,9 +20,13 @@ default).
 
 Memory inputs that shaped the decision:
 
-- Project memory: validated face tracker (state-driven SAM 3.1, world-frame
-  target, critically-damped 50 Hz controller). Off-robot compute on Apple
-  Silicon is faster than the CM4.
+- Project memory at planning time assumed a SAM-3.1-based face tracker
+  ported into the Rocky tree. The state-driven, world-frame, critically-
+  damped 50 Hz design held; the **detector** changed at implementation
+  time — the shipped tracker is `Sources/Perception/MacFaceTracker.swift`
+  using Apple Vision (`VNDetectFaceRectanglesRequest`) on JPEG frames
+  from the `robot-camera` sidecar. Off-robot compute on Apple Silicon
+  is faster than the CM4 either way.
 - Robot safety memory: small motion changes only.
 - "Don't band-aid" memory: name root causes; revert if needed.
 

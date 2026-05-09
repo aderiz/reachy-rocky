@@ -67,9 +67,11 @@ when you close the lid.
 
 ### Vision
 
-- **Real-time face tracking** via SAM 3.1 (synthetic-mode fallback
-  with no ML deps). State-driven world-frame target + critically-
-  damped 50 Hz head controller — calm, never jerky.
+- **Real-time face tracking** via Apple Vision
+  (`VNDetectFaceRectanglesRequest`) on JPEG frames pulled from the
+  `robot-camera` sidecar. State-driven world-frame target + EMA +
+  critically-damped 50 Hz head controller — calm, never jerky. No
+  ML model download required.
 - **Face recognition** via Apple Vision feature-prints. Enrol a face
   with a name in `Settings → Faces`; Rocky greets you by name when
   he sees you.
@@ -212,16 +214,17 @@ Each sidecar gets its own `uv venv` under
 idempotent; re-run any time `pyproject.toml` changes.
 
 ```bash
-# Always-on default. Synthetic detector — no ML deps.
+# Synthetic-target test scaffold for development without a robot or
+# camera. The real face tracker (Apple Vision) lives in Swift and
+# does not need this sidecar — but the supervisor expects the venv
+# to exist, so set it up once.
 ./Sidecars/face-tracker/setup.sh
-
-# Real SAM 3.1 face tracking (needs ~3 GB of model weights).
-FT_EXTRAS=sam,robot ./Sidecars/face-tracker/setup.sh
 
 # 4-mic ReSpeaker array via WebRTC. Default mic source on robot installs.
 ./Sidecars/robot-mic/setup.sh
 
-# RGB camera over WebRTC. Used by the cockpit's vision card and SAM.
+# RGB camera over WebRTC. Frames are consumed by Apple Vision face
+# detection in Sources/Perception/MacFaceTracker.swift.
 ./Sidecars/robot-camera/setup.sh
 
 # Local memory store (mempalace). Recall is automatic, on by default.

@@ -74,9 +74,9 @@ Swift packages (see `Package.swift`):
 
 Sidecars (`Sidecars/`):
 
-- `face-tracker` — SAM 3.1 + 50 Hz critically-damped controller (default `synthetic` mode without ML extras).
+- `face-tracker` — synthetic-target test scaffold (Lissajous pattern, stdlib only). Real face tracking is Swift-side in `Sources/Perception/MacFaceTracker.swift` (Apple Vision on `robot-camera` frames); the sidecar's `[sam]` mode was never implemented.
 - `robot-mic` — 4-mic ReSpeaker array via WebRTC + reachy_mini SDK.
-- `robot-camera` — RGB stream via WebRTC.
+- `robot-camera` — RGB stream via WebRTC; frames feed `MacFaceTracker`.
 - `mlx-tts` — Chatterbox FP16 voice cloning (default `say` backend without ML extras).
 - `mempalace` — local memory store (recall + record).
 - `echo` — reference / contract test.

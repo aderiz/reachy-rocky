@@ -18,7 +18,7 @@ The implementation plan lives at `~/.claude/plans/i-d-like-this-to-swirling-octo
 Three independent loops, each with its own cadence and ownership. They never call each other directly — cross-loop signalling happens via the `LogBus` actor or `@Observable` state on `AppServices` (the main-actor singleton). See `docs/concepts/rocky-architecture.md` for the diagram.
 
 1. **Robot state loop** (~10 Hz). `StateSubscriber` reads the daemon's `WS /api/state/ws/full` → mirrors into `AppServices.lastRobotState` → `MotionCard` redraws.
-2. **Face-tracker target loop** (50 Hz). `face-tracker` Python sidecar emits `target` events → `FaceTrackerService` → `FaceTargetBridge` → `TargetStreamer` → `POST /api/move/set_target`.
+2. **Face-tracker target loop** (50 Hz). Active path: `robot-camera` JPEG stream → `MacFaceTracker` (`Sources/Perception/`) running Apple Vision's `VNDetectFaceRectanglesRequest` on every frame → EMA + critically-damped controller → `TargetStreamer` → `POST /api/move/set_target`. The Python `face-tracker` sidecar is a **synthetic-target test scaffold** (Lissajous pattern) used for development without a robot or camera; its targets enter Rocky via `FaceTrackerService` → `FaceTargetBridge` but are normally dormant in shipped use. SAM 3.1 was the original M3b plan but never implemented — the sidecar's runner falls through to the synthetic detector if you set `ROCKY_FT_MODE=sam`.
 3. **Voice / brain / TTS loop** (event-driven). Mic → VAD → STT → `WakeFilter` → `CognitionEngine` → `ToolRegistry` (which may invoke `RobotTTS.speak` → `mlx-tts` sidecar → `MediaClient` upload + `play_sound`).
 
 ### The Sidecar contract — *the* invariant
@@ -73,14 +73,14 @@ Open `Package.swift` directly in Xcode for IDE indexing. Note: `⌘R` in Xcode r
 Each sidecar is independent. Setup is one-shot per sidecar:
 
 ```bash
-./Sidecars/face-tracker/setup.sh                # synthetic detector deps (stdlib + numpy)
-FT_EXTRAS=sam,robot ./Sidecars/face-tracker/setup.sh   # real SAM 3.1 + reachy_mini SDK
+./Sidecars/face-tracker/setup.sh                # synthetic-target test scaffold (stdlib only)
 ./Sidecars/mlx-tts/setup.sh                     # `say` backend (no deps)
 FT_EXTRAS=mlx ./Sidecars/mlx-tts/setup.sh       # Chatterbox FP16 via mlx-audio
 ./Sidecars/robot-mic/setup.sh                   # reachy_mini SDK over WebRTC
+./Sidecars/robot-camera/setup.sh                # reachy_mini SDK over WebRTC; feeds MacFaceTracker
 ```
 
-Venvs are written to `~/Library/Application Support/Rocky/sidecars/<name>/.venv/`. AppServices auto-detects venv presence to pick defaults: robot mic when `robot-mic/.venv` exists, Chatterbox TTS when `mlx-tts/.venv` exists. **The face-tracker sidecar defaults to `synthetic` mode** — set `ROCKY_FT_MODE=sam` in its manifest (or env) to switch to SAM 3.1 once the `[sam]` extras are installed.
+Venvs are written to `~/Library/Application Support/Rocky/sidecars/<name>/.venv/`. AppServices auto-detects venv presence to pick defaults: robot mic when `robot-mic/.venv` exists, Chatterbox TTS when `mlx-tts/.venv` exists. The face-tracker sidecar runs in `synthetic` mode regardless of any `ROCKY_FT_MODE` setting — its `[sam]` extras and `sam` mode are unimplemented stubs (`runner.py:92-94`); real face tracking happens Swift-side in `Sources/Perception/MacFaceTracker.swift`.
 
 ### Resetting state
 
@@ -124,6 +124,6 @@ When in doubt about a wire shape or daemon behaviour, re-fetch `http://reachy-mi
 ## Memory rules — non-negotiable
 
 - **Robot safety**: never stack motion-control changes. One tweak per iteration, verify calm, then next. After two failed tweaks in the same direction, stop and name the real problem; revert if needed.
-- **Face tracker design**: state-driven, world-frame target, critically-damped 50 Hz controller. Do **not** regress to per-frame P-control on raw image error. The validated implementation lives in `Sidecars/face-tracker/rocky_face_tracker/controller.py`.
+- **Face tracker design**: state-driven, world-frame target, critically-damped 50 Hz controller. Do **not** regress to per-frame P-control on raw image error. The shipped implementation lives in `Sources/Perception/MacFaceTracker.swift` (Apple Vision detection on `robot-camera` frames). The Python sidecar's `controller.py` is a parallel implementation for the synthetic-target test scaffold and the same design constraints apply if you ever bring an ML detector back inside it.
 - **Voice engine**: TTS uses **Chatterbox FP16** (via `mlx-audio`), not F5-TTS-MLX. The `say` backend is a placeholder.
 - **Don't band-aid**: when iterative single-parameter tweaks aren't fixing a complaint, the problem is in the signal or architecture, not the tuning. Stop, diagnose, propose a real fix or revert.

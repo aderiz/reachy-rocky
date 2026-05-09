@@ -1,7 +1,7 @@
 [project]
 name = "rocky-face-tracker"
 version = "0.1.0"
-description = "Rocky face-tracker sidecar — state-driven SAM 3.1 + 50 Hz CriticalDamper controller"
+description = "Rocky face-tracker sidecar — synthetic-target test scaffold (Lissajous + 50 Hz CriticalDamper). Real face tracking is Swift-side in Sources/Perception/MacFaceTracker.swift; the [sam] mode here is an unimplemented stub."
 requires-python = ">=3.12"
 dependencies = []
 
