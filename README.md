@@ -16,6 +16,14 @@ when you close the lid.
 
 > Rocky is a personal project, not a Pollen Robotics product.
 
+> ⚠️ **Early stage — expect bugs.** Rocky is a personal experiment
+> shared in case it's useful to others. It is not a finished product.
+> Things will break: voice mishears, the LLM hallucinates tool calls,
+> a sidecar will crash, the robot might twitch. The code changes
+> daily. Settings and stored state may be reset between updates. Use
+> at your own risk, with a robot you can stop quickly. Bug reports
+> and PRs are welcome — just know what you're getting into.
+
 ---
 
 ## Key features
@@ -460,6 +468,71 @@ points:
 Architecture decisions live in [`docs/decisions/`](docs/decisions/).
 The chronological build log is [`docs/log.md`](docs/log.md) — a good
 place to scan when you want to know "why was this done this way?".
+
+---
+
+## Built on
+
+Rocky is glue around a stack of other people's good work. The pieces
+it depends on at runtime, with thanks:
+
+### Robot platform
+
+- [Reachy Mini Wireless](https://www.pollen-robotics.com/reachy-mini/)
+  — Pollen Robotics. The robot itself, plus its on-board daemon.
+- [`pollen-robotics/reachy_mini`](https://github.com/pollen-robotics/reachy_mini)
+  — Python SDK used inside the `robot-mic`, `robot-camera`, and
+  (planned) face-tracker sidecars to access WebRTC media streams.
+
+### LLM runtime
+
+- [LM Studio](https://lmstudio.ai/) — local OpenAI-compatible model
+  server. Rocky targets its endpoint at `localhost:1234/v1`.
+- [`ml-explore/mlx`](https://github.com/ml-explore/mlx) — Apple's
+  array framework for Apple Silicon. Powers the MLX-quantised
+  variants of every model below.
+
+### Models (run inside LM Studio)
+
+- [Gemma](https://huggingface.co/google) — Google. Rocky's default
+  is `gemma-4-e4b-it-mlx`, small enough for 16 GB Macs.
+- [Qwen](https://huggingface.co/Qwen) — Alibaba. Recommended when you
+  have the RAM (Qwen 2.5 7B / 3.6 27B 4-bit) for stronger native
+  tool-calling.
+
+### Voice
+
+- [`Blaizzy/mlx-audio`](https://github.com/Blaizzy/mlx-audio) — TTS /
+  STT / STS on MLX. Rocky's `mlx-tts` sidecar uses it to load and
+  run Chatterbox.
+- [`resemble-ai/chatterbox`](https://github.com/resemble-ai/chatterbox)
+  — Resemble AI's open-source voice-cloning TTS. Rocky's "Chatterbox
+  FP16" engine.
+- Apple's `SFSpeechRecognizer`, `AVAudioEngine`, and Vision frameworks
+  for on-device STT, mic capture, and face detection (system, not
+  external).
+
+### Memory
+
+- [`MemPalace/mempalace`](https://github.com/MemPalace/mempalace) —
+  open-source AI memory store. Wrapped by the `mempalace` sidecar for
+  recall + record around every LLM turn.
+
+### Tools Rocky calls at runtime
+
+- [Brave Search API](https://brave.com/search/api/) — backs the
+  `search_web` tool. Bring your own subscription key.
+- [Open-Meteo](https://open-meteo.com/) — backs `get_weather`. Free,
+  no key, non-commercial use.
+
+### Tooling
+
+- [`astral-sh/uv`](https://github.com/astral-sh/uv) — Astral's Python
+  package manager. Every sidecar's `setup.sh` uses it to create a
+  pinned venv.
+
+If your project ends up on this list and you'd rather not be — open
+an issue and I'll remove it.
 
 ---
 
