@@ -2,6 +2,53 @@
 
 Append-only chronological record. Each entry: `## [YYYY-MM-DD] <op> | <subject>`. Run `grep "^## \[" log.md | tail -20` for the recent timeline.
 
+## [2026-05-09] doc | Hermes Agent integration design
+
+Architectural decision + concept + plan for integrating
+[Hermes Agent](https://github.com/nousresearch/hermes-agent) (NousResearch,
+MIT) as Rocky's optional advanced cognition backend. Five integration
+options were evaluated; the chosen path is **option A — Rocky-as-MCP-server,
+Hermes-as-brain**:
+
+- New `Sources/MCPHost/` Swift target exposes the existing `ToolRegistry`
+  over the Model Context Protocol stdio transport. One canonical schema
+  list; both LM Studio and Hermes call the same tools.
+- Hermes runs as a Rocky sidecar (`Sidecars/hermes/`) under ADR 0003's
+  contract — wrapped curl-pipe-bash install with a pinned SHA, isolated
+  in `~/.hermes-rocky/` so it doesn't conflict with the user's other
+  Hermes installs.
+- New `BrainBackend` protocol in `Cognition`; `LMStudioBrain` (default,
+  unchanged from today) and `HermesBrain` are interchangeable behind it.
+- Robot safety: a `MotionMutex` on `AppServices` ensures only one backend
+  holds the floor at a time. Backend switches drain in-flight tool calls
+  before flipping.
+- Memory: when Hermes is active, mempalace is paused (not deleted);
+  Honcho becomes authoritative. Switching back resumes mempalace.
+- Voice latency: the LM Studio default path is unchanged. The Hermes
+  path inherits whatever Hermes' chosen LLM provider gives — surfaced
+  in Settings as a latency hint.
+- Calm-tech: same cockpit conversation panel for both backends; a
+  small subdued indicator notes the active backend.
+- Bidirectional MCP (option E in the ADR — Rocky also reads Hermes'
+  Telegram threads via `hermes mcp serve`) is **deferred** to a follow-up
+  ADR; A is the foundation.
+
+The implementation plan has six milestones (HM1-HM6) over roughly three
+weeks: HM1 `MCPHost` package, HM2 `Sidecars/hermes/` sidecar, HM3
+`BrainBackend` protocol + `LMStudioBrain` extraction, HM4 `HermesBrain`
++ Settings + `MotionMutex`, HM5 polish, HM6 hardening.
+
+Three new docs:
+
+- `docs/decisions/0004-hermes-agent-integration.md` — ADR with all five
+  options weighed.
+- `docs/concepts/hermes-agent.md` — what Hermes is and how it fits.
+- `docs/workflows/integrate-hermes-agent.md` — the HM1-HM6 plan with
+  files, tests, validation gates.
+
+No code changes in this session — design + plan only. Implementation
+will happen on a separate prompt against this plan.
+
 ## [2026-05-08] doc | Top-level README + wiki catch-up
 
 The wiki had drifted out of date; the last log entry before this was

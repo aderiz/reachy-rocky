@@ -1,7 +1,7 @@
 ---
 title: Wiki Index
 type: index
-last_updated: 2026-05-08
+last_updated: 2026-05-09
 ---
 
 # Index
@@ -21,6 +21,7 @@ The catalog of every page in the wiki.
 - [Cockpit design](concepts/cockpit-design.md) — UI design contract: stage + margin + drawer + toolbar window, menu bar as persistent surface, six-wave roadmap.
 - [Voice / listen pipeline](concepts/voice-pipeline.md) — mic → ring buffer → VAD → STT → wake filter → cognition; pre-roll buffer, queued segment, calibration, echo gate.
 - [Tools registry](concepts/tools-registry.md) — schema/handler shape, dispatch path, fenced-JSON fallback for Gemma, inventory of the shipped tools.
+- [Hermes Agent](concepts/hermes-agent.md) — proposed opt-in advanced cognition backend; Rocky-as-MCP-server, Hermes as the brain, single-mutex robot safety, mempalace pauses while Honcho is active.
 - [Permissions authority](concepts/permissions-authority.md) — single source of truth, 5-state enum, TCC + signing pitfalls, debug-binary trap.
 
 ## Reference
@@ -35,6 +36,7 @@ The catalog of every page in the wiki.
 - [Dev loop on Wireless](workflows/dev-loop-wireless.md) — sshfs Approach A (recommended).
 - [Create an app](workflows/create-app.md) — `reachy-mini-app-assistant` CLI.
 - [Run and debug](workflows/run-and-debug.md) — daemon logs, `journalctl`, common pitfalls.
+- [Integrate Hermes Agent](workflows/integrate-hermes-agent.md) — HM1-HM6 milestone plan: `MCPHost` Swift target, `Sidecars/hermes/`, `BrainBackend` protocol, `MotionMutex`, persona migration.
 
 ## Patterns
 
@@ -53,6 +55,7 @@ The catalog of every page in the wiki.
 - [0001 — Target platform](decisions/0001-target-platform.md) — Wireless on-robot Python is the default for upstream Pollen apps.
 - [0002 — Rocky as a macOS-native nervous system](decisions/0002-rocky-app.md) — explains why Rocky is a Swift app, not a Python app on the CM4.
 - [0003 — Sidecar convention for external processes](decisions/0003-sidecar-convention.md) — JSON manifests, line-delimited JSON wire format, supervisor with restart policy + circuit breaker.
+- [0004 — Hermes Agent integration](decisions/0004-hermes-agent-integration.md) — Rocky-as-MCP-server, Hermes-as-brain via sidecar; opt-in advanced backend; `MotionMutex` arbitrates robot ownership; mempalace and Honcho are mutually-exclusive memory authorities.
 
 ## Rocky implementation
 
