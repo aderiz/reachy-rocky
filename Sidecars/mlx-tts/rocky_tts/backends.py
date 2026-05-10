@@ -45,14 +45,26 @@ def make_backend() -> Backend:
     """Pick the backend per ROCKY_TTS_BACKEND env var.
 
     Names recognised:
-      `chatterbox` (default) — Chatterbox-Turbo FP16 via mlx-audio.
+      `qwen3-tts` (v0.2 M6 default) — Qwen3-TTS-12Hz-1.7B-CustomVoice.
+        Streaming PCM with 97 ms first packet, 3-second voice clone.
+      `chatterbox` (v0.1 default) — Chatterbox-Turbo FP16 via mlx-audio.
+        Voice cloning, full-WAV (non-streaming) synthesis.
 
     Any other value (including the legacy `say`) raises — `say` was
     dropped in v0.2 M1 because it masked "the venv didn't build" with
     a robotic monotone. Run `./Sidecars/mlx-tts/setup.sh` (with the
     `[mlx]` extras) before launching Rocky.
     """
-    name = os.environ.get("ROCKY_TTS_BACKEND", "chatterbox").lower()
+    name = os.environ.get("ROCKY_TTS_BACKEND", "qwen3-tts").lower()
+    if name in {"qwen3-tts", "qwen3", "qwen", "auto"}:
+        try:
+            from .qwen3_tts_backend import Qwen3TTSBackend
+            return Qwen3TTSBackend()
+        except ImportError as exc:
+            raise RuntimeError(
+                f"Qwen3-TTS backend requested but mlx-audio is not installed "
+                f"(install with `FT_EXTRAS=mlx ./Sidecars/mlx-tts/setup.sh`): {exc}"
+            )
     if name in {"chatterbox", "chatterbox-turbo", "chatterbox-fp16",
                 "chatterbox-turbo-fp16", "mlx"}:
         try:
@@ -64,7 +76,6 @@ def make_backend() -> Backend:
                 f"(install with `FT_EXTRAS=mlx ./Sidecars/mlx-tts/setup.sh`): {exc}"
             )
     raise ValueError(
-        f"unknown TTS backend: {name!r}. The `say` backend was dropped in "
-        f"v0.2 M1; install the chatterbox venv via "
+        f"unknown TTS backend: {name!r}. Install the mlx-audio venv via "
         f"`FT_EXTRAS=mlx ./Sidecars/mlx-tts/setup.sh`."
     )

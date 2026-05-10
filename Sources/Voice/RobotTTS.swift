@@ -115,6 +115,123 @@ public actor RobotTTS {
 
     public func cancel() async throws {
         try await media.stopSound()
+        await streamingPlayer?.stop()
+    }
+
+    // MARK: - Streaming (M6 — Qwen3-TTS-12Hz)
+
+    /// Streaming player set when AppServices wires it. When non-nil
+    /// AND the sidecar reports `streams: true` in `health`, `speak`
+    /// uses the streaming path instead of the full-WAV round-trip.
+    private var streamingPlayer: StreamingTTS?
+
+    public func setStreamingPlayer(_ player: StreamingTTS?) {
+        self.streamingPlayer = player
+    }
+
+    /// Whether the sidecar reports streaming support (Qwen3-TTS-12Hz
+    /// = yes; Chatterbox = no). Cached after the first health probe.
+    private var sidecarStreamsKnown: Bool? = nil
+
+    public func sidecarSupportsStreaming() async -> Bool {
+        if let cached = sidecarStreamsKnown { return cached }
+        struct H: Decodable, Sendable { let streams: Bool? }
+        struct Empty: Encodable, Sendable {}
+        do {
+            let h: H = try await sidecar.send(method: "health", params: Empty())
+            let value = h.streams ?? false
+            sidecarStreamsKnown = value
+            return value
+        } catch {
+            sidecarStreamsKnown = false
+            return false
+        }
+    }
+
+    /// Speak via the streaming path. Yields control as soon as the
+    /// first PCM chunk lands; the full speak completes when the
+    /// player finishes the queued buffers + post-roll tail. Returns
+    /// the same `SpeakStats` shape — synthMs is the FIRST CHUNK
+    /// latency for streaming, not the full duration.
+    @discardableResult
+    public func speakStreaming(_ text: String) async throws -> SpeakStats {
+        guard let streamingPlayer else {
+            throw VoiceError.sttUnavailable("no streaming player wired")
+        }
+        let started = Date()
+        struct Params: Encodable, Sendable {
+            let text: String
+            let voice_ref_id: String?
+        }
+        struct ChunkEnvelope: Decodable, Sendable {
+            let chunk_index: Int?
+            let pcm_b64: String?
+            let sample_rate: Int?
+            let channels: Int?
+            let format: String?
+        }
+
+        let inputStream = sidecar.stream(
+            method: "synthesize_stream",
+            params: Params(text: text, voice_ref_id: voiceRefId)
+        )
+
+        // Wrap mutable first-chunk timing in a class so the
+        // AsyncThrowingStream's escaping closure can safely read it
+        // back across task boundaries.
+        final class FirstChunkTimer: @unchecked Sendable {
+            var ms: Double? = nil
+            let lock = NSLock()
+            func set(_ value: Double) {
+                lock.lock(); defer { lock.unlock() }
+                if ms == nil { ms = value }
+            }
+            func get() -> Double? {
+                lock.lock(); defer { lock.unlock() }
+                return ms
+            }
+        }
+        let timer = FirstChunkTimer()
+
+        let chunkStream = AsyncThrowingStream<(pcm: Data, sampleRate: Int), Error> { continuation in
+            let task = Task {
+                do {
+                    for try await raw in inputStream {
+                        let env = try JSONDecoder().decode(
+                            ChunkEnvelope.self, from: raw
+                        )
+                        guard
+                            let b64 = env.pcm_b64,
+                            let pcm = Data(base64Encoded: b64),
+                            let sr = env.sample_rate
+                        else { continue }
+                        timer.set(Date().timeIntervalSince(started) * 1000)
+                        continuation.yield((pcm: pcm, sampleRate: sr))
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+
+        try await streamingPlayer.play(chunks: chunkStream)
+        let totalMs = Date().timeIntervalSince(started) * 1000
+        let firstChunkMs = timer.get()
+        let stats = SpeakStats(
+            synthMs: firstChunkMs ?? 0,
+            uploadMs: 0,
+            totalMs: totalMs,
+            durationS: 0
+        )
+        self.lastStats = stats
+        await logBus.publish(.ttsRequest(
+            text: text,
+            voiceRefId: voiceRefId ?? "qwen3-tts",
+            firstChunkMs: firstChunkMs ?? 0
+        ))
+        return stats
     }
 
     /// Scale a 16-bit PCM WAV's samples by `factor` (clamped 0...1).

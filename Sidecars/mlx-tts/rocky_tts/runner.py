@@ -60,6 +60,51 @@ class Runner:
                     "synth_ms": synth_ms,
                     "backend": self.backend.name,
                 })
+            elif method == "synthesize_stream":
+                text = str(params.get("text", "")).strip()
+                voice_ref_id = params.get("voice_ref_id") or self.voice_ref_id
+                if not text:
+                    respond_error(rid, 400, "empty text")
+                    return
+                if not getattr(self.backend, "supports_streaming", False):
+                    respond_error(
+                        rid, 501,
+                        f"backend {self.backend.name!r} doesn't support streaming",
+                    )
+                    return
+                t0 = time.monotonic()
+                first_chunk_ms = None
+                total_pcm_bytes = 0
+                sample_rate = 16_000
+                index = 0
+                for pcm, sr in self.backend.synthesize_stream(text, voice_ref_id):
+                    if first_chunk_ms is None:
+                        first_chunk_ms = (time.monotonic() - t0) * 1000
+                    sample_rate = sr
+                    total_pcm_bytes += len(pcm)
+                    emit({
+                        "id": rid,
+                        "stream": {
+                            "chunk_index": index,
+                            "pcm_b64": base64.b64encode(pcm).decode("ascii"),
+                            "sample_rate": sr,
+                            "channels": 1,
+                            "format": "s16le",
+                        },
+                    })
+                    index += 1
+                emit({"id": rid, "stream_end": True})
+                duration_s = total_pcm_bytes / (sample_rate * 2)  # int16 mono
+                respond(rid, {
+                    "chunk_count": index,
+                    "first_chunk_ms": first_chunk_ms,
+                    "total_synth_ms": (time.monotonic() - t0) * 1000,
+                    "sample_rate": sample_rate,
+                    "channels": 1,
+                    "format": "s16le",
+                    "duration_s": duration_s,
+                    "backend": self.backend.name,
+                })
             elif method == "set_voice_ref":
                 name = str(params.get("name", ""))
                 wav_b64 = str(params.get("wav_b64", ""))
@@ -74,6 +119,7 @@ class Runner:
                 respond(rid, {
                     "backend": self.backend.name,
                     "voice_ref_id": self.voice_ref_id,
+                    "streams": bool(getattr(self.backend, "supports_streaming", False)),
                 })
             elif method == "warm_up":
                 t0 = time.monotonic()

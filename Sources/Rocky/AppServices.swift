@@ -31,6 +31,9 @@ final class AppServices {
     /// been installed (`Sidecars/brain/setup.sh`). When nil,
     /// CognitionEngine uses the LMStudioBrain (HTTP) fallback.
     let brainSidecar: SidecarRuntime?
+    /// M6 streaming TTS player. Receives PCM chunks from
+    /// Qwen3-TTS-12Hz and plays them via `AVAudioEngine`.
+    let streamingTTS: StreamingTTS
 
     // Voice
     let audioBuffer: AudioRingBuffer
@@ -503,6 +506,11 @@ final class AppServices {
             manifest: ttsManifest, resolver: ttsResolver, logBus: bus
         )
         self.robotTTS = RobotTTS(sidecar: ttsRuntime, media: self.mediaClient, logBus: bus)
+        // M6 streaming player. Default target: Mac local audio
+        // (lowest first-chunk latency). RobotTTS picks the streaming
+        // path when the sidecar reports `streams: true` in health
+        // — Qwen3-TTS-12Hz does, Chatterbox doesn't.
+        self.streamingTTS = StreamingTTS(logBus: bus)
 
         // Memory sidecar (mempalace). Verbatim conversation drawers +
         // semantic recall — gives Rocky a persistent memory across
@@ -827,13 +835,34 @@ final class AppServices {
         // Best-effort: bring up the TTS sidecar in the background so the
         // first `say` tool call is fast. Failure is non-fatal; the LLM
         // simply hears an error on `say` until the sidecar comes up.
-        Task { [robotTTS, logBus] in
+        Task { [robotTTS, streamingTTS, logBus] in
             do {
                 try await robotTTS.start()
+                // Wire the streaming player so RobotTTS routes through
+                // speakStreaming when the sidecar exposes streams.
+                await robotTTS.setStreamingPlayer(streamingTTS)
             } catch {
                 await logBus.publish(.error(
                     scope: "app/mlx-tts", message: "\(error)", recoverable: true
                 ))
+            }
+        }
+        // Mirror StreamingTTS.isSpeakingStream into ttsBusyUntil so the
+        // echo gate has a ground-truth busy signal (no more wordCount
+        // × 0.4 + 1.5 s heuristic — the player tells us exactly when
+        // it starts and stops).
+        let speakingStream = streamingTTS.isSpeakingStream
+        Task { [weak self] in
+            for await speaking in speakingStream {
+                await MainActor.run {
+                    if speaking {
+                        // Open-ended busy window; the false event below
+                        // closes it.
+                        self?.ttsBusyUntil = Date.distantFuture
+                    } else {
+                        self?.ttsBusyUntil = nil
+                    }
+                }
             }
         }
 
@@ -1999,30 +2028,31 @@ final class AppServices {
                     return .object(["ok": .bool(false),
                                     "error": .string("tts muted (or quiet mode)")])
                 }
-                // Stamp `ttsBusyUntil` BEFORE awaiting `speak` so the
-                // echo gate covers the start of TTS playback. Earlier
-                // code set this AFTER speak returned — by which point
-                // the daemon had already begun emitting the first
-                // syllables, the bot mic captured them, and STT
-                // transcribed Rocky's own voice as a user follow-up.
-                // Use a generous estimate based on word count
-                // (~0.4 s/word, +1 s for synthesis ramp); refine to
-                // the real duration once `speak` returns.
-                let estimateS = max(2.0, Double(text.split(separator: " ").count) * 0.4 + 1.0)
-                if let self {
-                    let until = Date().addingTimeInterval(estimateS)
-                    await MainActor.run { self.ttsBusyUntil = until }
-                }
-                let stats = try await tts.speak(text)
-                // Refine the busy window with the real synth duration
-                // + a 1.5 s post-roll tail. The tail covers Apple
-                // Speech's STT post-processing latency: a final from
-                // the last bit of TTS audio takes ~600–1500 ms to
-                // emerge from the recognizer, after the audio itself
-                // has stopped.
-                if let self {
-                    let until = Date().addingTimeInterval(stats.durationS + 1.5)
-                    await MainActor.run { self.ttsBusyUntil = until }
+                // M6: prefer the streaming path when the sidecar
+                // supports it (Qwen3-TTS-12Hz). Streaming flips
+                // `ttsBusyUntil` via the StreamingTTS.isSpeakingStream
+                // bridge — no heuristic stamp needed.
+                let supportsStream = await tts.sidecarSupportsStreaming()
+                let stats: RobotTTS.SpeakStats
+                if supportsStream {
+                    stats = try await tts.speakStreaming(text)
+                } else {
+                    // Legacy non-streaming path (Chatterbox + others
+                    // without supports_streaming): keep the v0.1
+                    // pre-stamp + post-refinement heuristic. The
+                    // estimated busy window covers the synthesis ramp;
+                    // post-stats refinement uses the real WAV
+                    // duration + 1.5 s STT post-roll tail.
+                    let estimateS = max(2.0, Double(text.split(separator: " ").count) * 0.4 + 1.0)
+                    if let self {
+                        let until = Date().addingTimeInterval(estimateS)
+                        await MainActor.run { self.ttsBusyUntil = until }
+                    }
+                    stats = try await tts.speak(text)
+                    if let self {
+                        let until = Date().addingTimeInterval(stats.durationS + 1.5)
+                        await MainActor.run { self.ttsBusyUntil = until }
+                    }
                 }
                 return .object([
                     "ok": .bool(true),
@@ -2155,28 +2185,44 @@ final class AppServices {
     }
 
     private nonisolated static func devTTSManifest(backend: String) -> SidecarManifest {
-        // M1 of v0.2: `say` backend is dropped. Chatterbox-or-fail-closed.
-        // The `backend` arg is retained for forward compatibility with M6
-        // (Qwen3-TTS-12Hz streaming), where it picks between models.
-        _ = backend
+        // M6: Qwen3-TTS-12Hz is the default; chatterbox stays as the
+        // fallback for users who prefer the existing voice character.
+        // Both load via mlx-audio in the same venv.
+        let resolved: String
+        switch backend.lowercased() {
+        case "chatterbox", "chatterbox-turbo", "chatterbox-fp16",
+             "chatterbox-turbo-fp16", "mlx":
+            resolved = "chatterbox"
+        case "qwen3-tts", "qwen3", "qwen", "auto", "":
+            resolved = "qwen3-tts"
+        default:
+            resolved = backend
+        }
         let venvPython = SidecarSupervisor.defaultVenvDir(for: "mlx-tts")
             .appendingPathComponent("bin/python")
         let sidecarDir = locateSidecarDir(named: "mlx-tts")?
             .path(percentEncoded: false) ?? "."
         return SidecarManifest(
             name: "mlx-tts",
-            version: "0.1.0-dev",
+            version: "0.2.0-dev",
             binary: venvPython.path,
             args: ["-u", "-m", "rocky_tts.runner"],
             workingDir: sidecarDir,
             env: [
                 "PYTHONPATH": sidecarDir,
-                "ROCKY_TTS_BACKEND": "chatterbox",
+                "ROCKY_TTS_BACKEND": resolved,
             ],
             readyTimeoutS: 30,
             shutdownGraceS: 3,
-            // Chatterbox first synth includes a model load; bump the timeout.
-            timeouts: ["*": 5, "synthesize": 60]
+            // First synth includes a model load (~5–10s); bump the
+            // synthesize timeout. synthesize_stream's first chunk
+            // can land in 97 ms for Qwen3-TTS once warm but include
+            // the cold-start budget too.
+            timeouts: [
+                "*": 5,
+                "synthesize": 60,
+                "synthesize_stream": 60,
+            ]
         )
     }
 

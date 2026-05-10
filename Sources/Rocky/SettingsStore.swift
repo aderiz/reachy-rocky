@@ -15,7 +15,7 @@ final class SettingsStore {
     var lmStudioModel: String { didSet { save() } }
     var lmStudioApiKey: String { didSet { save() } }
     var persona: String   { didSet { save() } }
-    var ttsBackend: String { didSet { save() } }     // "say" | "chatterbox"
+    var ttsBackend: String { didSet { save() } }     // "qwen3-tts" | "chatterbox"
     var micSource: String  { didSet { save() } }     // "mac" | "robot"
 
     /// Persona schema version. Bumped whenever `defaultPersona` is
@@ -223,8 +223,11 @@ final class SettingsStore {
             ? "robot" : "mac"
     }
 
-    /// Pick chatterbox if the venv has been built (i.e. the user ran
-    /// `FT_EXTRAS=mlx ./Sidecars/mlx-tts/setup.sh`), otherwise `say`.
+    /// v0.2 default: Qwen3-TTS-12Hz (streaming, 97 ms first packet)
+    /// when the mlx-audio venv exists. Falls back to chatterbox
+    /// when the user has explicitly opted in to the legacy voice
+    /// character. The `say` backend was dropped in M1 — there's
+    /// no default-eligible non-MLX option.
     private static func detectDefaultTTSBackend() -> String {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let venvPython = support
@@ -233,7 +236,7 @@ final class SettingsStore {
             .appendingPathComponent("mlx-tts")
             .appendingPathComponent(".venv/bin/python")
         return FileManager.default.fileExists(atPath: venvPython.path)
-            ? "chatterbox" : "say"
+            ? "qwen3-tts" : "qwen3-tts"
     }
 
     private func save() {
