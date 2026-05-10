@@ -11,6 +11,13 @@ import Foundation
 /// but no ML dep, no model download, and easy to reason about. Silero swap is
 /// a future drop-in via the same `VAD` protocol.
 public protocol VAD: Sendable {
+    /// Whether the detector is currently latched in the speech
+    /// state. `true` between a `.speechStart` and `.speechEnd`
+    /// transition. Consumed by `VoiceCoordinator` so it knows
+    /// whether to keep feeding the pre-roll buffer or grow the
+    /// pending segment.
+    var inSpeech: Bool { get }
+
     /// Feed a frame. Returns the resulting transition (if any).
     mutating func ingest(samples: [Float], at timestamp: Date) -> VADTransition?
 

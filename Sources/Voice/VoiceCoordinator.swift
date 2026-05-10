@@ -44,7 +44,7 @@ public actor VoiceCoordinator {
     private let wake: WakeFilter
     private let logBus: LogBus
     public private(set) var config: Config
-    private var vad: EnergyVAD
+    private var vad: any VAD
     private var pendingSegment: [Float] = []
     private var segmentStart: Date?
     /// Rolling buffer of the last few audio frames. Prepended to
@@ -82,7 +82,7 @@ public actor VoiceCoordinator {
         wake: WakeFilter,
         logBus: LogBus,
         config: Config = Config(),
-        vad: EnergyVAD = EnergyVAD()
+        vad: any VAD = EnergyVAD()
     ) {
         self.source = source
         self.stt = stt
@@ -141,14 +141,35 @@ public actor VoiceCoordinator {
     /// very next frame; the in-flight VAD state (loud/quiet frame
     /// counters) is preserved so a re-tune mid-utterance doesn't
     /// drop the user's speech segment.
+    ///
+    /// Only applies to `EnergyVAD` — the threshold semantics differ
+    /// across implementations (RMS [0.001, 0.05] for Energy vs.
+    /// probability [0, 1] for Silero), so the calibration UI's
+    /// `setVADThreshold` is wired specifically for the energy scale
+    /// and is hidden when Silero is the active engine. (M3+
+    /// follow-up: a Silero-aware calibration that sets a probability
+    /// threshold instead.)
     public func setVADThreshold(_ rms: Float) {
-        vad.config.rmsThreshold = rms
+        if var ev = vad as? EnergyVAD {
+            ev.config.rmsThreshold = rms
+            vad = ev
+        }
     }
 
     /// Snapshot of the current VAD threshold. Useful for the
     /// calibration UI to show the current value before/after.
+    /// Returns the EnergyVAD threshold if the active engine is
+    /// energy; for Silero it returns the configured probability
+    /// threshold (0..1). The UI can switch its slider range based
+    /// on the active engine.
     public func currentVADThreshold() -> Float {
-        vad.config.rmsThreshold
+        if let ev = vad as? EnergyVAD {
+            return ev.config.rmsThreshold
+        }
+        if let sv = vad as? SileroVAD {
+            return sv.config.threshold
+        }
+        return 0
     }
 
     public func openConversationWindow() async {

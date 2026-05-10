@@ -73,7 +73,21 @@ final class SettingsStore {
     /// flow records a few seconds of the user's normal speaking
     /// voice (plus ambient room + robot noise) and sets this to a
     /// safe fraction of their measured speech RMS.
+    ///
+    /// Only consumed when `vadEngine == "energy"`. For `"silero"`
+    /// the threshold is a probability (0..1) not an RMS value.
     var micVADThreshold: Double { didSet { save() } }
+
+    /// Voice-activity-detection engine choice. Values:
+    ///   - `"auto"` (default): pick Silero if its CoreML model is
+    ///     installed (`scripts/download-models.sh`), else Energy.
+    ///   - `"silero"`: force Silero VAD; falls back to Energy with
+    ///     a LogBus warning if the model is missing.
+    ///   - `"energy"`: force the simple RMS detector regardless.
+    /// Energy stays as the failsafe because it has zero deps and
+    /// always works; Silero is the default ML upgrade once the
+    /// 1-MB CoreML model is on disk.
+    var vadEngine: String { didSet { save() } }
 
     /// The threshold value that was active *before* the last
     /// calibration / slider change. Persisted so the Settings UI can
@@ -120,6 +134,7 @@ final class SettingsStore {
         // value.
         self.micVADThresholdPrevious = (d.object(forKey: Keys.micVADThresholdPrevious) as? Double)
             ?? storedVAD
+        self.vadEngine = d.string(forKey: Keys.vadEngine) ?? "auto"
     }
 
     /// Stamp `micVADThreshold` from a calibration / slider commit, and
@@ -175,6 +190,7 @@ final class SettingsStore {
         d.set(braveSearchAPIKey, forKey: Keys.braveSearchAPIKey)
         d.set(micVADThreshold, forKey: Keys.micVADThreshold)
         d.set(micVADThresholdPrevious, forKey: Keys.micVADThresholdPrevious)
+        d.set(vadEngine, forKey: Keys.vadEngine)
     }
 
     func robotEndpoint() -> RobotEndpoint {
@@ -310,5 +326,6 @@ final class SettingsStore {
         static let braveSearchAPIKey = "rocky.brave.search.apikey"
         static let micVADThreshold = "rocky.mic.vad.threshold"
         static let micVADThresholdPrevious = "rocky.mic.vad.threshold.previous"
+        static let vadEngine = "rocky.vad.engine"
     }
 }

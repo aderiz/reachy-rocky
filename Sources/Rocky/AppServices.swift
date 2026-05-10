@@ -451,18 +451,22 @@ final class AppServices {
         )
 
         let micSource = SharedBufferAudioSource(buffer: buf)
-        // Seed the VAD with the user's calibrated threshold (or
-        // 0.008 default). applySettings() will live-update it on
-        // subsequent setting changes; passing it here ensures the
-        // threshold is right from the very first frame, instead
-        // of running 0.008 until applySettings runs.
-        let vadConfig = EnergyVAD.Config(
-            rmsThreshold: Float(settings.micVADThreshold)
+        // Pick the VAD engine per `settings.vadEngine`:
+        //   - "auto"   -> Silero if its CoreML model is installed, else Energy.
+        //   - "silero" -> Silero, falling back to Energy with a warning.
+        //   - "energy" -> the simple RMS detector.
+        // Energy stays as the failsafe (zero deps, always works); Silero
+        // is the v0.2 default once the 1-MB CoreML model from
+        // `scripts/download-models.sh` is on disk.
+        let chosenVAD: any VAD = Self.makeVAD(
+            engine: settings.vadEngine,
+            energyThreshold: Float(settings.micVADThreshold),
+            logBus: bus
         )
         self.voice = VoiceCoordinator(
             source: micSource, stt: self.appleSTT,
             wake: self.wakeFilter, logBus: bus,
-            vad: EnergyVAD(config: vadConfig)
+            vad: chosenVAD
         )
 
         // Voice out (TTS): mlx-tts sidecar. `say` backend uses /usr/bin/python3
@@ -1956,6 +1960,46 @@ final class AppServices {
     }
 
     // MARK: - Helpers
+
+    /// VAD factory: resolves `settings.vadEngine` to a concrete
+    /// implementation. Posts a `LogBus` warning if Silero was
+    /// requested but the CoreML model isn't installed; falls back
+    /// to EnergyVAD so the listen pipeline always has a working VAD.
+    private nonisolated static func makeVAD(
+        engine: String,
+        energyThreshold: Float,
+        logBus: LogBus
+    ) -> any VAD {
+        let preferSilero = engine == "auto" || engine == "silero"
+        if preferSilero {
+            if let silero = SileroVAD.tryDefault() {
+                Task {
+                    await logBus.publish(.sidecarLog(
+                        sidecar: "voice",
+                        level: .info,
+                        message: "VAD engine: silero (CoreML)",
+                        fields: [:]
+                    ))
+                }
+                return silero
+            }
+            // Silero requested but model missing — explain how to fix
+            // and fall back. The fallback still gives a working voice
+            // pipeline; the user just doesn't get the ML-detector
+            // benefit until they run `scripts/download-models.sh`.
+            if engine == "silero" {
+                Task {
+                    await logBus.publish(.error(
+                        scope: "voice/vad",
+                        message: "Silero VAD requested but model not found; run scripts/download-models.sh. Falling back to EnergyVAD.",
+                        recoverable: true
+                    ))
+                }
+            }
+        }
+        let config = EnergyVAD.Config(rmsThreshold: energyThreshold)
+        return EnergyVAD(config: config)
+    }
 
     private nonisolated static func devTTSManifest(backend: String) -> SidecarManifest {
         // M1 of v0.2: `say` backend is dropped. Chatterbox-or-fail-closed.
