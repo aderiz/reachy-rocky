@@ -152,65 +152,226 @@ private struct BrainSettingsTab: View {
     @Environment(AppServices.self) private var services
     @State private var lmURLDraft: String = ""
     @State private var lmApiKeyDraft: String = ""
+    @State private var customMlxModelDraft: String = ""
+    @State private var showingCustomMlxField: Bool = false
+
+    /// Curated MLX-VLM models. The first entry is the v0.2 default.
+    /// "Other…" lets the user paste any HF model id mlx-vlm supports.
+    private static let mlxModelOptions: [(id: String, label: String)] = [
+        ("mlx-community/Qwen3-VL-4B-Instruct-4bit",
+         "Qwen3-VL 4B Instruct (4-bit, ~2.5 GB) — recommended"),
+        ("mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit",
+         "Qwen3-VL 30B-A3B Instruct (4-bit, ~17 GB) — bigger Macs"),
+        ("mlx-community/Qwen3-VL-30B-A3B-Instruct-8bit",
+         "Qwen3-VL 30B-A3B Instruct (8-bit, ~30 GB)"),
+        ("mlx-community/Qwen3-VL-235B-A22B-Instruct-4bit",
+         "Qwen3-VL 235B-A22B Instruct (4-bit, ~120 GB) — Studio Ultra"),
+    ]
 
     var body: some View {
         Form {
-            Section {
-                TextField("Base URL", text: $lmURLDraft,
-                          prompt: Text("http://localhost:1234/v1"))
-                    .onSubmit { commitURL() }
-                modelPicker
-                SecureField("API key", text: $lmApiKeyDraft,
-                            prompt: Text("(blank for none)"))
-                    .onSubmit { commitAPIKey() }
-            } header: {
-                Text("LM Studio")
-            } footer: {
-                Text("Submitted fields hot-reload the cognition engine. No relaunch needed.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+            backendSection
+            switch services.settings.brainBackend {
+            case "lm-studio":
+                lmStudioSection
+            case "mlx-vlm":
+                mlxVLMSection
+            default:  // "auto"
+                mlxVLMSection
+                lmStudioSection
             }
-
-            Section {
-                // Direct binding to the store — no draft state, no
-                // dependence on `.onSubmit` firing (which only fires
-                // when the user presses Return; paste-and-click-away
-                // wouldn't commit). Brave key has no hot-reload
-                // cost, so writing on every character change is
-                // fine; UserDefaults batches the writes.
-                SecureField(
-                    "Brave Search API key",
-                    text: Binding(
-                        get: { services.settings.braveSearchAPIKey },
-                        set: { services.settings.braveSearchAPIKey = $0 }
-                    ),
-                    prompt: Text("paste from search.brave.com/api")
-                )
-            } header: {
-                Text("Web search")
-            } footer: {
-                Text("Used by the `search_web` tool. Free tier allows 1 query/sec; leave blank to disable web search.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section("Status") {
-                LabeledContent("Brain") { llmLabel }
-                LabeledContent("Re-probe") {
-                    Button {
-                        Task { await services.probeLMStudioPublic() }
-                    } label: {
-                        Label("Probe", systemImage: "arrow.clockwise")
-                    }
-                }
-            }
+            webSearchSection
+            statusSection
         }
         .formStyle(.grouped)
         .onAppear {
             lmURLDraft = services.settings.lmStudioURL
             lmApiKeyDraft = services.settings.lmStudioApiKey
+            customMlxModelDraft = services.settings.brainModel
+            showingCustomMlxField = !Self.mlxModelOptions.contains {
+                $0.id == services.settings.brainModel
+            }
         }
     }
+
+    // MARK: - Backend picker
+
+    private var backendSection: some View {
+        Section {
+            Picker("Backend", selection: Binding(
+                get: { services.settings.brainBackend },
+                set: { newValue in
+                    services.settings.brainBackend = newValue
+                    Task { await services.applyBrainBackend() }
+                }
+            )) {
+                Text("Auto — MLX-VLM if installed, else LM Studio")
+                    .tag("auto")
+                Text("MLX-VLM (native MLX, vision-aware)")
+                    .tag("mlx-vlm")
+                Text("LM Studio (HTTP, text-only)")
+                    .tag("lm-studio")
+            }
+        } header: {
+            Text("Brain")
+        } footer: {
+            Text("Auto picks MLX-VLM when the brain sidecar venv is installed (`Sidecars/brain/setup.sh`). MLX-VLM runs natively on Apple Silicon — no HTTP hop, vision-aware, native tool calling.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - MLX-VLM section
+
+    private var mlxVLMSection: some View {
+        Section {
+            Picker("Model", selection: Binding<String>(
+                get: {
+                    let cur = services.settings.brainModel
+                    if Self.mlxModelOptions.contains(where: { $0.id == cur }) {
+                        return cur
+                    }
+                    return "__custom__"
+                },
+                set: { newValue in
+                    if newValue == "__custom__" {
+                        showingCustomMlxField = true
+                    } else {
+                        showingCustomMlxField = false
+                        services.settings.brainModel = newValue
+                        Task { await services.applyBrainBackend() }
+                    }
+                }
+            )) {
+                ForEach(Self.mlxModelOptions, id: \.id) { opt in
+                    Text(opt.label).tag(opt.id)
+                }
+                Text("Other (custom HF model id)").tag("__custom__")
+            }
+
+            if showingCustomMlxField {
+                HStack {
+                    TextField(
+                        "HF model id",
+                        text: $customMlxModelDraft,
+                        prompt: Text("mlx-community/your-vlm-here")
+                    )
+                    .onSubmit { commitCustomMlxModel() }
+                    Button("Apply") { commitCustomMlxModel() }
+                        .disabled(
+                            customMlxModelDraft.trimmingCharacters(in: .whitespaces).isEmpty
+                        )
+                }
+            }
+
+            LabeledContent("Sidecar status") {
+                brainSidecarStatusLabel
+            }
+            HStack {
+                Spacer()
+                Button {
+                    Task { await services.applyBrainBackend() }
+                } label: {
+                    Label("Restart brain", systemImage: "arrow.clockwise")
+                }
+            }
+        } header: {
+            Text("MLX-VLM")
+        } footer: {
+            Text("First run downloads ~2.5 GB of weights into ~/.cache/huggingface/. Switching models hot-swaps the sidecar — the next chat uses the new model. Restart Brain manually if the sidecar got into a bad state.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var brainSidecarStatusLabel: some View {
+        let state = services.brainSidecarState
+        switch state {
+        case .ready:
+            Label("Ready", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+        case .starting:
+            Label("Starting…", systemImage: "hourglass")
+                .foregroundStyle(.secondary)
+        case .stopped:
+            Label("Not running", systemImage: "circle.dashed")
+                .foregroundStyle(.secondary)
+        case .failing(let r):
+            Label("Failing: \(r)", systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .lineLimit(2)
+        case .circuitOpen(let until):
+            Label("Backing off until \(until.formatted(.dateTime.hour().minute().second()))",
+                  systemImage: "exclamationmark.octagon")
+                .foregroundStyle(.orange)
+                .lineLimit(2)
+        }
+    }
+
+    // MARK: - LM Studio section (fallback / explicit choice)
+
+    private var lmStudioSection: some View {
+        Section {
+            TextField("Base URL", text: $lmURLDraft,
+                      prompt: Text("http://localhost:1234/v1"))
+                .onSubmit { commitURL() }
+            modelPicker
+            SecureField("API key", text: $lmApiKeyDraft,
+                        prompt: Text("(blank for none)"))
+                .onSubmit { commitAPIKey() }
+        } header: {
+            Text("LM Studio")
+        } footer: {
+            Text("HTTP fallback for the brain. Submitted fields hot-reload the cognition engine. No relaunch needed.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - Web search
+
+    private var webSearchSection: some View {
+        Section {
+            // Direct binding to the store — no draft state, no
+            // dependence on `.onSubmit` firing (which only fires
+            // when the user presses Return; paste-and-click-away
+            // wouldn't commit). Brave key has no hot-reload
+            // cost, so writing on every character change is
+            // fine; UserDefaults batches the writes.
+            SecureField(
+                "Brave Search API key",
+                text: Binding(
+                    get: { services.settings.braveSearchAPIKey },
+                    set: { services.settings.braveSearchAPIKey = $0 }
+                ),
+                prompt: Text("paste from search.brave.com/api")
+            )
+        } header: {
+            Text("Web search")
+        } footer: {
+            Text("Used by the `search_web` tool. Free tier allows 1 query/sec; leave blank to disable web search.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - Status
+
+    private var statusSection: some View {
+        Section("Status") {
+            LabeledContent("LM Studio") { llmLabel }
+            LabeledContent("Re-probe") {
+                Button {
+                    Task { await services.probeLMStudioPublic() }
+                } label: {
+                    Label("Probe", systemImage: "arrow.clockwise")
+                }
+            }
+        }
+    }
+
+    // MARK: - Helpers
 
     private var modelPicker: some View {
         let models = services.availableLLMModels
@@ -267,6 +428,14 @@ private struct BrainSettingsTab: View {
         services.settings.lmStudioApiKey = lmApiKeyDraft
         Task { await services.applySettings() }
     }
+
+    private func commitCustomMlxModel() {
+        let trimmed = customMlxModelDraft.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty,
+              trimmed != services.settings.brainModel else { return }
+        services.settings.brainModel = trimmed
+        Task { await services.applyBrainBackend() }
+    }
 }
 
 // MARK: - Voice tab
@@ -298,30 +467,62 @@ private struct VoiceSettingsTab: View {
             }
 
             Section {
+                Picker("VAD engine", selection: vadEngineBinding) {
+                    Text("Auto — Silero if installed, else Energy").tag("auto")
+                    Text("Silero VAD (CoreML, ML-based)").tag("silero")
+                    Text("Energy threshold (RMS, simplest)").tag("energy")
+                }
                 MicSensitivityRow(calibrating: $calibrating)
             } header: {
-                Text("Sensitivity")
+                Text("Voice activity detection")
             } footer: {
-                Text("Rocky listens for speech that's louder than this " +
-                     "threshold. Click Calibrate to set it from your " +
-                     "voice and your room — recommended after moving the " +
-                     "mic, swapping rooms, or changing the source above.")
+                Text("Silero recognises speech (pitched, formant-shaped) and ignores chair scrapes, fan ticks, mouse clicks. Run `./scripts/download-models.sh silero` to install the CoreML model. Engine change applies on next Listen toggle. Threshold semantics differ between engines (RMS for Energy, probability for Silero).")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
 
             Section {
-                Picker("Engine", selection: ttsBackendBinding) {
-                    Text("System voice (say)").tag("say")
-                    Text("Chatterbox FP16 (cloned)").tag("chatterbox")
+                Picker("STT engine", selection: sttEngineBinding) {
+                    Text("Auto — WhisperKit if it loads, else Apple Speech").tag("auto")
+                    Text("WhisperKit (whisper-large-v3-turbo)").tag("whisperkit")
+                    Text("Apple Speech (SFSpeechRecognizer)").tag("apple")
+                }
+            } header: {
+                Text("Speech-to-text")
+            } footer: {
+                Text("WhisperKit hits 0.46 s latency at 2.2% WER on Apple Silicon. First-launch downloads ~700 MB of weights. Falls back to Apple Speech on hardware that can't load it. Engine change applies on next launch.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                TextField("Wake phrase", text: wakeWordBinding,
+                          prompt: Text("rocky"))
+                Picker("Wake engine", selection: wakeEngineBinding) {
+                    Text("STT-derived (uses transcript)").tag("stt")
+                    Text("Porcupine (placeholder — not yet integrated)")
+                        .tag("porcupine")
+                }
+            } header: {
+                Text("Wake word")
+            } footer: {
+                Text("Lower-case stored. STT-derived is the v0.1 path: WakeFilter pattern-matches the wake phrase in the final transcript. Porcupine slot is reserved for a future dedicated keyword spotter (97% accuracy, ~50 ms latency). Wake-phrase change applies on next launch.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Picker("TTS engine", selection: ttsBackendBinding) {
+                    Text("Qwen3-TTS-12Hz (streaming, 97 ms first packet)")
+                        .tag("qwen3-tts")
+                    Text("Chatterbox FP16 (full-WAV, slower)")
+                        .tag("chatterbox")
                 }
                 BotVolumeSlider()
             } header: {
                 Text("Voice (TTS)")
             } footer: {
-                Text("Chatterbox uses your cloned voice from " +
-                     "~/Library/Application Support/Rocky/voice/. " +
-                     "Engine change applies on next launch.")
+                Text("Qwen3-TTS streams PCM chunks as it synthesises — Rocky speaks the first sentence while the rest is still being generated. Chatterbox keeps the v0.1 voice character but waits for the whole reply. Both clone from `~/Library/Application Support/Rocky/voice/reference.wav`. Engine change applies on next launch.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -343,6 +544,32 @@ private struct VoiceSettingsTab: View {
         let store = services.settings
         return Binding(get: { store.ttsBackend },
                        set: { store.ttsBackend = $0 })
+    }
+
+    private var vadEngineBinding: Binding<String> {
+        let store = services.settings
+        return Binding(get: { store.vadEngine },
+                       set: { store.vadEngine = $0 })
+    }
+
+    private var sttEngineBinding: Binding<String> {
+        let store = services.settings
+        return Binding(get: { store.sttEngine },
+                       set: { store.sttEngine = $0 })
+    }
+
+    private var wakeWordBinding: Binding<String> {
+        let store = services.settings
+        return Binding(
+            get: { store.wakeWord },
+            set: { store.wakeWord = $0.lowercased() }
+        )
+    }
+
+    private var wakeEngineBinding: Binding<String> {
+        let store = services.settings
+        return Binding(get: { store.wakeEngine },
+                       set: { store.wakeEngine = $0 })
     }
 }
 

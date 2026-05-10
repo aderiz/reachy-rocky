@@ -169,6 +169,7 @@ final class AppServices {
     /// without poking actors on every redraw.
     var ttsSidecarState: SidecarState = .stopped
     var memorySidecarState: SidecarState = .stopped
+    var brainSidecarState: SidecarState = .stopped
 
     /// Total drawers in Rocky's palace. Polled lazily — see
     /// `refreshMemoryCount()`. `-1` means "haven't asked yet" so the
@@ -603,48 +604,11 @@ final class AppServices {
                                         recoverable: true))
         }
 
-        // Brain sidecar — opt-in upgrade from the LM Studio HTTP path.
-        // Starts only when the venv exists (constructed in init); on
-        // successful start, swaps the CognitionEngine's brain to
-        // MLXVLMBrain. Failure leaves the LMStudioBrain default in
-        // place with a logged warning.
-        let pref = settings.brainBackend
-        if pref == "auto" || pref == "mlx-vlm",
-           let brainSidecar {
-            do {
-                try await brainSidecar.start()
-                let mlx = MLXVLMBrain(sidecar: brainSidecar, logBus: logBus)
-                await cognition.setBrain(mlx)
-                // Wire the latest camera frame so the VLM has eyes.
-                let provider: CognitionEngine.ImageProvider = { [weak self] in
-                    guard let self else { return nil }
-                    let frame = await MainActor.run { self.lastCameraFrame }
-                    return frame.map { BrainImage(jpegData: $0.jpeg) }
-                }
-                await cognition.setImageProvider(provider)
-                await logBus.publish(.sidecarLog(
-                    sidecar: "brain",
-                    level: .info,
-                    message: "Brain backend: MLX-VLM (\(settings.brainModel))",
-                    fields: [:]
-                ))
-            } catch {
-                if pref == "mlx-vlm" {
-                    await logBus.publish(.error(
-                        scope: "app/brain",
-                        message: "MLX-VLM brain requested but failed to start: \(error). Falling back to LM Studio.",
-                        recoverable: true
-                    ))
-                } else {
-                    await logBus.publish(.sidecarLog(
-                        sidecar: "brain",
-                        level: .info,
-                        message: "Brain backend: LM Studio (HTTP) — brain sidecar not available",
-                        fields: [:]
-                    ))
-                }
-            }
-        }
+        // Brain backend — applies whichever backend the user chose
+        // (default "auto" picks MLX-VLM if the venv is installed).
+        // Settings UI's "Apply" button calls applyBrainBackend()
+        // to hot-swap without restarting Rocky.
+        await applyBrainBackend()
 
         // Pump LogBus events into MomentFeed and mirror new moments
         // back into the @Observable `recentMoments` slice for SwiftUI.
@@ -887,6 +851,19 @@ final class AppServices {
                         if case .ready = s {
                             Task { @MainActor in await self?.refreshMemoryCount() }
                         }
+                    }
+                }
+            }
+        }
+        // Mirror brain sidecar state into the Observable so the
+        // Settings → Brain tab can render Ready / Starting /
+        // Failing without poking the actor on every redraw.
+        if let brainSidecar {
+            let brainEvents = brainSidecar.events
+            Task { [weak self] in
+                for await event in brainEvents {
+                    if case .state(let s) = event {
+                        await MainActor.run { self?.brainSidecarState = s }
                     }
                 }
             }
@@ -1774,6 +1751,112 @@ final class AppServices {
         await robotTTS.setVolume(settings.audioVolume)
         await voice.setVADThreshold(Float(settings.micVADThreshold))
         await probeLMStudio()
+    }
+
+    /// Apply the user's `settings.brainBackend` choice. Hot-swaps
+    /// CognitionEngine's active brain without requiring a relaunch.
+    /// Three paths:
+    ///   - "lm-studio": stop the brain sidecar (if running), wire
+    ///     LMStudioBrain, drop the image provider.
+    ///   - "mlx-vlm": start the brain sidecar (if not yet started),
+    ///     wire MLXVLMBrain + camera-frame provider. If the sidecar
+    ///     isn't installed, log a warning and fall back to LM Studio.
+    ///   - "auto" (default): same as "mlx-vlm" when the sidecar is
+    ///     installed, else LM Studio. Silent fallback (no warning).
+    /// Also called once at app start; idempotent.
+    func applyBrainBackend() async {
+        let pref = settings.brainBackend
+        let wantsMLX = (pref == "auto" || pref == "mlx-vlm")
+        // Force LM Studio path: clean up the sidecar if running,
+        // wire the HTTP backend, drop the camera-frame provider.
+        if !wantsMLX {
+            if let brainSidecar {
+                await brainSidecar.stop()
+            }
+            await cognition.setBrain(LMStudioBrain(client: llm))
+            await cognition.setImageProvider(nil)
+            await logBus.publish(.sidecarLog(
+                sidecar: "brain",
+                level: .info,
+                message: "Brain backend: LM Studio (HTTP)",
+                fields: [:]
+            ))
+            return
+        }
+        // MLX-VLM path: ensure the sidecar is running (start may
+        // be a no-op if already running) and route through it.
+        guard let brainSidecar else {
+            // No sidecar built — venv not installed. Behaviour
+            // depends on whether the user explicitly asked for
+            // mlx-vlm or just "auto".
+            await cognition.setBrain(LMStudioBrain(client: llm))
+            await cognition.setImageProvider(nil)
+            if pref == "mlx-vlm" {
+                await logBus.publish(.error(
+                    scope: "app/brain",
+                    message: "MLX-VLM requested but `Sidecars/brain/` venv missing — run `Sidecars/brain/setup.sh` and re-apply. Falling back to LM Studio.",
+                    recoverable: true
+                ))
+            } else {
+                await logBus.publish(.sidecarLog(
+                    sidecar: "brain", level: .info,
+                    message: "Brain backend: LM Studio (HTTP) — brain venv not installed",
+                    fields: [:]
+                ))
+            }
+            return
+        }
+        do {
+            try await brainSidecar.start()
+            // If the user changed `brainModel` since the last apply,
+            // the sidecar's loaded model still matches whatever env
+            // it spawned with. Send `set_model` to hot-swap.
+            await self.requestBrainModel(settings.brainModel)
+            let mlx = MLXVLMBrain(sidecar: brainSidecar, logBus: logBus)
+            await cognition.setBrain(mlx)
+            // Wire the latest camera frame so the VLM has eyes.
+            let provider: CognitionEngine.ImageProvider = { [weak self] in
+                guard let self else { return nil }
+                let frame = await MainActor.run { self.lastCameraFrame }
+                return frame.map { BrainImage(jpegData: $0.jpeg) }
+            }
+            await cognition.setImageProvider(provider)
+            await logBus.publish(.sidecarLog(
+                sidecar: "brain", level: .info,
+                message: "Brain backend: MLX-VLM (\(settings.brainModel))",
+                fields: [:]
+            ))
+        } catch {
+            await cognition.setBrain(LMStudioBrain(client: llm))
+            await cognition.setImageProvider(nil)
+            if pref == "mlx-vlm" {
+                await logBus.publish(.error(
+                    scope: "app/brain",
+                    message: "MLX-VLM start failed: \(error). Falling back to LM Studio.",
+                    recoverable: true
+                ))
+            }
+        }
+    }
+
+    /// Hot-swap the brain sidecar's loaded MLX model. Best-effort —
+    /// if the sidecar isn't running or the request fails, the prior
+    /// model stays loaded.
+    func requestBrainModel(_ name: String) async {
+        guard let brainSidecar else { return }
+        struct Params: Encodable, Sendable { let name: String }
+        struct Result: Decodable, Sendable { let model: String? }
+        do {
+            let _: Result = try await brainSidecar.send(
+                method: "set_model", params: Params(name: name)
+            )
+        } catch {
+            await logBus.publish(.error(
+                scope: "app/brain",
+                message: "set_model(\(name)) failed: \(error)",
+                recoverable: true
+            ))
+        }
     }
 
     // MARK: - Tools
