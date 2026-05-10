@@ -111,6 +111,18 @@ public actor CognitionEngine {
         self.imageProvider = provider
     }
 
+    /// M7 fast-path matcher. When non-nil and a user utterance
+    /// matches one of its patterns, the engine dispatches the
+    /// pattern's handler directly and yields its reply through the
+    /// same Output stream the brain would have used. Bypasses
+    /// `brain.chatStream` entirely for matched queries — sub-second
+    /// time-to-first-word for trivial information fetches.
+    public var fastPath: FastPath?
+
+    public func setFastPath(_ fastPath: FastPath?) {
+        self.fastPath = fastPath
+    }
+
     public func setConfig(_ config: Config) {
         self.config = config
         if let first = transcript.first, first.role == .system {
@@ -145,6 +157,42 @@ public actor CognitionEngine {
         continuation: AsyncThrowingStream<Output, Error>.Continuation
     ) async throws {
         transcript.append(.init(role: .user, content: userText))
+
+        // M7 fast-path. Try to short-circuit the brain for trivial
+        // queries (time, weather, calendar, search, remember,
+        // greetings). On a match the registered handler fetches the
+        // data, formats a Rocky-voice reply, and we yield it through
+        // the same Output stream the brain would have used — sub-
+        // second time-to-first-word.
+        if let fastPath, let match = await fastPath.match(userText) {
+            do {
+                if let reply = try await fastPath.dispatch(match), !reply.isEmpty {
+                    let started = Date()
+                    transcript.append(.init(role: .assistant, content: reply))
+                    let latencyMs = Date().timeIntervalSince(started) * 1000
+                    continuation.yield(.assistantDelta(reply))
+                    continuation.yield(.assistantFinal(
+                        reply, latencyMs: latencyMs, firstChunkMs: latencyMs
+                    ))
+                    await logBus.publish(.sidecarLog(
+                        sidecar: "cognition",
+                        level: .info,
+                        message: "fast-path hit",
+                        fields: ["intent": match.intent.rawValue]
+                    ))
+                    return
+                }
+            } catch {
+                // Fast-path handler failed — log and fall through to
+                // the brain. Don't surface the error; the user's
+                // turn still resolves via the normal path.
+                await logBus.publish(.error(
+                    scope: "cognition/fast-path",
+                    message: "handler for \(match.intent.rawValue) failed: \(error)",
+                    recoverable: true
+                ))
+            }
+        }
 
         // Pre-turn recall: ask the memory sidecar for the top-K drawers
         // most relevant to this user utterance and stitch them into the

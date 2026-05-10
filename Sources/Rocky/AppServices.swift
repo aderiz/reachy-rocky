@@ -956,6 +956,16 @@ final class AppServices {
         // status is offline so users don't have to click "Probe" after
         // launching LM Studio.
         await registerInitialTools()
+
+        // M7 fast-path. Build the FastPath matcher with handlers
+        // backed by the tools we just registered. The fast-path
+        // dispatches them directly for trivial queries (time,
+        // weather, calendar, search, remember, greeting), bypassing
+        // the brain — sub-second time-to-first-word.
+        let fastPath = await Self.makeFastPath(
+            registry: self.toolRegistry, logBus: self.logBus
+        )
+        await cognition.setFastPath(fastPath)
         Task { [weak self] in await self?.probeLMStudio() }
         Task { [weak self] in
             while let self {
@@ -2159,6 +2169,126 @@ final class AppServices {
         }
         let config = EnergyVAD.Config(rmsThreshold: energyThreshold)
         return EnergyVAD(config: config)
+    }
+
+    /// FastPath factory. Wires per-intent handlers that invoke the
+    /// just-registered tools directly and format the result in
+    /// Rocky's persona. Each handler's reply is the literal text
+    /// that the engine yields as the assistant turn — no brain
+    /// inference happens for matched queries. Handlers return nil
+    /// to signal "I can't fast-path this — escalate to the brain
+    /// after all" (the matcher then falls through).
+    private nonisolated static func makeFastPath(
+        registry: ToolRegistry, logBus: LogBus
+    ) async -> FastPath {
+        let fastPath = FastPath()
+
+        // Time
+        await fastPath.register(.time) { _ in
+            let result = await registry.invoke(
+                name: "get_current_time", argumentsJSON: "{}",
+                llmMessageId: "fast-path"
+            )
+            guard result.ok else { return nil }
+            // The TimeTool already returns a `narrative` field that's
+            // formatted in Rocky's voice ("Rocky see eight forty.
+            // Tuesday."). Pass through.
+            if let json = try? JSONValue(jsonString: result.resultJSON),
+               let n = json.asObject?["narrative"]?.asString {
+                return n
+            }
+            return nil
+        }
+
+        // Weather
+        await fastPath.register(.weather) { match in
+            // Optional location capture group (`weather in Berlin`).
+            let location = match.groups.first ?? ""
+            var args: [String: JSONValue] = [:]
+            if !location.isEmpty {
+                args["location"] = .string(location)
+            }
+            let argsJSON: String = JSONValue.object(args).encodedString()
+            let result = await registry.invoke(
+                name: "get_weather", argumentsJSON: argsJSON,
+                llmMessageId: "fast-path"
+            )
+            guard result.ok else { return nil }
+            if let json = try? JSONValue(jsonString: result.resultJSON),
+               let n = json.asObject?["narrative"]?.asString {
+                return n
+            }
+            return nil
+        }
+
+        // Calendar
+        await fastPath.register(.calendar) { match in
+            // Map captured "tomorrow" / "this week" → days_ahead int.
+            let when = match.groups.first ?? ""
+            let daysAhead: Int
+            switch when {
+            case "today":     daysAhead = 0
+            case "tomorrow":  daysAhead = 1
+            case "this week": daysAhead = 7
+            case "next week": daysAhead = 14
+            default:          daysAhead = 0
+            }
+            let argsJSON = "{\"days_ahead\": \(daysAhead)}"
+            let result = await registry.invoke(
+                name: "read_calendar", argumentsJSON: argsJSON,
+                llmMessageId: "fast-path"
+            )
+            guard result.ok else { return nil }
+            if let json = try? JSONValue(jsonString: result.resultJSON),
+               let n = json.asObject?["narrative"]?.asString {
+                return n
+            }
+            return nil
+        }
+
+        // Web search
+        await fastPath.register(.search) { match in
+            let query = match.groups.first ?? ""
+            guard !query.isEmpty else { return nil }
+            let escaped = query.replacingOccurrences(of: "\"", with: "\\\"")
+            let argsJSON = "{\"query\": \"\(escaped)\"}"
+            let result = await registry.invoke(
+                name: "search_web", argumentsJSON: argsJSON,
+                llmMessageId: "fast-path"
+            )
+            guard result.ok else { return nil }
+            if let json = try? JSONValue(jsonString: result.resultJSON),
+               let n = json.asObject?["narrative"]?.asString {
+                return n
+            }
+            return nil
+        }
+
+        // Remember
+        await fastPath.register(.remember) { match in
+            let what = match.groups.first ?? ""
+            guard !what.isEmpty else { return nil }
+            let escaped = what.replacingOccurrences(of: "\"", with: "\\\"")
+            let argsJSON = "{\"text\": \"\(escaped)\"}"
+            let result = await registry.invoke(
+                name: "remember", argumentsJSON: argsJSON,
+                llmMessageId: "fast-path"
+            )
+            guard result.ok else { return nil }
+            return "Rocky remember."
+        }
+
+        // Greeting — no tool needed.
+        await fastPath.register(.greeting) { _ in
+            "Hello. Rocky here."
+        }
+
+        await logBus.publish(.sidecarLog(
+            sidecar: "cognition", level: .info,
+            message: "fast-path: \(FastPath.Intent.allCases.count) intents wired",
+            fields: [:]
+        ))
+        return fastPath
     }
 
     /// Wake-word engine factory: resolves `settings.wakeEngine`
