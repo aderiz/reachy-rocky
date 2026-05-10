@@ -101,6 +101,33 @@ final class SettingsStore {
     ///     fails on older Apple Silicon or as a sanity comparator.
     var sttEngine: String { didSet { save() } }
 
+    /// Wake word the user says to address Rocky. The default
+    /// "rocky" matches the persona name; alternative options (e.g.
+    /// "hey rocky", "robot", a different name entirely) are
+    /// supported as long as the chosen STT engine reliably
+    /// transcribes them. Stored lowercase to keep wake matching
+    /// case-insensitive.
+    ///
+    /// Note: M4 keeps STT-derived wake (the existing pattern match
+    /// in `WakeFilter.containsName`) as the primary wake path —
+    /// reliability comes mostly from the WhisperKit STT upgrade in
+    /// M3. A dedicated keyword-spotting model (Porcupine /
+    /// openWakeWord) is a future-pluggable enhancement: see
+    /// `WakeWordEngine` protocol.
+    var wakeWord: String { didSet { save() } }
+
+    /// Wake-word detection backend choice. Values:
+    ///   - `"stt"` (default): use the STT engine's transcript and
+    ///     `WakeFilter.containsName` pattern match.
+    ///   - `"porcupine"`: future-pluggable dedicated keyword spotter
+    ///     via Picovoice's Porcupine SDK. M4 ships the protocol slot
+    ///     but no working implementation — the user needs to vendor
+    ///     the .xcframework + sign up for an access key. When set
+    ///     to "porcupine" without a working implementation, the
+    ///     factory falls back to the STT-derived path with a logged
+    ///     warning.
+    var wakeEngine: String { didSet { save() } }
+
     /// The threshold value that was active *before* the last
     /// calibration / slider change. Persisted so the Settings UI can
     /// surface a one-click "Revert" if a calibration produced a worse
@@ -148,6 +175,8 @@ final class SettingsStore {
             ?? storedVAD
         self.vadEngine = d.string(forKey: Keys.vadEngine) ?? "auto"
         self.sttEngine = d.string(forKey: Keys.sttEngine) ?? "auto"
+        self.wakeWord = d.string(forKey: Keys.wakeWord) ?? "rocky"
+        self.wakeEngine = d.string(forKey: Keys.wakeEngine) ?? "stt"
     }
 
     /// Stamp `micVADThreshold` from a calibration / slider commit, and
@@ -205,6 +234,8 @@ final class SettingsStore {
         d.set(micVADThresholdPrevious, forKey: Keys.micVADThresholdPrevious)
         d.set(vadEngine, forKey: Keys.vadEngine)
         d.set(sttEngine, forKey: Keys.sttEngine)
+        d.set(wakeWord, forKey: Keys.wakeWord)
+        d.set(wakeEngine, forKey: Keys.wakeEngine)
     }
 
     func robotEndpoint() -> RobotEndpoint {
@@ -342,5 +373,7 @@ final class SettingsStore {
         static let micVADThresholdPrevious = "rocky.mic.vad.threshold.previous"
         static let vadEngine = "rocky.vad.engine"
         static let sttEngine = "rocky.stt.engine"
+        static let wakeWord = "rocky.wake.word"
+        static let wakeEngine = "rocky.wake.engine"
     }
 }

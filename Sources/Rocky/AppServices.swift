@@ -26,6 +26,7 @@ final class AppServices {
     let macFaceTracker: MacFaceTracker
     let faceLibrary: FaceLibrary
     let stateSubscriber: StateSubscriber
+    let wakeEngine: any WakeWordEngine
 
     // Voice
     let audioBuffer: AudioRingBuffer
@@ -432,7 +433,20 @@ final class AppServices {
         let buf = AudioRingBuffer(capacity: 6 * 16_000)
         self.audioBuffer = buf
         self.mic = MicService(buffer: buf, logBus: bus)
-        self.wakeFilter = WakeFilter()
+        // Configurable wake phrase from Settings (default "rocky"
+        // matches the persona name). Stored lowercase; WakeFilter
+        // already lowercases on match.
+        self.wakeFilter = WakeFilter(
+            config: WakeFilter.Config(wakeName: settings.wakeWord)
+        )
+        // Wake-word engine — STT-derived by default, Porcupine stub
+        // when the user opts in. The factory logs a warning if
+        // "porcupine" is selected but the implementation isn't
+        // available yet, then falls back to STT.
+        self.wakeEngine = Self.makeWakeEngine(
+            engine: settings.wakeEngine,
+            logBus: bus
+        )
         self.appleSTT = AppleSpeechSTT()
 
         // Robot-mic sidecar. Runs the reachy-mini SDK in webrtc mode.
@@ -2030,6 +2044,29 @@ final class AppServices {
         }
         let config = EnergyVAD.Config(rmsThreshold: energyThreshold)
         return EnergyVAD(config: config)
+    }
+
+    /// Wake-word engine factory: resolves `settings.wakeEngine`
+    /// to a concrete implementation. If "porcupine" is requested
+    /// but the framework isn't vendored, falls back to STT-derived
+    /// wake with a logged warning.
+    private nonisolated static func makeWakeEngine(
+        engine: String,
+        logBus: LogBus
+    ) -> any WakeWordEngine {
+        if engine == "porcupine" {
+            // Stub today — see PorcupineStubEngine for the
+            // requirements to flip this to working.
+            Task {
+                await logBus.publish(.error(
+                    scope: "voice/wake",
+                    message: "Porcupine wake engine selected but not yet integrated; falling back to STT-derived wake.",
+                    recoverable: true
+                ))
+            }
+            return STTWakeEngine()
+        }
+        return STTWakeEngine()
     }
 
     private nonisolated static func devTTSManifest(backend: String) -> SidecarManifest {
