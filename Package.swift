@@ -90,11 +90,6 @@ let package = Package(
             path: "Tests/SidecarHostTests"
         ),
         .testTarget(
-            name: "VisionTests",
-            dependencies: ["RockyVision", "SidecarHost", "Telemetry", "RockyKit"],
-            path: "Tests/VisionTests"
-        ),
-        .testTarget(
             name: "VoiceTests",
             dependencies: ["Voice", "Telemetry", "RockyKit"],
             path: "Tests/VoiceTests"

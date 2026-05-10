@@ -5,9 +5,7 @@
   "args": ["-u", "-m", "rocky_tts.runner"],
   "working_dir": "{sidecar_dir}",
   "env": {
-    "ROCKY_TTS_BACKEND": "say",
-    "ROCKY_TTS_VOICE": "Samantha",
-    "ROCKY_TTS_RATE": "180"
+    "ROCKY_TTS_BACKEND": "chatterbox"
   },
   "ready_event": "ready",
   "ready_timeout_s": 30,
@@ -16,6 +14,6 @@
   "restart_max_per_minute": 3,
   "timeouts": {
     "*": 5,
-    "synthesize": 30
+    "synthesize": 60
   }
 }

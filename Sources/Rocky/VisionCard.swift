@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import RockyVision
+import Perception
 
 /// Inspector → Vision. Live JPEG from the robot camera + bbox overlay
 /// + world-target arrow + counters and identity readout.
@@ -166,8 +167,8 @@ struct VisionCard: View {
 /// adapt automatically.
 private struct FacePreview: View {
     let frame: RobotCameraService.Frame?
-    let detection: RockyVision.FaceTrackerService.Detection?
-    let target: RockyVision.FaceTrackerService.Target?
+    let detection: MacFaceTracker.Detection?
+    let target: FaceTargetSnapshot?
 
     var body: some View {
         ZStack {

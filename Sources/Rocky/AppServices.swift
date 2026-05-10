@@ -21,8 +21,6 @@ final class AppServices {
     let robotEndpoint: RobotEndpoint
     let robotLink: RobotLinkClient
     let supervisor: SidecarSupervisor
-    let faceTracker: FaceTrackerService
-    let faceTargetBridge: FaceTargetBridge
     let targetStreamer: TargetStreamer
     let robotCamera: RobotCameraService
     let macFaceTracker: MacFaceTracker
@@ -62,8 +60,8 @@ final class AppServices {
     var stateUpdateCount: Int = 0
 
     /// Live mirror of the latest face-tracker target so the Vision card can render it.
-    var lastFaceTarget: FaceTrackerService.Target?
-    var lastFaceDetection: FaceTrackerService.Detection?
+    var lastFaceTarget: FaceTargetSnapshot?
+    var lastFaceDetection: MacFaceTracker.Detection?
     var faceTargetCount: Int = 0
     var faceDetectionCount: Int = 0
 
@@ -161,7 +159,6 @@ final class AppServices {
 
     /// Sidecar lifecycle mirrors so the Status panel can render real states
     /// without poking actors on every redraw.
-    var faceTrackerSidecarState: SidecarState = .stopped
     var ttsSidecarState: SidecarState = .stopped
     var memorySidecarState: SidecarState = .stopped
 
@@ -267,7 +264,6 @@ final class AppServices {
 
     private func firstUnhealthySidecar() -> String? {
         for (name, state) in [
-            ("Face tracker", faceTrackerSidecarState),
             ("Voice", ttsSidecarState),
             ("Memory", memorySidecarState),
         ] {
@@ -407,25 +403,10 @@ final class AppServices {
         self.supervisor = SidecarSupervisor(logBus: bus)
         self.stateSubscriber = StateSubscriber(endpoint: endpoint, logBus: bus)
 
-        // Build the face-tracker sidecar in dev mode (synthetic detector,
-        // /usr/bin/python3, no venv). Real-robot mode swaps the manifest
-        // during onboarding (M7).
-        let manifest = Self.devFaceTrackerManifest()
-        let dir = Self.locateSidecarDir(named: "face-tracker")
-            ?? URL(fileURLWithPath: "/")
-        let resolver = ManifestPathResolver(
-            sidecarDir: dir,
-            venvDir: SidecarSupervisor.defaultVenvDir(for: "face-tracker")
-        )
-        let runtime = SidecarRuntime(manifest: manifest, resolver: resolver, logBus: bus)
-        self.faceTracker = FaceTrackerService(sidecar: runtime, logBus: bus)
-
-        // Wire face-tracker targets into a 50 Hz set_target stream so the
-        // robot actually moves when faces are detected.
+        // 50 Hz set_target streamer. Targets come from `MacFaceTracker`
+        // (Apple Vision face detection on `robot-camera` JPEG frames);
+        // the streamer is suppressed during recorded primary moves.
         self.targetStreamer = TargetStreamer(client: self.robotLink, logBus: bus)
-        self.faceTargetBridge = FaceTargetBridge(
-            streamer: self.targetStreamer, logBus: bus
-        )
 
         // Robot-camera sidecar. Streams JPEG frames over the wire.
         let cameraManifest = Self.devRobotCameraManifest()
@@ -542,14 +523,6 @@ final class AppServices {
     /// Spin up long-lived services. Idempotent enough to be safe to call once
     /// from `RockyApp.task { ... }`.
     func start() async {
-        do {
-            try await faceTracker.start()
-        } catch {
-            await logBus.publish(.error(scope: "app/face-tracker",
-                                        message: "\(error)",
-                                        recoverable: true))
-        }
-
         // Memory sidecar is best-effort: if the venv hasn't been built
         // (Sidecars/mempalace/setup.sh not run), the start fails cleanly
         // and CognitionEngine just skips recall + record on subsequent
@@ -627,21 +600,10 @@ final class AppServices {
                 let now = Date()
                 if now.timeIntervalSince(lastMirror) < 0.2 { continue }
                 lastMirror = now
-                let mapped = RockyVision.FaceTrackerService.Detection(
-                    bbox: det.bbox,
-                    confidence: det.confidence,
-                    promptId: "vision-face",
-                    frameWidth: det.frameWidth,
-                    frameHeight: det.frameHeight,
-                    identity: det.identity,
-                    identityDistance: det.identityDistance,
-                    closestName: det.closestName,
-                    closestDistance: det.closestDistance
-                )
                 let snap = counter
                 let now2 = Date()
                 await MainActor.run {
-                    self.lastFaceDetection = mapped
+                    self.lastFaceDetection = det
                     self.faceDetectionCount = snap
                     self.lastFaceDetectionAt = now2
                 }
@@ -699,7 +661,7 @@ final class AppServices {
                 // 5 Hz mirror — see detection loop for rationale.
                 if now.timeIntervalSince(lastUpdate) < 0.2 { continue }
                 lastUpdate = now
-                let mapped = RockyVision.FaceTrackerService.Target(
+                let mapped = FaceTargetSnapshot(
                     yawRad: t.yawRad,
                     pitchRad: t.pitchRad,
                     decayActive: t.decay
@@ -773,14 +735,6 @@ final class AppServices {
         }
 
         // Mirror sidecar state into Observable so the Status panel can read it.
-        let ftEvents = faceTracker.sidecar.events
-        Task { [weak self] in
-            for await event in ftEvents {
-                if case .state(let s) = event {
-                    await MainActor.run { self?.faceTrackerSidecarState = s }
-                }
-            }
-        }
         let ttsEvents = robotTTS.sidecar.events
         Task { [weak self] in
             for await event in ttsEvents {
@@ -805,16 +759,6 @@ final class AppServices {
                 }
             }
         }
-
-        // Pump face-tracker events into observable mirrors.
-        // The Python face-tracker sidecar is still running in synthetic
-        // mode but is no longer the source of truth — Mac face tracker is.
-        // Drain its streams to keep them from blocking but discard the
-        // events so they don't overwrite the real Mac data in the UI.
-        let pyTargets = faceTracker.targets
-        let pyDetections = faceTracker.detections
-        Task { for await _ in pyTargets {} }
-        Task { for await _ in pyDetections {} }
 
         // First daemon health probe. Failure is expected when the robot is off.
         Task { [weak self] in
@@ -931,7 +875,6 @@ final class AppServices {
     func stop() async {
         await voice.stop()
         await stateSubscriber.stop()
-        await faceTracker.stop()
         mic.stop()
     }
 
@@ -1432,8 +1375,8 @@ final class AppServices {
         defer {
             Task { @MainActor in self.transitioningUntil = nil }
         }
-        try? await faceTracker.setEnabled(false)
-        defer { Task { try? await faceTracker.setEnabled(true) } }
+        await macFaceTracker.setEnabled(false)
+        defer { Task { await macFaceTracker.setEnabled(true) } }
 
         try await robotLink.playRecordedMove(dataset: dataset, move: name)
 
@@ -1480,15 +1423,7 @@ final class AppServices {
     /// window stay in lockstep regardless of which surface toggled it.
     func setFaceTrackingEnabled(_ enabled: Bool) async {
         faceTrackingEnabled = enabled
-        do {
-            try await faceTracker.setEnabled(enabled)
-        } catch {
-            await logBus.publish(.error(
-                scope: "app/face-tracker",
-                message: "setEnabled: \(error)",
-                recoverable: true
-            ))
-        }
+        await macFaceTracker.setEnabled(enabled)
     }
 
     /// Tracks the last successful auto-wake so we don't spam the daemon.
@@ -1885,20 +1820,20 @@ final class AppServices {
             }
         )
 
-        let visionService = faceTracker
+        let visionService = macFaceTracker
         await toolRegistry.register(
             name: "pause_face_tracking",
-            description: "Stop the face-tracker sidecar from steering the head. Use before a recorded emotion.",
+            description: "Stop pushing face-tracking targets to the head. Use before a recorded emotion so the streamer doesn't fight the primary animation.",
             handler: { _ in
-                try await visionService.setEnabled(false)
+                await visionService.setEnabled(false)
                 return .object(["ok": .bool(true)])
             }
         )
         await toolRegistry.register(
             name: "resume_face_tracking",
-            description: "Resume the face-tracker sidecar.",
+            description: "Resume face-tracking — the head follows detected faces again.",
             handler: { _ in
-                try await visionService.setEnabled(true)
+                await visionService.setEnabled(true)
                 return .object(["ok": .bool(true)])
             }
         )
@@ -2022,58 +1957,29 @@ final class AppServices {
 
     // MARK: - Helpers
 
-    private nonisolated static func devFaceTrackerManifest() -> SidecarManifest {
-        SidecarManifest(
-            name: "face-tracker",
-            version: "0.1.0-dev",
-            binary: "/usr/bin/python3",
-            args: ["-u", "-m", "rocky_face_tracker.runner"],
-            workingDir: locateSidecarDir(named: "face-tracker")?
-                .path(percentEncoded: false) ?? ".",
-            env: [
-                "PYTHONPATH": locateSidecarDir(named: "face-tracker")?
-                    .path(percentEncoded: false) ?? ".",
-                "ROCKY_FT_MODE": "synthetic",
-                "ROCKY_FT_HFOV_DEG": "65",
-                "ROCKY_FT_VFOV_DEG": "39",
-                "ROCKY_FT_DAMPER_OMEGA": "3.0",
-                "ROCKY_FT_EMA_ALPHA": "0.5",
-                "ROCKY_FT_IDLE_TIMEOUT_S": "1.5",
-                "ROCKY_FT_PROMPT": "a brunette male with a beard",
-            ],
-            readyTimeoutS: 15,
-            shutdownGraceS: 3
-        )
-    }
-
     private nonisolated static func devTTSManifest(backend: String) -> SidecarManifest {
+        // M1 of v0.2: `say` backend is dropped. Chatterbox-or-fail-closed.
+        // The `backend` arg is retained for forward compatibility with M6
+        // (Qwen3-TTS-12Hz streaming), where it picks between models.
+        _ = backend
         let venvPython = SidecarSupervisor.defaultVenvDir(for: "mlx-tts")
             .appendingPathComponent("bin/python")
-        let isChatterbox = backend == "chatterbox"
-        let useVenv = isChatterbox && FileManager.default.fileExists(atPath: venvPython.path)
-        let binary = useVenv ? venvPython.path : "/usr/bin/python3"
-        let resolvedBackend = useVenv ? "chatterbox" : "say"
         let sidecarDir = locateSidecarDir(named: "mlx-tts")?
             .path(percentEncoded: false) ?? "."
-        var env: [String: String] = [
-            "PYTHONPATH": sidecarDir,
-            "ROCKY_TTS_BACKEND": resolvedBackend,
-        ]
-        if resolvedBackend == "say" {
-            env["ROCKY_TTS_VOICE"] = "Samantha"
-            env["ROCKY_TTS_RATE"] = "180"
-        }
         return SidecarManifest(
             name: "mlx-tts",
             version: "0.1.0-dev",
-            binary: binary,
+            binary: venvPython.path,
             args: ["-u", "-m", "rocky_tts.runner"],
             workingDir: sidecarDir,
-            env: env,
+            env: [
+                "PYTHONPATH": sidecarDir,
+                "ROCKY_TTS_BACKEND": "chatterbox",
+            ],
             readyTimeoutS: 30,
             shutdownGraceS: 3,
             // Chatterbox first synth includes a model load; bump the timeout.
-            timeouts: ["*": 5, "synthesize": isChatterbox ? 60 : 30]
+            timeouts: ["*": 5, "synthesize": 60]
         )
     }
 

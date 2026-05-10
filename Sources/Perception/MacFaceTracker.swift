@@ -187,6 +187,7 @@ public actor MacFaceTracker {
     /// Suspends pushing to `streamer` while the daemon plays a primary
     /// move (wake_up / goto_sleep / emotion). Caller toggles this.
     private var streamerSuppressed: Bool = false
+    private var userEnabled: Bool = true
 
     private var detectorTask: Task<Void, Never>?
     private var commandTask: Task<Void, Never>?
@@ -220,9 +221,20 @@ public actor MacFaceTracker {
     }
 
     /// Pause/unpause pushes to the streamer (used during recorded moves
-    /// like wake_up so we don't fight a primary animation).
+    /// like wake_up so we don't fight a primary animation). Transient
+    /// — set by the in-flight-move watch loop in AppServices and
+    /// expected to flip back when the move finishes.
     public func setStreamerSuppressed(_ suppressed: Bool) {
         self.streamerSuppressed = suppressed
+    }
+
+    /// User-controlled enable / disable. Sticky — set by the
+    /// `pause_face_tracking` / `resume_face_tracking` tools and the
+    /// menu-bar / Settings toggle. Composes with `streamerSuppressed`:
+    /// the streamer only receives target updates when **both**
+    /// `userEnabled == true` AND `streamerSuppressed == false`.
+    public func setEnabled(_ enabled: Bool) {
+        self.userEnabled = enabled
     }
 
     /// Start the 50 Hz command tick. Caller pushes frames in via `ingest(_:)`.
@@ -451,7 +463,7 @@ public actor MacFaceTracker {
             // antennas so the twitch pattern animates regardless of
             // whether the head is actively tracking or idling.
             let antennas = tickAntennas(dt: dt)
-            if let streamer, !streamerSuppressed {
+            if let streamer, userEnabled, !streamerSuppressed {
                 let pose = RPYPose(roll: 0, pitch: pitchClamped, yaw: yawClamped)
                 await streamer.update(
                     .init(headPose: pose, antennas: antennas, bodyYaw: bodyClamped),

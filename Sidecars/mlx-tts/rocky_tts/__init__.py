@@ -1,14 +1,14 @@
 """Rocky TTS sidecar.
 
-Two pluggable backends share one wire protocol:
+One backend (since v0.2 M1):
 
-  * `say`        — macOS's bundled TTS via subprocess. No Python deps.
-                   Default; useful for smoke-testing the wire path.
   * `chatterbox` — Chatterbox-Turbo FP16 via mlx-audio (voice cloning).
-                   Activated when the user installs the `mlx` extras and
-                   sets ROCKY_TTS_BACKEND=chatterbox. Reference WAV +
-                   optional transcript live in
+                   Reference WAV + optional transcript live in
                    ~/Library/Application Support/Rocky/voice/.
+
+The legacy `say` backend was dropped in M1 because it masked "the venv
+wasn't installed" with a robotic monotone; chatterbox-or-fail-closed.
+M6 will swap the underlying model to Qwen3-TTS-12Hz for streaming.
 
 `runner.py` exposes:
 
@@ -17,6 +17,6 @@ Two pluggable backends share one wire protocol:
   health() -> { backend, voice_ref_id }
 """
 
-from .backends import Backend, SayBackend
+from .backends import Backend
 
-__all__ = ["Backend", "SayBackend"]
+__all__ = ["Backend"]
