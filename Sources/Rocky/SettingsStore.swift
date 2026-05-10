@@ -89,6 +89,18 @@ final class SettingsStore {
     /// 1-MB CoreML model is on disk.
     var vadEngine: String { didSet { save() } }
 
+    /// Speech-to-text engine choice. Values:
+    ///   - `"auto"` (default): WhisperKit if it loads, else Apple
+    ///     Speech.
+    ///   - `"whisperkit"`: force WhisperKit (`whisper-large-v3-
+    ///     turbo`); first launch downloads ~700 MB of weights to
+    ///     `~/Documents/huggingface/`. Falls back to Apple Speech
+    ///     with a logged warning on failure.
+    ///   - `"apple"`: force `SFSpeechRecognizer`. The v0.1
+    ///     baseline; useful when WhisperKit's hardware fingerprint
+    ///     fails on older Apple Silicon or as a sanity comparator.
+    var sttEngine: String { didSet { save() } }
+
     /// The threshold value that was active *before* the last
     /// calibration / slider change. Persisted so the Settings UI can
     /// surface a one-click "Revert" if a calibration produced a worse
@@ -135,6 +147,7 @@ final class SettingsStore {
         self.micVADThresholdPrevious = (d.object(forKey: Keys.micVADThresholdPrevious) as? Double)
             ?? storedVAD
         self.vadEngine = d.string(forKey: Keys.vadEngine) ?? "auto"
+        self.sttEngine = d.string(forKey: Keys.sttEngine) ?? "auto"
     }
 
     /// Stamp `micVADThreshold` from a calibration / slider commit, and
@@ -191,6 +204,7 @@ final class SettingsStore {
         d.set(micVADThreshold, forKey: Keys.micVADThreshold)
         d.set(micVADThresholdPrevious, forKey: Keys.micVADThresholdPrevious)
         d.set(vadEngine, forKey: Keys.vadEngine)
+        d.set(sttEngine, forKey: Keys.sttEngine)
     }
 
     func robotEndpoint() -> RobotEndpoint {
@@ -327,5 +341,6 @@ final class SettingsStore {
         static let micVADThreshold = "rocky.mic.vad.threshold"
         static let micVADThresholdPrevious = "rocky.mic.vad.threshold.previous"
         static let vadEngine = "rocky.vad.engine"
+        static let sttEngine = "rocky.stt.engine"
     }
 }

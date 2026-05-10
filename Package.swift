@@ -16,7 +16,15 @@ let package = Package(
         .library(name: "Perception", targets: ["Perception"]),
         .library(name: "Memory", targets: ["Memory"]),
     ],
-    dependencies: [],
+    dependencies: [
+        // M3: WhisperKit — Apple-Silicon-native STT (CoreML + ANE).
+        // 0.46 s latency, 2.2% WER on whisper-large-v3-turbo. Apache-2
+        // licensed; compatible with Rocky's MIT.
+        .package(
+            url: "https://github.com/argmaxinc/WhisperKit.git",
+            from: "0.10.0"
+        ),
+    ],
     targets: [
         .executableTarget(
             name: "Rocky",
@@ -56,7 +64,10 @@ let package = Package(
         ),
         .target(
             name: "Voice",
-            dependencies: ["RockyKit", "Telemetry", "SidecarHost", "RobotLink"],
+            dependencies: [
+                "RockyKit", "Telemetry", "SidecarHost", "RobotLink",
+                .product(name: "WhisperKit", package: "WhisperKit"),
+            ],
             path: "Sources/Voice"
         ),
         .target(

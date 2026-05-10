@@ -854,25 +854,56 @@ final class AppServices {
     /// synchronously without re-prompting — so for non-`.notDetermined`
     /// statuses we still call through to update labels.
     private func warmUpSTT() async {
+        // Apple Speech authorisation: keep this even when WhisperKit
+        // is the active engine. Apple Speech is the M0 fallback if
+        // WhisperKit fails to load (corrupt cache, ANE saturation,
+        // etc.) and the OS-level prompt has to fire either way to
+        // keep the Permissions panel honest.
         let initial = SFSpeechRecognizer.authorizationStatus()
         if initial == .notDetermined {
             await MainActor.run { self.sttBackendName = "Apple Speech (pending)" }
-            return
+        } else {
+            let resolved = await appleSTT.requestAuthorization()
+            switch resolved {
+            case .ready:
+                await MainActor.run { self.sttBackendName = "Apple Speech" }
+            case .unavailable:
+                await MainActor.run {
+                    self.voiceErrorMessage = "Speech recognition unavailable for the current locale."
+                    self.sttBackendName = "unavailable"
+                }
+            case .unauthorized(let status):
+                await MainActor.run {
+                    self.voiceErrorMessage = "Speech recognition not authorized (\(status.rawValue))."
+                    self.sttBackendName = "unauthorized"
+                }
+            }
         }
-        let resolved = await appleSTT.requestAuthorization()
-        switch resolved {
-        case .ready:
-            await MainActor.run { self.sttBackendName = "Apple Speech" }
-        case .unavailable:
+
+        // M3 upgrade path: try WhisperKit. If `settings.sttEngine` is
+        // "auto" or "whisperkit", attempt to load the model. On
+        // success, swap the VoiceCoordinator's STT to WhisperKit and
+        // update the dashboard label. On failure, leave Apple Speech
+        // in place.
+        let pref = await MainActor.run { self.settings.sttEngine }
+        guard pref == "auto" || pref == "whisperkit" else { return }
+        if let wk = await WhisperKitSTT.tryDefault() {
+            await voice.setSTT(wk)
             await MainActor.run {
-                self.voiceErrorMessage = "Speech recognition unavailable for the current locale."
-                self.sttBackendName = "unavailable"
+                self.sttBackendName = "WhisperKit (large-v3-turbo)"
             }
-        case .unauthorized(let status):
-            await MainActor.run {
-                self.voiceErrorMessage = "Speech recognition not authorized (\(status.rawValue))."
-                self.sttBackendName = "unauthorized"
-            }
+            await logBus.publish(.sidecarLog(
+                sidecar: "voice",
+                level: .info,
+                message: "STT engine: WhisperKit (whisper-large-v3-turbo)",
+                fields: [:]
+            ))
+        } else if pref == "whisperkit" {
+            await logBus.publish(.error(
+                scope: "voice/stt",
+                message: "WhisperKit requested but failed to load; falling back to Apple Speech.",
+                recoverable: true
+            ))
         }
     }
 
