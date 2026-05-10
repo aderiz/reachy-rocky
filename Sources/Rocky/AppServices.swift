@@ -27,6 +27,10 @@ final class AppServices {
     let faceLibrary: FaceLibrary
     let stateSubscriber: StateSubscriber
     let wakeEngine: any WakeWordEngine
+    /// Native-MLX brain sidecar runtime, or nil when the venv hasn't
+    /// been installed (`Sidecars/brain/setup.sh`). When nil,
+    /// CognitionEngine uses the LMStudioBrain (HTTP) fallback.
+    let brainSidecar: SidecarRuntime?
 
     // Voice
     let audioBuffer: AudioRingBuffer
@@ -522,11 +526,49 @@ final class AppServices {
         // human cadence. Subscription is wired in start().
         self.momentFeed = MomentFeed()
 
-        // Cognition: LM Studio client + tool registry + memory.
+        // Cognition: brain backend + tool registry + memory. The
+        // LM Studio HTTP client always exists as the v0.1 fallback;
+        // M5 layers MLXVLMBrain (mlx-vlm + Qwen3-VL 4B sidecar) as
+        // the v0.2 default. The brain sidecar is constructed below
+        // and selected on top of LMStudioBrain in `start()`.
         self.llm = LMStudioClient(config: settings.lmStudioConfig(), logBus: bus)
         self.toolRegistry = ToolRegistry(logBus: bus)
+        let initialBrain: any BrainBackend = LMStudioBrain(client: self.llm)
+
+        // Brain sidecar — only initialised when the venv exists.
+        // First-run users without the venv get LMStudioBrain (text-
+        // only HTTP) until they run `Sidecars/brain/setup.sh`.
+        let brainVenv = SidecarSupervisor.defaultVenvDir(for: "brain")
+            .appendingPathComponent("bin/python")
+        if FileManager.default.fileExists(atPath: brainVenv.path),
+           let brainDir = Self.locateSidecarDir(named: "brain") {
+            let brainManifest = SidecarManifest(
+                name: "brain",
+                version: "0.2.0",
+                binary: brainVenv.path,
+                args: ["-u", "-m", "rocky_brain.runner"],
+                workingDir: brainDir.path(percentEncoded: false),
+                env: [
+                    "PYTHONPATH": brainDir.path(percentEncoded: false),
+                    "ROCKY_BRAIN_MODEL": settings.brainModel,
+                ],
+                readyTimeoutS: 300,
+                shutdownGraceS: 5,
+                timeouts: ["*": 5, "chat_stream": 120, "set_model": 300]
+            )
+            let brainResolver = ManifestPathResolver(
+                sidecarDir: brainDir,
+                venvDir: SidecarSupervisor.defaultVenvDir(for: "brain")
+            )
+            self.brainSidecar = SidecarRuntime(
+                manifest: brainManifest, resolver: brainResolver, logBus: bus
+            )
+        } else {
+            self.brainSidecar = nil
+        }
+
         self.cognition = CognitionEngine(
-            llm: self.llm,
+            brain: initialBrain,
             registry: self.toolRegistry,
             memory: self.memory,
             logBus: bus,
@@ -551,6 +593,49 @@ final class AppServices {
             await logBus.publish(.error(scope: "app/memory",
                                         message: "\(error) — run Sidecars/mempalace/setup.sh",
                                         recoverable: true))
+        }
+
+        // Brain sidecar — opt-in upgrade from the LM Studio HTTP path.
+        // Starts only when the venv exists (constructed in init); on
+        // successful start, swaps the CognitionEngine's brain to
+        // MLXVLMBrain. Failure leaves the LMStudioBrain default in
+        // place with a logged warning.
+        let pref = settings.brainBackend
+        if pref == "auto" || pref == "mlx-vlm",
+           let brainSidecar {
+            do {
+                try await brainSidecar.start()
+                let mlx = MLXVLMBrain(sidecar: brainSidecar, logBus: logBus)
+                await cognition.setBrain(mlx)
+                // Wire the latest camera frame so the VLM has eyes.
+                let provider: CognitionEngine.ImageProvider = { [weak self] in
+                    guard let self else { return nil }
+                    let frame = await MainActor.run { self.lastCameraFrame }
+                    return frame.map { BrainImage(jpegData: $0.jpeg) }
+                }
+                await cognition.setImageProvider(provider)
+                await logBus.publish(.sidecarLog(
+                    sidecar: "brain",
+                    level: .info,
+                    message: "Brain backend: MLX-VLM (\(settings.brainModel))",
+                    fields: [:]
+                ))
+            } catch {
+                if pref == "mlx-vlm" {
+                    await logBus.publish(.error(
+                        scope: "app/brain",
+                        message: "MLX-VLM brain requested but failed to start: \(error). Falling back to LM Studio.",
+                        recoverable: true
+                    ))
+                } else {
+                    await logBus.publish(.sidecarLog(
+                        sidecar: "brain",
+                        level: .info,
+                        message: "Brain backend: LM Studio (HTTP) — brain sidecar not available",
+                        fields: [:]
+                    ))
+                }
+            }
         }
 
         // Pump LogBus events into MomentFeed and mirror new moments

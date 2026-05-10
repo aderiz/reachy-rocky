@@ -59,7 +59,29 @@ public actor CognitionEngine {
         case error(String)
     }
 
-    public let llm: LMStudioClient
+    /// The active brain backend. Either `LMStudioBrain` (text-only,
+    /// HTTP, v0.1 baseline) or `MLXVLMBrain` (native MLX, vision-
+    /// aware, v0.2 default). The engine doesn't care which is in
+    /// play — both speak the same `ChatChunk` stream shape. `var`
+    /// because AppServices upgrades from LMStudioBrain → MLXVLMBrain
+    /// after the brain sidecar finishes loading the model.
+    public private(set) var brain: any BrainBackend
+
+    /// Live-swap the brain backend (e.g. when the brain sidecar
+    /// finishes loading the model and we upgrade from LM Studio
+    /// fallback). Existing transcript is preserved across the swap.
+    public func setBrain(_ brain: any BrainBackend) {
+        self.brain = brain
+    }
+
+    /// Optional closure called at turn start to fetch the latest
+    /// camera frame for vision-aware brains. AppServices wires this
+    /// to read its `lastCameraFrame` mirror. Returns `nil` when no
+    /// fresh frame is available — text-only brains ignore the
+    /// image regardless.
+    public typealias ImageProvider = @Sendable () async -> BrainImage?
+    public var imageProvider: ImageProvider?
+
     public let registry: ToolRegistry
     public let memory: MemoryService?
     private let logBus: LogBus
@@ -67,18 +89,26 @@ public actor CognitionEngine {
     private var transcript: [ChatMessage]
 
     public init(
-        llm: LMStudioClient,
+        brain: any BrainBackend,
         registry: ToolRegistry,
         memory: MemoryService? = nil,
         logBus: LogBus,
-        config: Config = Config()
+        config: Config = Config(),
+        imageProvider: ImageProvider? = nil
     ) {
-        self.llm = llm
+        self.brain = brain
         self.registry = registry
         self.memory = memory
         self.logBus = logBus
         self.config = config
+        self.imageProvider = imageProvider
         self.transcript = [.init(role: .system, content: config.systemPrompt)]
+    }
+
+    /// Live-swap the image provider after init (e.g. when the camera
+    /// sidecar comes online mid-session).
+    public func setImageProvider(_ provider: ImageProvider?) {
+        self.imageProvider = provider
     }
 
     public func setConfig(_ config: Config) {
@@ -166,7 +196,14 @@ public actor CognitionEngine {
             let messagesForLLM = Self.injectRecall(
                 envelope: recallEnvelope, into: transcript
             )
-            let stream = llm.chatStream(messages: messagesForLLM, tools: tools.isEmpty ? nil : tools)
+            // Vision-aware brains take a camera frame at turn start;
+            // text-only brains ignore it.
+            let image: BrainImage? = await imageProvider?()
+            let stream = brain.chatStream(
+                messages: messagesForLLM,
+                tools: tools.isEmpty ? nil : tools,
+                image: image
+            )
 
             for try await chunk in stream {
                 if firstChunkMs == nil {

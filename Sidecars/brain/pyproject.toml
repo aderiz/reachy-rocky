@@ -1,0 +1,27 @@
+[project]
+name = "rocky-brain"
+version = "0.2.0"
+description = "Rocky brain sidecar — vision-language inference via mlx-vlm + Qwen3-VL on Apple Silicon. Native MLX, no LM Studio HTTP hop. Streams tokens + native tool calls (qwen3_coder parser)."
+requires-python = ">=3.11"
+dependencies = [
+    "mlx>=0.20",
+    "mlx-vlm>=0.4",
+    "mlx-lm>=0.20",
+    "numpy>=1.26",
+    "pillow>=10",
+]
+
+[project.optional-dependencies]
+# TurboQuant KV cache compression: 4.6x compression at ~98% FP16 speed.
+# Optional because the wheel build chain is more involved than vanilla
+# mlx; default install still gives a working brain without it.
+turboquant = [
+    "turboquant-mlx>=0.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["rocky_brain"]

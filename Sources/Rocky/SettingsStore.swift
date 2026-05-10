@@ -128,6 +128,25 @@ final class SettingsStore {
     ///     warning.
     var wakeEngine: String { didSet { save() } }
 
+    /// Brain (LLM/VLM) backend choice. Values:
+    ///   - `"auto"` (default): MLX-VLM if the brain sidecar venv is
+    ///     installed AND the model loads, else LM Studio.
+    ///   - `"mlx-vlm"`: force the native-MLX brain sidecar (mlx-vlm
+    ///     + Qwen3-VL 4B by default). Falls back to LM Studio with
+    ///     a logged warning on failure.
+    ///   - `"lm-studio"`: force the v0.1 HTTP path. Useful when LM
+    ///     Studio is loading a specialised non-VL model that's not
+    ///     available as MLX, or as a sanity comparator.
+    var brainBackend: String { didSet { save() } }
+
+    /// Hugging Face repo id of the MLX-VLM model the brain sidecar
+    /// should load. Default `mlx-community/Qwen3-VL-4B-Instruct-4bit`
+    /// fits 16 GB Macs comfortably (~2.5 GB on disk, ~3 GB at runtime).
+    /// Heavier alternatives exist on the same hub
+    /// (`Qwen3-VL-30B-A3B-Instruct-4bit` for 64+ GB Macs) — change
+    /// this knob and restart the brain sidecar to swap.
+    var brainModel: String { didSet { save() } }
+
     /// The threshold value that was active *before* the last
     /// calibration / slider change. Persisted so the Settings UI can
     /// surface a one-click "Revert" if a calibration produced a worse
@@ -177,6 +196,9 @@ final class SettingsStore {
         self.sttEngine = d.string(forKey: Keys.sttEngine) ?? "auto"
         self.wakeWord = d.string(forKey: Keys.wakeWord) ?? "rocky"
         self.wakeEngine = d.string(forKey: Keys.wakeEngine) ?? "stt"
+        self.brainBackend = d.string(forKey: Keys.brainBackend) ?? "auto"
+        self.brainModel = d.string(forKey: Keys.brainModel)
+            ?? "mlx-community/Qwen3-VL-4B-Instruct-4bit"
     }
 
     /// Stamp `micVADThreshold` from a calibration / slider commit, and
@@ -236,6 +258,8 @@ final class SettingsStore {
         d.set(sttEngine, forKey: Keys.sttEngine)
         d.set(wakeWord, forKey: Keys.wakeWord)
         d.set(wakeEngine, forKey: Keys.wakeEngine)
+        d.set(brainBackend, forKey: Keys.brainBackend)
+        d.set(brainModel, forKey: Keys.brainModel)
     }
 
     func robotEndpoint() -> RobotEndpoint {
@@ -375,5 +399,7 @@ final class SettingsStore {
         static let sttEngine = "rocky.stt.engine"
         static let wakeWord = "rocky.wake.word"
         static let wakeEngine = "rocky.wake.engine"
+        static let brainBackend = "rocky.brain.backend"
+        static let brainModel = "rocky.brain.model"
     }
 }

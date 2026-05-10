@@ -1,0 +1,24 @@
+{
+  "name": "brain",
+  "version": "0.2.0",
+  "binary": "{venv}/bin/python",
+  "args": ["-u", "-m", "rocky_brain.runner"],
+  "working_dir": "{sidecar_dir}",
+  "env": {
+    "ROCKY_BRAIN_MODEL": "mlx-community/Qwen3-VL-4B-Instruct-4bit",
+    "ROCKY_BRAIN_MAX_TOKENS": "768",
+    "ROCKY_BRAIN_TEMPERATURE": "0.6",
+    "ROCKY_BRAIN_VISION_CACHE_SIZE": "8"
+  },
+  "ready_event": "ready",
+  "ready_timeout_s": 300,
+  "shutdown_grace_s": 5,
+  "restart_policy": "on_failure",
+  "restart_max_per_minute": 3,
+  "timeouts": {
+    "*": 5,
+    "chat_stream": 120,
+    "health": 5,
+    "set_model": 300
+  }
+}
