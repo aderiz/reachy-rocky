@@ -31,6 +31,10 @@ final class AppServices {
     /// been installed (`Sidecars/brain/setup.sh`). When nil,
     /// CognitionEngine uses the LMStudioBrain (HTTP) fallback.
     let brainSidecar: SidecarRuntime?
+    /// MLX-Whisper STT sidecar runtime, or nil when its venv hasn't
+    /// been built (`Sidecars/mlx-stt/setup.sh`). When nil, warmUpSTT
+    /// falls back to WhisperKit (CoreML) and then Apple Speech.
+    let mlxSTTSidecar: SidecarRuntime?
     /// M6 streaming TTS player. Receives PCM chunks from
     /// Qwen3-TTS-12Hz and plays them via `AVAudioEngine`.
     let streamingTTS: StreamingTTS
@@ -164,6 +168,14 @@ final class AppServices {
     /// streamer. Driven by `setFaceTrackingEnabled` so menu bar and any
     /// future dashboard control read the same source of truth.
     var faceTrackingEnabled: Bool = true
+
+    /// Whether the camera frame is forwarded to the brain on each chat
+    /// turn. When `false`, the `imageProvider` closure returns nil so
+    /// the VLM operates text-only — useful for privacy (don't share
+    /// the room with the model) or when the camera frame is distracting
+    /// the model. The camera sidecar keeps running so the face tracker
+    /// and Vision card still work; only the brain feed is gated.
+    var visionEnabled: Bool = true
 
     /// Sidecar lifecycle mirrors so the Status panel can render real states
     /// without poking actors on every redraw.
@@ -604,6 +616,42 @@ final class AppServices {
             self.brainSidecar = nil
         }
 
+        // MLX-Whisper STT sidecar. Same pattern as brain: only built
+        // when the venv exists, so first-run users without it land
+        // on WhisperKit / Apple Speech via `warmUpSTT`.
+        let mlxSTTVenv = SidecarSupervisor.defaultVenvDir(for: "mlx-stt")
+            .appendingPathComponent("bin/python")
+        if FileManager.default.fileExists(atPath: mlxSTTVenv.path),
+           let sttDir = Self.locateSidecarDir(named: "mlx-stt") {
+            let sttManifest = SidecarManifest(
+                name: "mlx-stt",
+                version: "0.1.0",
+                binary: mlxSTTVenv.path,
+                args: ["-u", "-m", "rocky_mlx_stt.runner"],
+                workingDir: sttDir.path(percentEncoded: false),
+                env: [
+                    "PYTHONPATH": sttDir.path(percentEncoded: false),
+                    "ROCKY_STT_MODEL": "mlx-community/whisper-large-v3-mlx",
+                    "ROCKY_STT_LANGUAGE": "en",
+                ],
+                readyTimeoutS: 300,
+                shutdownGraceS: 5,
+                // First transcribe loads the model (~5 s); cap the
+                // RPC at 30 s so a stuck call surfaces clearly. warm_up
+                // gets a longer budget for the explicit model fetch.
+                timeouts: ["*": 5, "transcribe": 30, "warm_up": 60]
+            )
+            let sttResolver = ManifestPathResolver(
+                sidecarDir: sttDir,
+                venvDir: SidecarSupervisor.defaultVenvDir(for: "mlx-stt")
+            )
+            self.mlxSTTSidecar = SidecarRuntime(
+                manifest: sttManifest, resolver: sttResolver, logBus: bus
+            )
+        } else {
+            self.mlxSTTSidecar = nil
+        }
+
         self.cognition = CognitionEngine(
             brain: initialBrain,
             registry: self.toolRegistry,
@@ -945,17 +993,18 @@ final class AppServices {
         }
 
         // Pat-on-head wake monitor. Polls the active mic's RMS at
-        // 20 Hz; while the robot is asleep AND the mic is on, a sharp
-        // transient (RMS jumps from quiet baseline to a loud spike in
-        // one frame) is treated as a pat and wakes the robot. Requires
-        // listen mode to be on; if you sleep with the mic muted, only
-        // the Wake button works.
+        // 20 Hz; while the robot is asleep AND the mic is on AND
+        // SettingsStore.wakeOnPat is true, a loud transient wakes the
+        // robot. Off by default — the on-robot mic hears Rocky's own
+        // goodnight TTS / fans / ambient voice and trips immediately.
         Task { [weak self] in await self?.runPatMonitor() }
 
         // Listen mode is on by default — the user can still disable it
         // via the toggle in HeroCard / menu bar, but they shouldn't
         // have to click "Listen" to start a normal session.
+        fputs("[mic] auto-toggle on at app start (micEnabled=\(micEnabled))\n", stderr)
         if !micEnabled { await toggleMic() }
+        fputs("[mic] auto-toggle complete (micEnabled=\(micEnabled), source=\(settings.micSource), err=\(voiceErrorMessage ?? "none"))\n", stderr)
 
         // Tool registry + LM Studio probe. Auto-retries every 8 s while
         // status is offline so users don't have to click "Probe" after
@@ -1033,12 +1082,63 @@ final class AppServices {
             }
         }
 
-        // M3 upgrade path: try WhisperKit. If `settings.sttEngine` is
-        // "auto" or "whisperkit", attempt to load the model. On
-        // success, swap the VoiceCoordinator's STT to WhisperKit and
-        // update the dashboard label. On failure, leave Apple Speech
-        // in place.
+        // STT engine selection ladder. `auto` tries MLX-Whisper first
+        // (single MLX runtime alongside brain + TTS), then WhisperKit
+        // (CoreML, ANE-accelerated, self-contained but separate weight
+        // cache under ~/Documents/huggingface/), and finally leaves
+        // Apple Speech in place. Explicit engine choices skip the
+        // ladder and try only the requested engine.
         let pref = await MainActor.run { self.settings.sttEngine }
+        guard pref != "apple" else { return }
+
+        // ---- MLX-Whisper (mlx-stt sidecar) ----
+        let tryMLX = (pref == "auto" || pref == "mlx-whisper")
+        if tryMLX, let mlxSTTSidecar {
+            do {
+                try await mlxSTTSidecar.start()
+                let mlx = MLXWhisperSTT(sidecar: mlxSTTSidecar)
+                // Warm-up runs a 1 s silence transcribe so model
+                // weights are loaded before the user's first utterance.
+                // Failures here only surface a log line; we still
+                // install the engine since the first real call will
+                // retry the load.
+                do { try await mlx.warmUp() } catch {
+                    await logBus.publish(.sidecarLog(
+                        sidecar: "voice", level: .warn,
+                        message: "MLX-Whisper warm-up failed (non-fatal): \(error)",
+                        fields: [:]
+                    ))
+                }
+                await voice.setSTT(mlx)
+                await MainActor.run {
+                    self.sttBackendName = "MLX-Whisper (large-v3-mlx)"
+                }
+                await logBus.publish(.sidecarLog(
+                    sidecar: "voice", level: .info,
+                    message: "STT engine: MLX-Whisper (mlx-community/whisper-large-v3-mlx)",
+                    fields: [:]
+                ))
+                fputs("[stt] engine = MLX-Whisper (mlx-stt sidecar)\n", stderr)
+                return
+            } catch {
+                fputs("[stt] MLX-Whisper start failed: \(error) — falling through\n", stderr)
+                await logBus.publish(.error(
+                    scope: "voice/stt",
+                    message: "MLX-Whisper sidecar failed to start: \(error)",
+                    recoverable: true
+                ))
+            }
+        } else if tryMLX {
+            // Sidecar nil — venv not installed. Inform the user in
+            // auto mode (where the fallback is silent and confusing).
+            await logBus.publish(.sidecarLog(
+                sidecar: "voice", level: .info,
+                message: "MLX-Whisper venv not found — run Sidecars/mlx-stt/setup.sh to enable. Trying WhisperKit.",
+                fields: [:]
+            ))
+        }
+
+        // ---- WhisperKit (CoreML) ----
         guard pref == "auto" || pref == "whisperkit" else { return }
         if let wk = await WhisperKitSTT.tryDefault() {
             await voice.setSTT(wk)
@@ -1051,6 +1151,7 @@ final class AppServices {
                 message: "STT engine: WhisperKit (whisper-large-v3-turbo)",
                 fields: [:]
             ))
+            fputs("[stt] engine = WhisperKit (CoreML)\n", stderr)
         } else if pref == "whisperkit" {
             await logBus.publish(.error(
                 scope: "voice/stt",
@@ -1175,6 +1276,17 @@ final class AppServices {
                 // that double-dispatched transcripts to the LLM.
             } catch {
                 voiceErrorMessage = Self.friendlyVoiceErrorMessage(for: error)
+                // Make silent failures observable. Without this the UI
+                // shows only a small red caption in CockpitView; if the
+                // user is on a different tab, the error vanishes. Both
+                // logBus (LogsView) and stderr (Console / terminal)
+                // surface the real exception for diagnosis.
+                fputs("[mic] toggleMic enable FAILED — source=\(settings.micSource), error=\(error)\n", stderr)
+                await logBus.publish(.error(
+                    scope: "voice/mic-toggle",
+                    message: "enable failed (source=\(settings.micSource)): \(error)",
+                    recoverable: true
+                ))
             }
         }
     }
@@ -1183,10 +1295,21 @@ final class AppServices {
         switch output {
         case .partial(let text):
             await MainActor.run { self.lastTranscript = text }
-        case .finalText(let text, let dispatched, _):
+        case .finalText(let text, let dispatched, let reason):
             await MainActor.run {
                 self.lastTranscript = text
                 if dispatched { self.lastDispatched = text }
+            }
+            // Wake-on-name: a fresh wake match while asleep also wakes
+            // the body. Without this, saying "Rocky" only opens the
+            // conversation window — the brain hears the transcript
+            // but the motors stay disabled, so any motion or `wake_up`
+            // tool call queues behind a sleeping daemon. Fire-and-
+            // forget so the brain can think during the ~3 s wake_up
+            // move. Follow-ups inside the open window (`.withinWindow`)
+            // intentionally don't trigger this — once awake, stay awake.
+            if dispatched, case .wakeMatch = reason, isAsleep {
+                Task { [weak self] in await self?.wakeRobot() }
             }
             if dispatched {
                 // Echo gate: drop transcripts captured while Rocky is
@@ -1638,6 +1761,13 @@ final class AppServices {
         await macFaceTracker.setEnabled(enabled)
     }
 
+    /// Toggle whether camera frames are passed to the brain on each
+    /// chat turn. Idempotent. Does NOT stop the camera sidecar —
+    /// the Vision card and face tracker still operate.
+    func setVisionEnabled(_ enabled: Bool) {
+        visionEnabled = enabled
+    }
+
     /// Tracks the last successful auto-wake so we don't spam the daemon.
     private var lastAutoWakeAt: Date?
 
@@ -1672,12 +1802,13 @@ final class AppServices {
 
         while !Task.isCancelled {
             try? await Task.sleep(nanoseconds: pollInterval)
-            let (asleep, micOn, useRobot) = await MainActor.run {
+            let (asleep, micOn, useRobot, enabled) = await MainActor.run {
                 (self.isAsleep,
                  self.micEnabled,
-                 self.settings.micSource == "robot")
+                 self.settings.micSource == "robot",
+                 self.settings.wakeOnPat)
             }
-            guard asleep, micOn else { continue }
+            guard enabled, asleep, micOn else { continue }
             if Date().timeIntervalSince(lastWakeAttempt) < cooldownS { continue }
             let rms: Float = useRobot
                 ? await self.robotMic.lastRMS
@@ -1915,10 +2046,15 @@ final class AppServices {
         let mlx = MLXVLMBrain(sidecar: brainSidecar, logBus: logBus)
         await cognition.setBrain(mlx)
         fputs("[brain] applyBrainBackend: cognition.brain = MLXVLMBrain (\(settings.brainModel))\n", stderr)
-        // Wire the latest camera frame so the VLM has eyes.
+        // Wire the latest camera frame so the VLM has eyes. Gated by
+        // `visionEnabled` so the user can blind the model from the
+        // toolbar without stopping the camera sidecar.
         let provider: CognitionEngine.ImageProvider = { [weak self] in
             guard let self else { return nil }
-            let frame = await MainActor.run { self.lastCameraFrame }
+            let (frame, enabled) = await MainActor.run {
+                (self.lastCameraFrame, self.visionEnabled)
+            }
+            guard enabled else { return nil }
             return frame.map { BrainImage(jpegData: $0.jpeg) }
         }
         await cognition.setImageProvider(provider)

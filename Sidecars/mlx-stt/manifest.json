@@ -1,0 +1,21 @@
+{
+  "name": "mlx-stt",
+  "version": "0.1.0",
+  "binary": "{venv}/bin/python",
+  "args": ["-u", "-m", "rocky_mlx_stt.runner"],
+  "working_dir": "{sidecar_dir}",
+  "env": {
+    "ROCKY_STT_MODEL": "mlx-community/whisper-large-v3-mlx",
+    "ROCKY_STT_LANGUAGE": "en"
+  },
+  "ready_event": "ready",
+  "ready_timeout_s": 300,
+  "shutdown_grace_s": 5,
+  "restart_policy": "on_failure",
+  "restart_max_per_minute": 3,
+  "timeouts": {
+    "*": 5,
+    "transcribe": 30,
+    "warm_up": 60
+  }
+}

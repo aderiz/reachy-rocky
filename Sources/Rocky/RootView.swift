@@ -90,6 +90,34 @@ struct RootView: View {
                   : "Mute Rocky's voice — replies still appear in the conversation.")
         }
 
+        ToolbarItem(placement: .secondaryAction) {
+            Button {
+                services.setVisionEnabled(!services.visionEnabled)
+            } label: {
+                Label(services.visionEnabled ? "Disable vision" : "Enable vision",
+                      systemImage: services.visionEnabled
+                        ? "eye.fill"
+                        : "eye.slash.fill")
+            }
+            .help(services.visionEnabled
+                  ? "Stop passing the camera frame to the brain — Rocky will reply text-only without seeing what's in front of him."
+                  : "Pass the camera frame to the brain so Rocky can see and describe what's in front of him.")
+        }
+
+        ToolbarItem(placement: .secondaryAction) {
+            Button {
+                Task { await services.setFaceTrackingEnabled(!services.faceTrackingEnabled) }
+            } label: {
+                Label(services.faceTrackingEnabled ? "Disable face tracking" : "Enable face tracking",
+                      systemImage: services.faceTrackingEnabled
+                        ? "face.smiling.inverse"
+                        : "face.dashed")
+            }
+            .help(services.faceTrackingEnabled
+                  ? "Stop the face tracker from steering Rocky's head — head stops tracking faces."
+                  : "Resume the face tracker so Rocky's head follows visible faces.")
+        }
+
         ToolbarItem(placement: .principal) { Spacer() }
 
         ToolbarItem(placement: .primaryAction) {

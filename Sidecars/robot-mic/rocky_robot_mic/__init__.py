@@ -22,6 +22,14 @@ Methods:
   health():          { connected, recording, sample_rate, channels }
 """
 
-from .runner import main  # re-export for `python -m rocky_robot_mic`
+# Intentionally empty. Do NOT `from .runner import main` here — the
+# sidecar is launched via `python -m rocky_robot_mic.runner`, and
+# importing `runner` from `__init__.py` causes the runner module to be
+# loaded twice (once as `rocky_robot_mic.runner`, once as `__main__`),
+# yielding the `<frozen runpy>:128 RuntimeWarning: ... found in
+# sys.modules after import of package ... prior to execution` warning.
+# That double-import can leave GStreamer / threading state in a
+# half-initialised condition and is suspected in the "green but
+# silent" robot-mic symptom.
 
-__all__ = ["main"]
+__all__: list[str] = []

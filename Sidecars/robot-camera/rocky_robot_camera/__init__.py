@@ -5,6 +5,8 @@ Connects to the Reachy Mini daemon via the `reachy_mini` SDK, polls
 and emits `frame` events to Rocky over the Sidecar wire.
 """
 
-from .runner import main
+# Intentionally empty — see `rocky_robot_mic/__init__.py` for the
+# rationale. Importing `runner` from `__init__.py` causes a double-
+# import when launched via `python -m rocky_robot_camera.runner`.
 
-__all__ = ["main"]
+__all__: list[str] = []

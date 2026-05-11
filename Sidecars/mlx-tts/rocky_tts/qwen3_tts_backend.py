@@ -191,11 +191,17 @@ class Qwen3TTSBackend(Backend):
         #   - otherwise → standard synthesis with the model's
         #     default voice (no cloning; this is the first-run path
         #     before the user has recorded a reference)
+        # `streaming_interval=0.32` (~4 codec tokens at 12.5 Hz) is the
+        # canonical low-latency setting from the mlx-audio v0.4.3 Qwen3-
+        # TTS README. Default is 2.0 s — too coarse for live-assistant
+        # responsiveness. 0.32 s gets first chunk within a few hundred
+        # ms after the ICL prefill (which is the floor we can't avoid).
         for result in self._model.generate(  # type: ignore[union-attr]
             text=text,
             ref_audio=self.ref_audio_path,
             ref_text=self.ref_text,
             stream=True,
+            streaming_interval=0.32,
             verbose=False,
         ):
             audio = getattr(result, "audio", result)

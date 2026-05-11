@@ -72,7 +72,7 @@ struct StatusView: View {
                        from: [cameraRow, faceSidecarRow]),
             capability(id: "cap.think",  title: "Think",
                        icon: "brain",
-                       from: [llmRow]),
+                       from: [brainRow]),
             capability(id: "cap.speak",  title: "Speak",
                        icon: "speaker.wave.2",
                        from: [ttsSidecarRow]),
@@ -302,7 +302,7 @@ struct StatusView: View {
             ("Body",   [robotRow]),
             ("Listen", [micRow, sttRow]),
             ("See",    [cameraRow, faceSidecarRow]),
-            ("Think",  [llmRow]),
+            ("Think",  [brainRow]),
             ("Speak",  [ttsSidecarRow]),
             ("Memory", [memorySidecarRow]),
         ]
@@ -336,6 +336,42 @@ struct StatusView: View {
             action: HealthAction(label: "Probe") {
                 Task { await services.probeRobotPublic() }
             }
+        )
+    }
+
+    /// Active brain row. Reflects whichever backend is actually doing
+    /// the thinking — MLX-VLM when the brain sidecar is the active
+    /// path (explicit setting OR `auto` with the sidecar ready), or
+    /// LM Studio when LM Studio is the active path. The other one is
+    /// hidden so the Status panel doesn't flag an offline backend
+    /// nobody asked for.
+    private var brainRow: HealthRow {
+        switch services.settings.brainBackend {
+        case "mlx-vlm":
+            return mlxBrainRow
+        case "lm-studio":
+            return llmRow
+        default:  // "auto"
+            // Auto picks MLX-VLM when the sidecar is ready; otherwise
+            // falls back to LM Studio.
+            if services.brainSidecarState == .ready {
+                return mlxBrainRow
+            }
+            return llmRow
+        }
+    }
+
+    private var mlxBrainRow: HealthRow {
+        let model = services.settings.brainModel
+        // Pull the short model name (after the last "/") so the row
+        // doesn't wrap awkwardly. Full id is still in the tooltip.
+        let shortModel = model.split(separator: "/").last.map(String.init) ?? model
+        return sidecarRow(
+            id: "brain.mlx",
+            title: "MLX-VLM",
+            icon: "brain",
+            state: services.brainSidecarState,
+            extra: shortModel
         )
     }
 

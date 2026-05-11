@@ -73,6 +73,20 @@ public actor VoiceCoordinator {
     /// latest deadline.
     private var windowCloseTask: Task<Void, Never>?
 
+    /// Dedup state: normalised text + timestamp of the most recently
+    /// `.dispatch`-decided transcript. Used to suppress duplicate
+    /// dispatches when VAD over-segments a single utterance into two
+    /// near-identical transcripts (typical on the robot-mic WebRTC
+    /// path, where the audio track has occasional silent gaps that
+    /// EnergyVAD interprets as speech-end).
+    private var lastDispatchedNormalized: String = ""
+    private var lastDispatchedAt: Date = .distantPast
+    /// How long a "same as just-dispatched" transcript is treated as
+    /// a VAD double-fire. Tight enough that a genuine repeat ("Rocky
+    /// what's this? ... Rocky what's this?") with 3 + seconds between
+    /// them still goes through both times.
+    private let dedupWindowS: TimeInterval = 3.0
+
     public nonisolated let outputs: AsyncStream<Output>
     private let outputsContinuation: AsyncStream<Output>.Continuation
 
@@ -331,6 +345,32 @@ public actor VoiceCoordinator {
         let decision = await wake.decide(transcript: text)
         switch decision {
         case .dispatch(let transcript, let reason):
+            // Dedup gate: VAD on the robot-mic WebRTC path
+            // occasionally splits one utterance into two segments
+            // because of brief silent gaps in the audio stream.
+            // Each segment is STT'd separately and produces a
+            // near-identical transcript a fraction of a second
+            // apart. Suppress the second one so the brain only
+            // sees one prompt per spoken sentence. The normalisation
+            // strips case and non-alphanumeric chars so "Rocky
+            // what's this" and "Rocky, what's this?" collapse to
+            // the same key.
+            let normalized = Self.normalizeForDedup(transcript)
+            let now = Date()
+            let withinWindow = now.timeIntervalSince(lastDispatchedAt) < dedupWindowS
+            if withinWindow, !normalized.isEmpty, normalized == lastDispatchedNormalized {
+                await logBus.publish(.sidecarLog(
+                    sidecar: "voice", level: .info,
+                    message: "dedup: dropping duplicate \"\(transcript)\"",
+                    fields: ["normalized": normalized,
+                             "since_last_ms": "\(Int(now.timeIntervalSince(lastDispatchedAt) * 1000))"]
+                ))
+                outputsContinuation.yield(.finalText(text: text, dispatched: false, reason: nil))
+                return
+            }
+            lastDispatchedNormalized = normalized
+            lastDispatchedAt = now
+
             outputsContinuation.yield(.finalText(text: transcript, dispatched: true, reason: reason))
             // Surface the (re)opened window to AppServices so its
             // `conversationOpenUntil` mirror tracks the wake filter and
@@ -354,6 +394,18 @@ public actor VoiceCoordinator {
             outputsContinuation.yield(.windowClosed(reason: reason))
             await logBus.publish(.conversationWindow(transition: .closed, reason: reason))
         }
+    }
+
+    /// Normalise a transcript for the dedup comparison: lowercased,
+    /// punctuation stripped, runs of whitespace collapsed. Picks up
+    /// "Rocky what's this" ≡ "Rocky, what's this?" but keeps genuinely
+    /// different transcripts ("what time is it" vs "what time was it")
+    /// distinct.
+    private static func normalizeForDedup(_ text: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(.whitespaces)
+        let scalars = text.unicodeScalars.filter { allowed.contains($0) }
+        let lowered = String(String.UnicodeScalarView(scalars)).lowercased()
+        return lowered.split(whereSeparator: \.isWhitespace).joined(separator: " ")
     }
 
     private func scheduleIdleClose(at deadline: Date) {

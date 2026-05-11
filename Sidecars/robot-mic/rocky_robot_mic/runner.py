@@ -104,6 +104,21 @@ class Runner:
 
     def audio_loop(self) -> None:
         assert self.mini is not None
+        # Idempotent acquire before start_recording. ReachyMini's
+        # __init__ already configures the media manager, but when the
+        # bot has just finished a power-cycle the daemon may not have
+        # the WebRTC receiver peer fully attached. Calling
+        # `acquire_media()` is a no-op when `_media_released = False`
+        # (which is the post-init state), so this is safe; when the
+        # peer was torn down by a prior T2 reconnect it nudges the
+        # daemon to re-attach the audio track. Without this, fresh
+        # sidecars sometimes come up green-but-silent — RMS = 0 forever.
+        try:
+            self.mini.acquire_media()
+        except Exception as exc:  # noqa: BLE001
+            log("warn", "acquire_media before start_recording failed",
+                error=str(exc))
+
         self.mini.media.start_recording()
         try:
             self.sample_rate = int(self.mini.media.get_input_audio_samplerate() or 16_000)
@@ -113,7 +128,21 @@ class Runner:
 
         log("info", "recording started",
             sr=self.sample_rate, ch=self.channels)
+        # Mirror to stderr too — the JSON-envelope `log` goes to stdout
+        # which only the in-app LogsView sees. Mirroring lets terminal
+        # / Console.app observers see the recording-start handshake.
+        sys.stderr.write(
+            f"[robot-mic] recording started sr={self.sample_rate} ch={self.channels}\n"
+        )
+        sys.stderr.flush()
         self.last_frame_ts = time.monotonic()
+        # Diagnostics: log the first audio frame's shape + a coarse
+        # peak so a "green but silent" sidecar is debuggable from the
+        # log. Without this you can't tell whether the bot is sending
+        # zero-valued PCM or the conversion is wrong on our side.
+        self._logged_first_frame = False
+        self._peak_log_ts = time.monotonic()
+        self._window_peak = 0.0
         # Spawn the stall watchdog at most once per process — a
         # reconnect-tier recovery restarts audio_loop, but we don't
         # want a second watchdog stacking on the first.
@@ -140,6 +169,31 @@ class Runner:
 
             # samples: shape (N, 2) float32 typically
             arr = np.asarray(samples, dtype=np.float32)
+            if not self._logged_first_frame:
+                self._logged_first_frame = True
+                peak = float(np.max(np.abs(arr))) if arr.size else 0.0
+                log("info", "first audio frame",
+                    shape=str(arr.shape), dtype=str(arr.dtype),
+                    peak=f"{peak:.5f}")
+                sys.stderr.write(
+                    f"[robot-mic] first audio frame shape={arr.shape} "
+                    f"dtype={arr.dtype} peak={peak:.5f}\n"
+                )
+                sys.stderr.flush()
+            # Periodic peak telemetry: once per second log the running
+            # max so the user can see whether their voice is reaching
+            # the mic, without flooding the log per-frame.
+            now = time.monotonic()
+            frame_peak = float(np.max(np.abs(arr))) if arr.size else 0.0
+            if frame_peak > self._window_peak:
+                self._window_peak = frame_peak
+            if now - self._peak_log_ts >= 1.0:
+                sys.stderr.write(
+                    f"[robot-mic] peak (last 1s) = {self._window_peak:.5f}\n"
+                )
+                sys.stderr.flush()
+                self._window_peak = 0.0
+                self._peak_log_ts = now
             if arr.ndim == 2 and arr.shape[1] >= 1:
                 mono = arr.mean(axis=1)
             else:

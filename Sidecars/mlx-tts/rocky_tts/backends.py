@@ -65,6 +65,15 @@ def make_backend() -> Backend:
                 f"Qwen3-TTS backend requested but mlx-audio is not installed "
                 f"(install with `FT_EXTRAS=mlx ./Sidecars/mlx-tts/setup.sh`): {exc}"
             )
+    if name in {"fish-audio", "fish", "fish-speech", "fish-s2-pro"}:
+        try:
+            from .fish_tts_backend import FishTTSBackend
+            return FishTTSBackend()
+        except ImportError as exc:
+            raise RuntimeError(
+                f"Fish Audio backend requested but mlx-audio is not installed "
+                f"(install with `FT_EXTRAS=mlx ./Sidecars/mlx-tts/setup.sh`): {exc}"
+            )
     if name in {"chatterbox", "chatterbox-turbo", "chatterbox-fp16",
                 "chatterbox-turbo-fp16", "mlx"}:
         try:

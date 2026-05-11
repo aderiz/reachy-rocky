@@ -1,0 +1,17 @@
+[project]
+name = "rocky-mlx-stt"
+version = "0.1.0"
+description = "Rocky STT sidecar — Whisper inference via mlx-whisper on Apple Silicon. Replaces WhisperKit (CoreML) with the MLX runtime so weights live in HF cache alongside the brain + TTS models."
+requires-python = ">=3.11"
+dependencies = [
+    "mlx>=0.20",
+    "mlx-whisper>=0.4",
+    "numpy>=1.26",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["rocky_mlx_stt"]

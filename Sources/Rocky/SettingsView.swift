@@ -483,14 +483,15 @@ private struct VoiceSettingsTab: View {
 
             Section {
                 Picker("STT engine", selection: sttEngineBinding) {
-                    Text("Auto — WhisperKit if it loads, else Apple Speech").tag("auto")
-                    Text("WhisperKit (whisper-large-v3-turbo)").tag("whisperkit")
+                    Text("Auto — MLX-Whisper → WhisperKit → Apple Speech").tag("auto")
+                    Text("MLX-Whisper (whisper-large-v3-mlx, via sidecar)").tag("mlx-whisper")
+                    Text("WhisperKit (whisper-large-v3-turbo, CoreML)").tag("whisperkit")
                     Text("Apple Speech (SFSpeechRecognizer)").tag("apple")
                 }
             } header: {
                 Text("Speech-to-text")
             } footer: {
-                Text("WhisperKit hits 0.46 s latency at 2.2% WER on Apple Silicon. First-launch downloads ~700 MB of weights. Falls back to Apple Speech on hardware that can't load it. Engine change applies on next launch.")
+                Text("MLX-Whisper runs whisper-large-v3-mlx via the mlx-stt sidecar — same MLX runtime as the brain and TTS. Run `./Sidecars/mlx-stt/setup.sh` to install (~3 GB on first transcribe). WhisperKit uses CoreML weights at ~700 MB. Apple Speech is the system fallback. Auto tries them in order; the first one that loads wins. Engine change applies on next launch.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -503,26 +504,30 @@ private struct VoiceSettingsTab: View {
                     Text("Porcupine (placeholder — not yet integrated)")
                         .tag("porcupine")
                 }
+                Toggle("Wake on chassis tap / loud sound",
+                       isOn: wakeOnPatBinding)
             } header: {
                 Text("Wake word")
             } footer: {
-                Text("Lower-case stored. STT-derived is the v0.1 path: WakeFilter pattern-matches the wake phrase in the final transcript. Porcupine slot is reserved for a future dedicated keyword spotter (97% accuracy, ~50 ms latency). Wake-phrase change applies on next launch.")
+                Text("Lower-case stored. STT-derived is the v0.1 path: WakeFilter pattern-matches the wake phrase in the final transcript. Porcupine slot is reserved for a future dedicated keyword spotter (97% accuracy, ~50 ms latency). Wake-phrase change applies on next launch.\n\nWake-on-tap routes any loud sound (RMS > 0.03) into a wake. Off by default — the on-robot mic hears Rocky's own goodnight TTS and ambient noise, which immediately undoes a sleep command.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
 
             Section {
                 Picker("TTS engine", selection: ttsBackendBinding) {
-                    Text("Qwen3-TTS-12Hz (streaming, 97 ms first packet)")
+                    Text("Qwen3-TTS-12Hz (streaming, ~3 s first packet with ICL)")
                         .tag("qwen3-tts")
-                    Text("Chatterbox FP16 (full-WAV, slower)")
+                    Text("Fish Audio S2 Pro (full-WAV, voice cloning)")
+                        .tag("fish-audio")
+                    Text("Chatterbox FP16 (full-WAV, legacy)")
                         .tag("chatterbox")
                 }
                 BotVolumeSlider()
             } header: {
                 Text("Voice (TTS)")
             } footer: {
-                Text("Qwen3-TTS streams PCM chunks as it synthesises — Rocky speaks the first sentence while the rest is still being generated. Chatterbox keeps the v0.1 voice character but waits for the whole reply. Both clone from `~/Library/Application Support/Rocky/voice/reference.wav`. Engine change applies on next launch.")
+                Text("Qwen3-TTS streams PCM chunks as it synthesises. Fish Audio S2 Pro is a non-streaming alternative with strong voice cloning. Chatterbox keeps the v0.1 voice character. All three clone from `~/Library/Application Support/Rocky/voice/sample.wav` + `sample.txt`. Engine change applies on next launch.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -564,6 +569,12 @@ private struct VoiceSettingsTab: View {
             get: { store.wakeWord },
             set: { store.wakeWord = $0.lowercased() }
         )
+    }
+
+    private var wakeOnPatBinding: Binding<Bool> {
+        let store = services.settings
+        return Binding(get: { store.wakeOnPat },
+                       set: { store.wakeOnPat = $0 })
     }
 
     private var wakeEngineBinding: Binding<String> {

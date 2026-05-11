@@ -90,15 +90,20 @@ final class SettingsStore {
     var vadEngine: String { didSet { save() } }
 
     /// Speech-to-text engine choice. Values:
-    ///   - `"auto"` (default): WhisperKit if it loads, else Apple
-    ///     Speech.
+    ///   - `"auto"` (default): tries MLX-Whisper first (sidecar),
+    ///     then WhisperKit (CoreML), then Apple Speech.
+    ///   - `"mlx-whisper"`: force the `mlx-stt` sidecar running
+    ///     `mlx-community/whisper-large-v3-mlx`. Shares the MLX
+    ///     runtime with brain + TTS. Weights cached in `~/.cache/
+    ///     huggingface/`. Falls through to WhisperKit / Apple
+    ///     Speech if the sidecar venv isn't installed.
     ///   - `"whisperkit"`: force WhisperKit (`whisper-large-v3-
     ///     turbo`); first launch downloads ~700 MB of weights to
     ///     `~/Documents/huggingface/`. Falls back to Apple Speech
     ///     with a logged warning on failure.
     ///   - `"apple"`: force `SFSpeechRecognizer`. The v0.1
-    ///     baseline; useful when WhisperKit's hardware fingerprint
-    ///     fails on older Apple Silicon or as a sanity comparator.
+    ///     baseline; useful when both MLX paths fail or as a
+    ///     sanity comparator.
     var sttEngine: String { didSet { save() } }
 
     /// Wake word the user says to address Rocky. The default
@@ -127,6 +132,13 @@ final class SettingsStore {
     ///     factory falls back to the STT-derived path with a logged
     ///     warning.
     var wakeEngine: String { didSet { save() } }
+
+    /// When true, a sustained loud sound (mic RMS spike) while Rocky
+    /// is asleep wakes him. Default is off because the on-robot mic
+    /// picks up Rocky's own goodnight TTS, fans, and casual room
+    /// noise — all of which trip the threshold and immediately undo
+    /// `sleepRobot()`. Users who want tap-to-wake can opt in.
+    var wakeOnPat: Bool { didSet { save() } }
 
     /// Brain (LLM/VLM) backend choice. Values:
     ///   - `"auto"` (default): MLX-VLM if the brain sidecar venv is
@@ -196,6 +208,7 @@ final class SettingsStore {
         self.sttEngine = d.string(forKey: Keys.sttEngine) ?? "auto"
         self.wakeWord = d.string(forKey: Keys.wakeWord) ?? "rocky"
         self.wakeEngine = d.string(forKey: Keys.wakeEngine) ?? "stt"
+        self.wakeOnPat = (d.object(forKey: Keys.wakeOnPat) as? Bool) ?? false
         self.brainBackend = d.string(forKey: Keys.brainBackend) ?? "auto"
         self.brainModel = d.string(forKey: Keys.brainModel)
             ?? "mlx-community/Qwen3-VL-4B-Instruct-4bit"
@@ -261,6 +274,7 @@ final class SettingsStore {
         d.set(sttEngine, forKey: Keys.sttEngine)
         d.set(wakeWord, forKey: Keys.wakeWord)
         d.set(wakeEngine, forKey: Keys.wakeEngine)
+        d.set(wakeOnPat, forKey: Keys.wakeOnPat)
         d.set(brainBackend, forKey: Keys.brainBackend)
         d.set(brainModel, forKey: Keys.brainModel)
     }
@@ -432,6 +446,7 @@ final class SettingsStore {
         static let sttEngine = "rocky.stt.engine"
         static let wakeWord = "rocky.wake.word"
         static let wakeEngine = "rocky.wake.engine"
+        static let wakeOnPat = "rocky.wake.on.pat"
         static let brainBackend = "rocky.brain.backend"
         static let brainModel = "rocky.brain.model"
     }
