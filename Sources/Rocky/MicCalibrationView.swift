@@ -215,8 +215,9 @@ struct MicCalibrationView: View {
         case .voice:
             phaseRecording(
                 title: "Now speak normally",
-                subtitle: "Talk for about ten seconds. Try a few short sentences with natural pauses — the weather, what's on tomorrow, anything.",
-                duration: voiceSeconds
+                subtitle: "Talk for about ten seconds. Try a few short sentences with natural pauses — the weather, what's on tomorrow, anything. The white line on the bar marks the noise floor: aim for your voice to cross it on every word.",
+                duration: voiceSeconds,
+                showCutoff: true
             )
         case .computing:
             phaseInstruction(
@@ -250,7 +251,10 @@ struct MicCalibrationView: View {
         .padding(.vertical, 18)
     }
 
-    private func phaseRecording(title: String, subtitle: String, duration: Double) -> some View {
+    private func phaseRecording(
+        title: String, subtitle: String, duration: Double,
+        showCutoff: Bool = false
+    ) -> some View {
         VStack(spacing: 12) {
             Text(title)
                 .font(.headline)
@@ -262,8 +266,8 @@ struct MicCalibrationView: View {
             ProgressView(value: min(elapsed / duration, 1.0))
                 .progressViewStyle(.linear)
                 .frame(maxWidth: 320)
-            liveVUBar
-                .frame(maxWidth: 320)
+            vuBar(showCutoff: showCutoff)
+                .frame(maxWidth: 320, maxHeight: 14)
             Text(String(format: "Live RMS  %.4f", services.lastMicRMS))
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
@@ -272,12 +276,39 @@ struct MicCalibrationView: View {
         .padding(.vertical, 8)
     }
 
+    /// Full-scale of the VU bar in RMS. Normal indoor conversational
+    /// speech sits around 0.04–0.10 RMS at close range; loud speech
+    /// can reach 0.15+. The previous full-scale of 0.05 made the bar
+    /// peg red on *normal* voice, contradicting the calibration logic
+    /// (which compares RMS against a `noise_ceiling × 1.3` cutoff
+    /// that could itself land above 0.05). 0.20 reserves the red
+    /// zone for genuinely loud audio.
+    private static let vuFullScaleRMS: Double = 0.20
+
     private var liveVUBar: some View {
-        // Map [0, 0.05] → [0, 1] for display; calibration thresholds
-        // live in this range and a logarithmic axis would obscure the
-        // user's intuition that "louder = bigger bar".
+        return vuBar(showCutoff: false)
+            .frame(height: 14)
+    }
+
+    /// VU bar shared by both the live recording phases. When
+    /// `showCutoff` is true (voice phase), overlay a vertical marker
+    /// at `noiseCeiling × speechFloorMultiplier` so the user can see
+    /// the threshold their voice needs to cross — the previous UI
+    /// only complained "speak louder" after the fact with no live
+    /// indicator of what "louder" meant.
+    private func vuBar(showCutoff: Bool) -> some View {
         let live = Double(services.lastMicRMS)
-        let normalised = min(live / 0.05, 1.0)
+        let normalised = min(live / Self.vuFullScaleRMS, 1.0)
+
+        // Cutoff at noise_ceiling × multiplier (matches the cutoff
+        // used by `speechOnlyVoiceSamples` and `computeThreshold`).
+        let noiseCeiling = max(percentile(roomSamples, 0.99),
+                                percentile(robotSamples, 0.99))
+        let cutoff = Double(max(noiseCeiling * Float(Self.speechFloorMultiplier),
+                                 0.003))
+        let cutoffNorm = min(cutoff / Self.vuFullScaleRMS, 1.0)
+        let aboveCutoff = showCutoff && live >= cutoff
+
         return GeometryReader { geo in
             ZStack(alignment: .leading) {
                 RoundedRectangle(cornerRadius: 4)
@@ -289,10 +320,31 @@ struct MicCalibrationView: View {
                         endPoint: .trailing
                     ))
                     .frame(width: geo.size.width * normalised)
+
+                if showCutoff && cutoff > 0 {
+                    // Vertical line marking where the user's RMS
+                    // needs to land to count as "voice". The line
+                    // tints green once they cross it so they get
+                    // immediate confirmation each time a syllable
+                    // lands.
+                    Rectangle()
+                        .fill(aboveCutoff ? Color.green : Color.white.opacity(0.85))
+                        .frame(width: 2)
+                        .offset(x: geo.size.width * cutoffNorm - 1)
+                        .shadow(color: .black.opacity(0.4),
+                                radius: 1, x: 0, y: 0)
+                }
             }
         }
-        .frame(height: 14)
     }
+
+    /// Voice-frame detection multiplier applied to the measured
+    /// noise ceiling. 1.3 (was 1.5) — less aggressive, so normal-
+    /// volume speech in a moderately noisy room still counts as
+    /// voice. The room-noise capture's p99 already excludes the
+    /// loudest 1% of frames, so a 1.3× headroom on top of that is
+    /// enough margin to discriminate.
+    private static let speechFloorMultiplier: Double = 1.3
 
     // MARK: - Results
 
@@ -370,10 +422,12 @@ struct MicCalibrationView: View {
     }
 
     private var verifyVUBarWithLine: some View {
+        // Same full-scale as the live bar — voice "red" should mean
+        // the same thing on both screens.
         let live = Double(services.lastMicRMS)
-        let normalised = min(live / 0.05, 1.0)
+        let normalised = min(live / Self.vuFullScaleRMS, 1.0)
         let threshold = Double(recommendedThreshold ?? 0)
-        let thresholdNorm = min(threshold / 0.05, 1.0)
+        let thresholdNorm = min(threshold / Self.vuFullScaleRMS, 1.0)
         let above = live >= threshold
         return GeometryReader { geo in
             ZStack(alignment: .leading) {
@@ -692,15 +746,17 @@ struct MicCalibrationView: View {
     }
 
     /// Pull the speech-only RMS samples from `voiceSamples` by running
-    /// a coarse RMS-VAD: anything above `noise_ceiling × 1.5` counts
-    /// as a voice frame; the rest is the user pausing between words.
-    /// Without this, `speech_p25` is dominated by inter-word silence
-    /// and the threshold ends up too low.
+    /// a coarse RMS-VAD: anything above
+    /// `noise_ceiling × speechFloorMultiplier` counts as a voice
+    /// frame; the rest is the user pausing between words. Without
+    /// this, `speech_p25` is dominated by inter-word silence and the
+    /// threshold ends up too low.
     private func speechOnlyVoiceSamples() -> [Float] {
         guard !voiceSamples.isEmpty else { return [] }
         let noiseCeiling = max(percentile(roomSamples, 0.99),
                                percentile(robotSamples, 0.99))
-        let cutoff = max(noiseCeiling * 1.5, 0.001)
+        let cutoff = max(noiseCeiling * Float(Self.speechFloorMultiplier),
+                          0.003)
         return voiceSamples.filter { $0 >= cutoff }
     }
 
@@ -714,12 +770,26 @@ struct MicCalibrationView: View {
 
         let speechOnly = speechOnlyVoiceSamples()
         // Need a meaningful chunk of voice frames above noise. Less
-        // than 10% means the user mostly didn't speak (or was way
-        // too quiet for the mic).
+        // than 10% means the user's voice didn't stand out from the
+        // room noise floor — either they didn't speak, the mic gain
+        // is too low, or the room noise we measured was unusually
+        // high. Diagnose the most likely cause from the captured
+        // amplitudes so the failure message is actually actionable.
         let voiceFraction = Double(speechOnly.count)
             / Double(voiceSamples.count)
         if voiceFraction < 0.10 || speechOnly.count < 10 {
-            return .failure("We didn't pick up enough of your voice. Speak a little louder, hold the mic at a normal distance, and try again.")
+            let voiceP90 = percentile(voiceSamples, 0.90)
+            let cutoff = max(noiseCeiling * Float(Self.speechFloorMultiplier),
+                              0.003)
+            let reason: String
+            if voiceP90 < 0.003 {
+                reason = "We barely heard anything from your mic at all (loudest frames \(String(format: "%.4f", voiceP90))). Check that the right mic is selected in Settings → Voice, and that it isn't muted at the OS level."
+            } else if voiceP90 < cutoff {
+                reason = "Your voice came through (peak \(String(format: "%.4f", voiceP90))) but the room is noisy enough (ceiling \(String(format: "%.4f", noiseCeiling))) that the system couldn't separate speech from background. Move somewhere quieter, or speak closer to the mic, and try again."
+            } else {
+                reason = "We didn't pick up enough sustained voice — maybe long pauses between words. Speak in a few short sentences without big gaps, and try again."
+            }
+            return .failure(reason)
         }
 
         let speechP25 = percentile(speechOnly, 0.25)
@@ -728,12 +798,15 @@ struct MicCalibrationView: View {
         // the loudest noise we measured) and speech_p25 (well below
         // any normal word). Position 0.4 of the way up: closer to
         // noise so quiet / distant speech still triggers.
-        let lower = max(noiseCeiling * 1.3, 0.001)
+        let lower = max(noiseCeiling * Float(Self.speechFloorMultiplier),
+                         0.003)
         let upper = max(speechP25, lower * 1.001)
         let threshold = lower + (upper - lower) * 0.4
-        // Hard clamp: never below 0.001 (would catch quantisation
-        // noise) and never above 0.05 (would miss most speech).
-        let clamped = min(max(threshold, 0.001), 0.05)
+        // Hard clamp: never below 0.003 (catches quantisation noise
+        // + dead air) and never above 0.10 (would miss most quiet
+        // speech). Cap raised from 0.05 to match the wider voice-
+        // amplitude range we now expect from the VU.
+        let clamped = min(max(threshold, 0.003), 0.10)
         return .success(clamped)
     }
 

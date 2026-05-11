@@ -32,12 +32,10 @@ paths are exposed; the runner picks based on caller method.
 
 from __future__ import annotations
 
-import io
 import os
 import struct
 import sys
 from pathlib import Path
-from typing import Iterator
 
 from .backends import Backend, SynthesisResult
 
@@ -46,15 +44,11 @@ DEFAULT_QWEN3_MODEL = "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16"
 DEFAULT_REF_DIR = Path.home() / "Library" / "Application Support" / "Rocky" / "voice"
 DEFAULT_REF_NAME = "reference.wav"
 # Qwen3-TTS native output sample rate. Authoritative source: every
-# `GenerationResult.sample_rate` from the model returns this value
+# `GenerationResult.sample_rate` returns this value
 # (mlx_audio.tts.models.qwen3_tts.config.ModelConfig.sample_rate
-# defaults to 24000). Hard-code as the fallback so a misbehaving
-# stream never produces a WAV with a stale 16 kHz header.
+# defaults to 24000). Hard-code as the empty-output fallback so a
+# misbehaving model never produces a WAV with a stale 16 kHz header.
 DEFAULT_OUTPUT_SAMPLE_RATE = 24_000
-# `streaming_interval=0.32` ≈ 4 codec tokens at 12.5 Hz — the
-# canonical low-latency setting from mlx-audio's Qwen3-TTS README.
-# The library default is 2.0 s, too coarse for live response.
-STREAMING_INTERVAL_S = 0.32
 
 
 def _stderr(msg: str) -> None:
@@ -63,14 +57,27 @@ def _stderr(msg: str) -> None:
 
 
 class Qwen3TTSBackend(Backend):
-    """Qwen3-TTS-12Hz Base with ICL voice cloning + streaming PCM.
+    """Qwen3-TTS-12Hz Base with ICL voice cloning.
 
-    Chunks flow up to Swift's `StreamingTTS`, which routes them to
-    the robot speaker via chunked upload + queued `play_sound` calls.
+    Returns the full WAV in one shot (non-streaming). We used to
+    stream chunk-by-chunk via `model.generate(stream=True)`, but the
+    streaming decoder in mlx-audio 0.4.3 produces audibly lower-
+    quality output than the non-streaming `decode` path for the same
+    generated codes — verified by a deterministic A/B (greedy
+    sampling, identical inputs): both paths produce identical-length
+    audio but the streaming version has only 0.78 normalised
+    cross-correlation with non-streaming, audible as "the cloned
+    voice doesn't sound like the reference".
+    And we were paying that quality cost for nothing —
+    `StreamingTTS.playToRobot` accumulates every chunk before
+    uploading the WAV to the daemon and calling `play_sound`, so
+    end-to-end time-to-audio is identical either way. The only thing
+    streaming bought us was the `isSpeaking` UI flicker firing ~3 s
+    earlier. Not worth it.
     """
 
     name = "qwen3-tts"
-    supports_streaming = True
+    supports_streaming = False
 
     def __init__(
         self,
@@ -268,7 +275,7 @@ class Qwen3TTSBackend(Backend):
             _stderr(f"warm-up deferred — model not yet ready: {exc}")
 
     # ------------------------------------------------------------------
-    # Full-WAV synthesis (compat with the original Backend interface)
+    # Full-WAV synthesis
     # ------------------------------------------------------------------
 
     def synthesize(
@@ -276,32 +283,6 @@ class Qwen3TTSBackend(Backend):
         text: str,
         voice_ref_id: str | None,
     ) -> SynthesisResult:
-        chunks: list[bytes] = []
-        sample_rate = DEFAULT_OUTPUT_SAMPLE_RATE
-        for pcm, sr in self.synthesize_stream(text, voice_ref_id):
-            chunks.append(pcm)
-            sample_rate = sr
-        if not chunks:
-            _stderr(f"synthesize: no audio chunks for text {text!r}")
-        pcm_concat = b"".join(chunks)
-        wav_bytes = _wrap_pcm_in_wav(pcm_concat, sample_rate=sample_rate)
-        duration_s = len(pcm_concat) / (sample_rate * 2)  # int16 mono
-        return SynthesisResult(
-            wav_bytes=wav_bytes,
-            sample_rate=sample_rate,
-            channels=1,
-            duration_s=duration_s,
-        )
-
-    # ------------------------------------------------------------------
-    # Streaming synthesis — yields (pcm_bytes_int16, sample_rate)
-    # ------------------------------------------------------------------
-
-    def synthesize_stream(
-        self,
-        text: str,
-        voice_ref_id: str | None,
-    ) -> Iterator[tuple[bytes, int]]:
         self._ensure_loaded()
 
         # Prefer the pre-loaded mx.array. Fall back to the path so a
@@ -321,23 +302,50 @@ class Qwen3TTSBackend(Backend):
             )
             ref_audio = None
 
-        # `Model.generate(...)` from qwen3_tts is the canonical
-        # streaming generator — yields `GenerationResult` objects
-        # with `.audio` (mx.array) and `.sample_rate`. The library's
-        # default streaming_interval is 2.0 s (too coarse); we use
-        # the README's documented low-latency setting of 0.32 s
-        # (~4 codec tokens at 12.5 Hz).
-        for result in self._model.generate(  # type: ignore[union-attr]
+        # `stream=False` routes to `_generate_icl` (or the default
+        # base-model path) and yields a single `GenerationResult`
+        # carrying the full audio. Per the deterministic A/B above
+        # — the non-streaming decode produces audibly higher-quality
+        # speech than streaming for the same codes, and we don't
+        # benefit from streaming downstream anyway because
+        # StreamingTTS.playToRobot already accumulates every chunk
+        # before uploading.
+        results = list(self._model.generate(  # type: ignore[union-attr]
             text=text,
             ref_audio=ref_audio,
             ref_text=self.ref_text,
-            stream=True,
-            streaming_interval=STREAMING_INTERVAL_S,
+            stream=False,
             verbose=False,
-        ):
-            audio = result.audio
-            sr = int(result.sample_rate)
-            yield _to_int16_bytes(audio), sr
+        ))
+        if not results:
+            _stderr(f"synthesize: model.generate yielded no results for {text!r}")
+            return SynthesisResult(
+                wav_bytes=_wrap_pcm_in_wav(b"",
+                                            sample_rate=DEFAULT_OUTPUT_SAMPLE_RATE),
+                sample_rate=DEFAULT_OUTPUT_SAMPLE_RATE,
+                channels=1,
+                duration_s=0.0,
+            )
+
+        # Concatenate any multi-segment output (the base-model path
+        # may split on \n; ICL always returns a single segment).
+        if len(results) == 1:
+            audio = results[0].audio
+            sample_rate = int(results[0].sample_rate)
+        else:
+            import mlx.core as mx  # local import; module already loaded
+            audio = mx.concatenate([r.audio for r in results], axis=0)
+            sample_rate = int(results[0].sample_rate)
+
+        pcm = _to_int16_bytes(audio)
+        wav_bytes = _wrap_pcm_in_wav(pcm, sample_rate=sample_rate)
+        duration_s = len(pcm) / (sample_rate * 2)  # int16 mono
+        return SynthesisResult(
+            wav_bytes=wav_bytes,
+            sample_rate=sample_rate,
+            channels=1,
+            duration_s=duration_s,
+        )
 
 
 # ---------------------------------------------------------------------------

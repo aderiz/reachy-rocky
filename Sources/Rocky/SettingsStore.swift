@@ -261,21 +261,17 @@ final class SettingsStore {
             ? "robot" : "mac"
     }
 
-    /// v0.2 default: Qwen3-TTS-12Hz (streaming, 97 ms first packet)
-    /// when the mlx-audio venv exists. Falls back to chatterbox
-    /// when the user has explicitly opted in to the legacy voice
-    /// character. The `say` backend was dropped in M1 — there's
-    /// no default-eligible non-MLX option.
-    private static func detectDefaultTTSBackend() -> String {
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let venvPython = support
-            .appendingPathComponent("Rocky")
-            .appendingPathComponent("sidecars")
-            .appendingPathComponent("mlx-tts")
-            .appendingPathComponent(".venv/bin/python")
-        return FileManager.default.fileExists(atPath: venvPython.path)
-            ? "qwen3-tts" : "qwen3-tts"
-    }
+    /// First-run default TTS engine. Benchmarked against the active
+    /// cloning models on Apple Silicon (mlx-audio 0.4.3, M-series):
+    ///   - chatterbox (8-bit):  0.15× RTF, fastest
+    ///   - chatterbox-turbo:    0.25× RTF
+    ///   - qwen3-tts (1.7B 8b): 0.36× RTF
+    ///   - higgs-audio v2 q8:   0.66× RTF
+    ///   - fish-audio s2 pro:   1.08–1.59× RTF, near real-time
+    /// Chatterbox 8-bit wins on speed AND ships a clean cloning
+    /// path that just works. Picked as the default; the picker
+    /// still lets the user opt into the others.
+    private static func detectDefaultTTSBackend() -> String { "chatterbox" }
 
     private func save() {
         let d = UserDefaults.standard

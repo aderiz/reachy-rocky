@@ -1006,6 +1006,15 @@ final class AppServices {
         if !micEnabled { await toggleMic() }
         fputs("[mic] auto-toggle complete (micEnabled=\(micEnabled), source=\(settings.micSource), err=\(voiceErrorMessage ?? "none"))\n", stderr)
 
+        // On-bot relay auto-start. The Reachy Mini daemon doesn't
+        // remember "the last running app" across reboots — after a
+        // power-cycle, `current-app-status` is null and our mic /
+        // camera sidecars will spin in their reconnect loops
+        // forever. Wait for the daemon to come online, then ensure
+        // `rocky_media_relay` is the active app. Fire-and-forget so
+        // it doesn't gate the rest of startup.
+        Task { [weak self] in await self?.ensureRelayAppRunning() }
+
         // Tool registry + LM Studio probe. Auto-retries every 8 s while
         // status is offline so users don't have to click "Probe" after
         // launching LM Studio.
@@ -1871,6 +1880,124 @@ final class AppServices {
         }
     }
 
+    /// Ensure the on-bot `rocky_media_relay` Reachy Mini App is the
+    /// currently-running app on the bot. The daemon doesn't restore
+    /// the last running app across reboots, so after every
+    /// power-cycle the bot comes up with `current-app-status: null`
+    /// and our WebSocket subscribers have nothing to talk to. This
+    /// task closes that gap from the Mac side without needing a
+    /// systemd unit on the bot.
+    ///
+    /// Behaviour:
+    ///   1. Wait (with backoff) until the daemon's HTTP endpoint
+    ///      responds.
+    ///   2. Probe `/api/apps/current-app-status`.
+    ///   3. If the relay is already running → done.
+    ///   4. If a *different* app is running → leave it alone (the
+    ///      user picked it). Log a hint so the user knows Rocky
+    ///      won't have audio/video until the relay is the active
+    ///      app.
+    ///   5. If nothing is running → POST
+    ///      `/api/apps/start-app/rocky_media_relay`.
+    ///
+    /// Fire-and-forget from `start()`. Runs once per app launch.
+    private func ensureRelayAppRunning() async {
+        let host = settings.robotHost
+        let daemonPort = settings.robotPort
+        let base = "http://\(host):\(daemonPort)"
+        let relayName = "rocky_media_relay"
+
+        struct StatusInfo: Decodable {
+            let name: String?
+        }
+        struct StatusResponse: Decodable {
+            let info: StatusInfo?
+            let state: String?
+        }
+
+        // 1. Wait for daemon to be reachable. Probe at ~3s intervals
+        // for up to ~3 minutes; that covers a bot mid-boot. If it's
+        // genuinely offline beyond that, leave it — the user will
+        // notice and the WS subscriber's reconnect loop will pick
+        // it up when the bot eventually appears.
+        let session = URLSession.shared
+        let statusURL = URL(string: "\(base)/api/apps/current-app-status")!
+        let startURL = URL(string: "\(base)/api/apps/start-app/\(relayName)")!
+        let probeBudget: Int = 60   // 60 × ~3s = 3 min
+        var reachable = false
+        for _ in 0..<probeBudget {
+            do {
+                let (_, resp) = try await session.data(for: URLRequest(url: statusURL))
+                if let http = resp as? HTTPURLResponse, http.statusCode == 200 {
+                    reachable = true
+                    break
+                }
+            } catch {
+                // not reachable yet; keep waiting
+            }
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+        }
+        guard reachable else {
+            fputs("[relay] daemon never came online; skipping auto-start\n", stderr)
+            return
+        }
+
+        // 2. Probe current app status.
+        let currentName: String?
+        do {
+            let (data, _) = try await session.data(for: URLRequest(url: statusURL))
+            if data.isEmpty || data == Data("null".utf8) {
+                currentName = nil
+            } else if let decoded = try? JSONDecoder().decode(StatusResponse.self, from: data) {
+                currentName = decoded.info?.name
+            } else {
+                currentName = nil
+            }
+        } catch {
+            fputs("[relay] status probe failed: \(error)\n", stderr)
+            return
+        }
+
+        // 3 / 4. Decide what to do.
+        if currentName == relayName {
+            fputs("[relay] \(relayName) already running on bot\n", stderr)
+            return
+        }
+        if let other = currentName, !other.isEmpty {
+            fputs(
+                "[relay] another app is running on the bot (\(other)). "
+                + "Rocky's audio/video won't flow until that app is "
+                + "stopped and \(relayName) is started.\n", stderr)
+            await logBus.publish(.error(
+                scope: "relay",
+                message: "bot running '\(other)' — Rocky needs '\(relayName)' for audio + video",
+                recoverable: true
+            ))
+            return
+        }
+
+        // 5. Nothing running — start the relay.
+        var req = URLRequest(url: startURL)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 15
+        do {
+            let (_, resp) = try await session.data(for: req)
+            if let http = resp as? HTTPURLResponse, http.statusCode == 200 {
+                fputs("[relay] started \(relayName) on bot\n", stderr)
+                await logBus.publish(.sidecarLog(
+                    sidecar: "relay", level: .info,
+                    message: "auto-started \(relayName) on bot after reboot",
+                    fields: [:]
+                ))
+            } else {
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+                fputs("[relay] start-app returned HTTP \(code)\n", stderr)
+            }
+        } catch {
+            fputs("[relay] start-app request failed: \(error)\n", stderr)
+        }
+    }
+
     /// Auto-wake Rocky if (a) the daemon is online and (b) Rocky is reported
     /// asleep. Rate-limited to once every 30 s so we don't spam if a wake
     /// fails or the user explicitly puts him back to sleep. Called from
@@ -2696,15 +2823,17 @@ final class AppServices {
     }
 
     private nonisolated static func devTTSManifest(backend: String) -> SidecarManifest {
-        // M6: Qwen3-TTS-12Hz is the default; chatterbox stays as the
-        // fallback for users who prefer the existing voice character.
-        // Both load via mlx-audio in the same venv.
+        // v0.4+: Chatterbox 8-bit is the default. Outperforms every
+        // other cloning model on mlx-audio 0.4.3 by a wide margin
+        // (0.15× RTF on Apple Silicon vs ~1.4× for Qwen3-TTS 1.7B).
+        // Qwen3-TTS, Fish, and the others stay available as picker
+        // options; all load via mlx-audio in the same venv.
         let resolved: String
         switch backend.lowercased() {
         case "chatterbox", "chatterbox-turbo", "chatterbox-fp16",
-             "chatterbox-turbo-fp16", "mlx":
+             "chatterbox-turbo-fp16", "chatterbox-8bit", "mlx", "auto", "":
             resolved = "chatterbox"
-        case "qwen3-tts", "qwen3", "qwen", "auto", "":
+        case "qwen3-tts", "qwen3", "qwen":
             resolved = "qwen3-tts"
         default:
             resolved = backend

@@ -56,6 +56,17 @@ public actor StreamingTTS {
         self.sttPostRollS = max(0, seconds)
     }
 
+    /// Output volume scaler applied to the accumulated PCM before
+    /// the WAV is uploaded to the robot. 1.0 = no scaling. Values >
+    /// 1.0 boost; samples above int16 range hard-clip. RobotTTS
+    /// mirrors its own `volume` here so the settings slider drives
+    /// both the streaming and non-streaming TTS paths uniformly.
+    public private(set) var volume: Double = 1.0
+
+    public func setVolume(_ v: Double) {
+        self.volume = max(0.0, min(3.0, v))
+    }
+
     /// Play a stream of (pcm, sampleRate) chunks via `AVAudioEngine`.
     /// `chunks` is the AsyncThrowingStream that the caller built
     /// from `mlx-tts`'s `synthesize_stream` envelopes — each item
@@ -148,10 +159,17 @@ public actor StreamingTTS {
         let totalSamples = pcmAccumulator.count / bytesPerFrame
         let durationS = Double(totalSamples) / Double(sampleRate)
 
+        // Apply the volume scaler to the accumulated int16 PCM.
+        // Anything other than exactly 1.0 needs a full pass. Boosts
+        // hard-clip via Int16(clamping:); the user trades clipping
+        // distortion for actual audibility when the reference clip
+        // was recorded quietly.
+        let scaledPCM = Self.scalePCM16(pcmAccumulator, factor: volume)
+
         // Wrap raw PCM in a minimal WAV header so the daemon's
         // `play_sound` accepts it.
         let wav = Self.wrapPCMInWAV(
-            pcm: pcmAccumulator, sampleRate: sampleRate
+            pcm: scaledPCM, sampleRate: sampleRate
         )
         let uploadStart = Date()
         _ = try await media.uploadSound(filename: filename, data: wav)
@@ -200,6 +218,27 @@ public actor StreamingTTS {
         if value == isSpeaking { return }
         isSpeaking = value
         isSpeakingContinuation.yield(value)
+    }
+
+    /// Scale every int16-LE sample by `factor`. Identity at 1.0;
+    /// boosts hard-clip via `Int16(clamping:)` so >1.0 produces
+    /// audible distortion rather than wrap-around. Returns the
+    /// input unchanged at exactly 1.0 to skip a 24 kHz × Nseconds
+    /// memcopy in the common case.
+    static func scalePCM16(_ pcm: Data, factor: Double) -> Data {
+        if abs(factor - 1.0) < 1e-9 { return pcm }
+        let f = max(0.0, min(3.0, factor))
+        var scaled = pcm
+        scaled.withUnsafeMutableBytes { rawPtr in
+            guard let base = rawPtr.baseAddress else { return }
+            let samples = base.assumingMemoryBound(to: Int16.self)
+            let count = pcm.count / 2
+            for i in 0..<count {
+                let v = Double(samples[i]) * f
+                samples[i] = Int16(clamping: Int(v.rounded()))
+            }
+        }
+        return scaled
     }
 
     /// Wrap raw int16-LE mono PCM in a minimal WAV (RIFF) header so

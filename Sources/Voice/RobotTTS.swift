@@ -25,10 +25,21 @@ public actor RobotTTS {
     public private(set) var lastStats: SpeakStats?
     private var seq: UInt64 = 0
 
-    /// 0.0 (silent) ... 1.0 (no scaling). Applied to the synthesized WAV
-    /// in-memory just before upload by scaling each PCM sample. See
-    /// `scaleWavVolume(_:factor:)`.
+    /// 0.0 (silent) ... 3.0 (3× boost, hard-clipped at int16 max).
+    /// 1.0 is "no scaling". Applied to the synthesised PCM (streaming
+    /// path) or to the WAV (non-streaming path) just before upload by
+    /// scaling each int16 sample. Boosting above 1.0 produces
+    /// distortion when the synth already peaks near full-scale, but
+    /// is the only practical lever when the reference voice clip was
+    /// recorded quietly and the bot speaker is set fully open.
     public private(set) var volume: Double = 0.85
+
+    /// Volume ceiling. 3× corresponds to ~+9.5 dB and is enough
+    /// headroom to make a quietly-recorded reference clone audible
+    /// without descending into pure clipping. Above this the signal
+    /// is dominated by hard-clip artefacts and the user should
+    /// re-record their reference instead.
+    public static let maxVolume: Double = 3.0
 
     public init(sidecar: any Sidecar, media: MediaClient, logBus: LogBus) {
         self.sidecar = sidecar
@@ -36,8 +47,13 @@ public actor RobotTTS {
         self.logBus = logBus
     }
 
-    public func setVolume(_ v: Double) {
-        self.volume = max(0.0, min(1.0, v))
+    public func setVolume(_ v: Double) async {
+        let clamped = max(0.0, min(Self.maxVolume, v))
+        self.volume = clamped
+        // Mirror into the streaming player — the Qwen3 path goes
+        // through there, and without this the slider only affected
+        // the non-streaming Chatterbox/Fish path.
+        await streamingPlayer?.setVolume(clamped)
     }
 
     /// Launch the underlying TTS sidecar process. Idempotent.
@@ -125,12 +141,22 @@ public actor RobotTTS {
     /// uses the streaming path instead of the full-WAV round-trip.
     private var streamingPlayer: StreamingTTS?
 
-    public func setStreamingPlayer(_ player: StreamingTTS?) {
+    public func setStreamingPlayer(_ player: StreamingTTS?) async {
         self.streamingPlayer = player
+        // Push the current volume so the streaming player inherits
+        // whatever the user last set, even if the slider hasn't
+        // moved since the player was wired.
+        await player?.setVolume(self.volume)
     }
 
-    /// Whether the sidecar reports streaming support (Qwen3-TTS-12Hz
-    /// = yes; Chatterbox = no). Cached after the first health probe.
+    /// Whether the sidecar reports streaming support. All shipped
+    /// backends currently report `false` — Qwen3-TTS used to stream
+    /// but produced lower-quality audio than its own non-streaming
+    /// decode (the streaming `streaming_step` decoder has different
+    /// state than the non-streaming `decode` and only achieves ~0.78
+    /// cross-correlation with it). The streaming-vs-not flag is kept
+    /// for future backends that genuinely benefit. Cached after the
+    /// first health probe.
     private var sidecarStreamsKnown: Bool? = nil
 
     public func sidecarSupportsStreaming() async -> Bool {
@@ -242,14 +268,18 @@ public actor RobotTTS {
         return stats
     }
 
-    /// Scale a 16-bit PCM WAV's samples by `factor` (clamped 0...1).
-    /// Walks the RIFF chunk list to locate `data` rather than assuming
-    /// a fixed header offset, so it tolerates extra `LIST`/`INFO`
-    /// chunks that some encoders produce. Bit depths other than 16 are
-    /// passed through unmodified.
+    /// Scale a 16-bit PCM WAV's samples by `factor` (clamped
+    /// 0 ... `maxVolume`). Walks the RIFF chunk list to locate
+    /// `data` rather than assuming a fixed header offset, so it
+    /// tolerates extra `LIST` / `INFO` chunks that some encoders
+    /// produce. Bit depths other than 16 are passed through
+    /// unmodified. Values > 1.0 hard-clip via `Int16(clamping:)`.
     private static func scaleWavVolume(_ wav: Data, factor: Double) -> Data {
-        let f = max(0.0, min(1.0, factor))
-        if f >= 0.999 { return wav }
+        let f = max(0.0, min(maxVolume, factor))
+        // Skip the rewrite entirely only at exactly 1.0 (no-op);
+        // everything else needs an actual sample-scaling pass,
+        // including the gain > 1.0 boost case.
+        if abs(f - 1.0) < 1e-9 { return wav }
         guard wav.count >= 44 else { return wav }
         // RIFF/WAVE sanity.
         guard wav.subdata(in: 0..<4) == Data("RIFF".utf8),

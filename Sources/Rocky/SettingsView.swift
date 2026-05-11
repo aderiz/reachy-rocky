@@ -535,18 +535,18 @@ private struct VoiceSettingsTab: View {
 
             Section {
                 Picker("TTS engine", selection: ttsBackendBinding) {
-                    Text("Qwen3-TTS-12Hz (streaming, ~3 s first packet with ICL)")
-                        .tag("qwen3-tts")
-                    Text("Fish Audio S2 Pro (full-WAV, voice cloning)")
-                        .tag("fish-audio")
-                    Text("Chatterbox FP16 (full-WAV, legacy)")
+                    Text("Chatterbox 8-bit (fastest, 0.15× RTF) — recommended")
                         .tag("chatterbox")
+                    Text("Qwen3-TTS-12Hz 1.7B (multilingual, 0.36× RTF in 8-bit)")
+                        .tag("qwen3-tts")
+                    Text("Fish Audio S2 Pro (high-quality clone, ~1× RTF)")
+                        .tag("fish-audio")
                 }
                 BotVolumeSlider()
             } header: {
                 Text("Voice (TTS)")
             } footer: {
-                Text("Qwen3-TTS streams PCM chunks as it synthesises. Fish Audio S2 Pro is a non-streaming alternative with strong voice cloning. Chatterbox keeps the v0.1 voice character. All three clone from `~/Library/Application Support/Rocky/voice/sample.wav` + `sample.txt`. Engine change applies on next launch.")
+                Text("RTF = wall-time-to-synth ÷ audio-duration (lower = faster, < 1.0× is faster than real-time). Chatterbox 8-bit is the fastest cloning model in the venv and what Rocky uses by default. Switch to Qwen3-TTS for multilingual / different timbre, or Fish for the strongest clone fidelity. All three pick up the reference from `~/Library/Application Support/Rocky/voice/sample.wav` + `sample.txt`. Engine change applies on next launch.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -1029,7 +1029,7 @@ private struct BotVolumeSlider: View {
                 Spacer()
                 Text("\(Int(value * 100))%")
                     .font(.caption.monospacedDigit().weight(.medium))
-                    .foregroundStyle(.primary)
+                    .foregroundStyle(value > 1.0 ? .orange : .primary)
             }
             Slider(
                 value: Binding(
@@ -1039,7 +1039,12 @@ private struct BotVolumeSlider: View {
                         Task { await services.robotTTS.setVolume(newValue) }
                     }
                 ),
-                in: 0.0...1.0,
+                // 0–300% — anything above 100% applies a software
+                // gain boost (hard-clipped at int16 max) for the
+                // case where the reference clip was recorded
+                // quietly and the bot speaker is already fully open
+                // on its own alsamixer.
+                in: 0.0...3.0,
                 step: 0.05
             ) {
                 Text("Volume")
@@ -1052,7 +1057,7 @@ private struct BotVolumeSlider: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
-            Text("Applied to every TTS clip before it's uploaded to the robot — works for both Chatterbox cloned voice and the system fallback.")
+            Text("Applied to every TTS clip before it's uploaded to the robot. 100% = no scaling. Values above 100% hard-clip — useful when a quiet reference clip leaves the cloned voice too soft, but they introduce clipping distortion. If you need more, re-record the reference louder or raise the bot's on-device alsamixer PCM gain.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }

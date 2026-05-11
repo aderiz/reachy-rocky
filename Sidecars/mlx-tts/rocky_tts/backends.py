@@ -55,7 +55,7 @@ def make_backend() -> Backend:
     a robotic monotone. Run `./Sidecars/mlx-tts/setup.sh` (with the
     `[mlx]` extras) before launching Rocky.
     """
-    name = os.environ.get("ROCKY_TTS_BACKEND", "qwen3-tts").lower()
+    name = os.environ.get("ROCKY_TTS_BACKEND", "chatterbox").lower()
     if name in {"qwen3-tts", "qwen3", "qwen", "auto"}:
         try:
             from .qwen3_tts_backend import Qwen3TTSBackend
