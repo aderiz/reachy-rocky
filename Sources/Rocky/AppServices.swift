@@ -1852,7 +1852,16 @@ final class AppServices {
         // transition flag a bit longer so the slump animation is visible.
         await MainActor.run {
             self.transitioningUntil = Date().addingTimeInterval(4.0)
+            // Conversation window stays open across normal idle gaps,
+            // but when the user explicitly sleeps Rocky we close it so
+            // that subsequent audio is gated by the wake filter again.
+            // Without this, any sound (or the bot's own goodbye TTS
+            // bleed) is auto-dispatched to the brain — which can
+            // tool-call `wake_up` and re-wake the bot the user just
+            // put to sleep.
+            self.conversationOpenUntil = nil
         }
+        await voice.closeConversationWindow()
         do { try await robotLink.goToSleep() }
         catch {
             await MainActor.run { self.transitioningUntil = nil }
@@ -2208,14 +2217,13 @@ final class AppServices {
             }
         )
 
-        await toolRegistry.register(
-            name: "wake_up",
-            description: "Wake Rocky up (enable motors and play the wake-up move).",
-            handler: { _ in
-                try await robot.wakeUp()
-                return .object(["ok": .bool(true)])
-            }
-        )
+        // `wake_up` tool intentionally NOT registered. Waking is a
+        // user-only action — either pressing the wake button or
+        // saying the wake word ("Rocky") via the wake-on-name path
+        // in handleVoice. The brain has no use case for waking the
+        // robot itself, and exposing the tool created an auto-wake
+        // path where any in-flight brain turn could re-wake the bot
+        // moments after the user explicitly put it to sleep.
 
         await toolRegistry.register(
             name: "go_to_sleep",

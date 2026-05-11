@@ -41,6 +41,33 @@ rm -rf "$APP"
 mkdir -p "$MACOS" "$RES"
 cp "$BIN_PATH" "$MACOS/$EXEC_NAME"
 
+# App icon — generate AppIcon.icns from Resources/AppIcon.source.png
+# on every build. Source of truth is the PNG; the .icns is a build
+# artifact so we don't have to keep a binary in version control.
+# Each entry in the .iconset directory follows Apple's naming
+# convention (icon_<size>.png + icon_<size>@2x.png); `iconutil`
+# pacakages them into the final .icns.
+ICON_SRC="$REPO/Resources/AppIcon.source.png"
+if [[ -f "$ICON_SRC" ]]; then
+    echo "==> Generating AppIcon.icns from $ICON_SRC"
+    ICONSET="$(mktemp -d)/AppIcon.iconset"
+    mkdir -p "$ICONSET"
+    sips -z 16   16   "$ICON_SRC" --out "$ICONSET/icon_16x16.png"     >/dev/null
+    sips -z 32   32   "$ICON_SRC" --out "$ICONSET/icon_16x16@2x.png"  >/dev/null
+    sips -z 32   32   "$ICON_SRC" --out "$ICONSET/icon_32x32.png"     >/dev/null
+    sips -z 64   64   "$ICON_SRC" --out "$ICONSET/icon_32x32@2x.png"  >/dev/null
+    sips -z 128  128  "$ICON_SRC" --out "$ICONSET/icon_128x128.png"   >/dev/null
+    sips -z 256  256  "$ICON_SRC" --out "$ICONSET/icon_128x128@2x.png">/dev/null
+    sips -z 256  256  "$ICON_SRC" --out "$ICONSET/icon_256x256.png"   >/dev/null
+    sips -z 512  512  "$ICON_SRC" --out "$ICONSET/icon_256x256@2x.png">/dev/null
+    sips -z 512  512  "$ICON_SRC" --out "$ICONSET/icon_512x512.png"   >/dev/null
+    sips -z 1024 1024 "$ICON_SRC" --out "$ICONSET/icon_512x512@2x.png">/dev/null
+    iconutil -c icns "$ICONSET" -o "$RES/AppIcon.icns"
+    rm -rf "$(dirname "$ICONSET")"
+else
+    echo "==> WARN: $ICON_SRC missing — building without an app icon"
+fi
+
 cat > "$CONTENTS/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -52,6 +79,7 @@ cat > "$CONTENTS/Info.plist" <<'PLIST'
     <key>CFBundleVersion</key>              <string>0.1.0</string>
     <key>CFBundleShortVersionString</key>   <string>0.1.0</string>
     <key>CFBundleExecutable</key>           <string>Rocky</string>
+    <key>CFBundleIconFile</key>             <string>AppIcon</string>
     <key>CFBundlePackageType</key>          <string>APPL</string>
     <key>LSMinimumSystemVersion</key>       <string>15.0</string>
     <key>LSUIElement</key>                  <false/>

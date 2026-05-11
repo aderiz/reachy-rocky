@@ -22,6 +22,17 @@ struct ConversationView: View {
     @State private var draft: String = ""
     @FocusState private var inputFocused: Bool
 
+    // Footer state lives here (not on CockpitView) because the
+    // footer is part of the conversation column per design §3.2 — it
+    // tracks the splitter when the user resizes columns. Keeping
+    // state with the view that owns it also avoids the long-window
+    // rendering bug where the Remember field stretched across the
+    // entire window.
+    @State private var rememberDraft: String = ""
+    @State private var rememberConfirmation: String?
+    @State private var pinNext: Bool = false
+    @State private var diagnoseShown: Bool = false
+
     var body: some View {
         VStack(spacing: 0) {
             HearingStrip()
@@ -34,9 +45,92 @@ struct ConversationView: View {
             inputRow
                 .padding(.horizontal, 24)
                 .padding(.vertical, 12)
+            Divider().opacity(0.10)
+            MomentStrip()
+            Divider().opacity(0.10)
+            footer
+                .padding(.horizontal, 24)
+                .padding(.vertical, 10)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.regularMaterial)
+    }
+
+    // MARK: - Footer (remember + diagnose)
+
+    private var footer: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            footerRow
+            if diagnoseShown {
+                DiagnoseStrip()
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .animation(.easeInOut(duration: 0.18), value: diagnoseShown)
+    }
+
+    private var footerRow: some View {
+        HStack(spacing: 10) {
+            Image(systemName: pinNext ? "pin.fill" : "pin")
+                .foregroundStyle(pinNext ? .yellow : .secondary)
+                .onTapGesture { pinNext.toggle() }
+                .help(pinNext
+                      ? "Pinned: this memory will always be recalled."
+                      : "Click to pin: always recall this memory.")
+
+            TextField("Remember: a fact, preference, or note Rocky should keep…",
+                      text: $rememberDraft)
+                .textFieldStyle(.roundedBorder)
+                // Cap so the field stays a compact input even when
+                // the conversation column is wide; the confirmation
+                // chip + Why-no-reply button sit beside it and we
+                // want them visible together.
+                .frame(maxWidth: 360)
+                .onSubmit { submitRemember() }
+
+            if let confirmation = rememberConfirmation {
+                Label(confirmation, systemImage: "checkmark.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+                    .transition(.opacity)
+            }
+
+            Spacer(minLength: 0)
+
+            Button {
+                diagnoseShown.toggle()
+            } label: {
+                Label(diagnoseShown ? "Hide diagnose" : "Why no reply?",
+                      systemImage: "stethoscope")
+            }
+            .buttonStyle(.borderless)
+            .controlSize(.small)
+            .help("Walk the mic / STT / wake / brain / TTS chain for the most recent utterance.")
+        }
+        .animation(.easeInOut(duration: 0.2), value: rememberConfirmation)
+    }
+
+    private func submitRemember() {
+        let text = rememberDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        let body = pinNext ? "[pinned] " + text : text
+        rememberDraft = ""
+        Task {
+            do {
+                _ = try await services.memory.record(role: .system, text: body)
+                await MainActor.run {
+                    rememberConfirmation = "Filed"
+                    pinNext = false
+                }
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                await MainActor.run { rememberConfirmation = nil }
+                await services.refreshMemoryCount()
+            } catch {
+                await MainActor.run {
+                    rememberConfirmation = "failed: \(error)"
+                }
+            }
+        }
     }
 
     // MARK: - Transcript
@@ -49,8 +143,13 @@ struct ConversationView: View {
                         emptyState.padding(.vertical, 80)
                     } else {
                         ForEach(services.brainTurns) { turn in
-                            ConversationBubble(turn: turn)
-                                .id(turn.id)
+                            if turn.role == "tool",
+                               !services.settings.showToolCalls {
+                                EmptyView()
+                            } else {
+                                ConversationBubble(turn: turn)
+                                    .id(turn.id)
+                            }
                         }
                     }
                 }
@@ -223,21 +322,31 @@ private struct VUMeter: View {
 private struct ConversationBubble: View {
     let turn: AppServices.BrainTurn
 
+    /// Hard cap on bubble width. Messages.app and Slack settle around
+    /// 60–70% of the column; we use an absolute upper bound so
+    /// bubbles stay readable even when the conversation column is
+    /// wide. Below this they'll shrink to the content's natural
+    /// width — short replies sit as compact pills, long replies wrap
+    /// at the cap.
+    private static let bubbleMaxWidth: CGFloat = 520
+
     var body: some View {
         switch turn.role {
         case "user":
-            HStack {
-                Spacer(minLength: 40)
+            HStack(alignment: .top, spacing: 0) {
+                Spacer(minLength: 0)
                 bubble(alignment: .trailing,
                        tint: .accentColor,
                        roleLabel: "You")
+                    .frame(maxWidth: Self.bubbleMaxWidth, alignment: .trailing)
             }
         case "assistant":
-            HStack {
+            HStack(alignment: .top, spacing: 0) {
                 bubble(alignment: .leading,
                        tint: .primary,
                        roleLabel: "Rocky")
-                Spacer(minLength: 40)
+                    .frame(maxWidth: Self.bubbleMaxWidth, alignment: .leading)
+                Spacer(minLength: 0)
             }
         case "tool":
             HStack {
@@ -265,23 +374,24 @@ private struct ConversationBubble: View {
     private func bubble(alignment: HorizontalAlignment,
                          tint: Color,
                          roleLabel: String) -> some View {
+        // The outer caller (`var body`) applies the absolute
+        // `bubbleMaxWidth` cap and trailing/leading alignment via the
+        // parent HStack. Inside the bubble we just let the Text size
+        // naturally — short content stays compact, long content
+        // wraps inside the cap.
         VStack(alignment: alignment, spacing: 2) {
             Text(turn.content.isEmpty ? "…" : turn.content)
                 .font(.callout)
                 .foregroundStyle(.primary)
                 .multilineTextAlignment(alignment == .trailing ? .trailing : .leading)
                 .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
                 .background(
                     RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .fill(tint.opacity(0.12))
                 )
-            // Latency caption only on Rocky's bubbles, only on hover —
-            // for now we emit it as a quiet always-on caption since
-            // SwiftUI doesn't have a great hover-only on macOS without
-            // adding state. Keep it small + tertiary so it doesn't
-            // demand attention.
             if let total = turn.totalMs, alignment == .leading {
                 Text(String(format: "%.0f ms", total))
                     .font(.caption2.monospacedDigit())
@@ -289,8 +399,113 @@ private struct ConversationBubble: View {
                     .padding(.horizontal, 4)
             }
         }
-        .frame(maxWidth: .infinity,
-               alignment: alignment == .trailing ? .trailing : .leading)
         .accessibilityLabel("\(roleLabel) said: \(turn.content)")
+    }
+}
+
+// MARK: - Diagnose strip
+
+/// Walks the pipeline stages for the last utterance. Heuristic for now
+/// (compares lastTranscript to lastDispatched, reads brain/voice error
+/// fields); becomes authoritative once the moment-feed actor tags every
+/// turn with the closing stage in Wave 4.
+///
+/// Moved into ConversationView.swift alongside the footer that summons
+/// it so the cockpit column owns its own diagnose surface end-to-end.
+private struct DiagnoseStrip: View {
+    @Environment(AppServices.self) private var services
+
+    var body: some View {
+        let stages = stageStatuses()
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Image(systemName: "stethoscope")
+                    .foregroundStyle(verdictTint)
+                Text("Last utterance — what happened")
+                    .font(.callout.weight(.medium))
+                Spacer()
+                Text(verdict)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(verdictTint)
+            }
+            HStack(alignment: .top, spacing: 18) {
+                ForEach(stages, id: \.label) { stage in
+                    HStack(spacing: 6) {
+                        Image(systemName: stage.icon)
+                            .foregroundStyle(stage.tint)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(stage.label)
+                                .font(.caption.weight(.medium))
+                            Text(stage.detail)
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                }
+            }
+            if let err = services.brainErrorMessage ?? services.voiceErrorMessage {
+                Text(err)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .padding(.top, 2)
+            }
+        }
+        .padding(10)
+        .background(.regularMaterial,
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private struct Stage {
+        let label: String
+        let detail: String
+        let ok: Bool
+        let icon: String
+        let tint: Color
+    }
+
+    private func stageStatuses() -> [Stage] {
+        let micOK = services.micEnabled
+        let transcript = services.lastTranscript
+        let dispatched = services.lastDispatched == transcript && !transcript.isEmpty
+        let brainOK = services.brainErrorMessage == nil
+        return [
+            mk("Mic",  micOK ? "live" : "off", micOK),
+            mk("STT",
+               transcript.isEmpty ? "no final yet" : "\u{201C}\(transcript)\u{201D}",
+               !transcript.isEmpty),
+            mk("Wake",
+               dispatched ? "matched"
+                          : (transcript.isEmpty ? "—"
+                                                 : "no wake word"),
+               dispatched),
+            mk("Brain",
+               services.brainBusy ? "thinking…"
+                                   : (services.brainErrorMessage ?? "ok"),
+               brainOK),
+            mk("TTS",  services.ttsMuted ? "muted" : "ok", !services.ttsMuted),
+        ]
+    }
+
+    private func mk(_ label: String, _ detail: String, _ ok: Bool) -> Stage {
+        Stage(
+            label: label,
+            detail: detail,
+            ok: ok,
+            icon: ok ? "checkmark.circle.fill" : "exclamationmark.circle.fill",
+            tint: ok ? .green : .orange
+        )
+    }
+
+    private var verdict: String {
+        let stages = stageStatuses()
+        if let firstFail = stages.first(where: { !$0.ok }) {
+            return "stalled at \(firstFail.label.lowercased())"
+        }
+        return "all clear"
+    }
+
+    private var verdictTint: Color {
+        stageStatuses().allSatisfy(\.ok) ? .green : .orange
     }
 }

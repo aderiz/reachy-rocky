@@ -140,6 +140,24 @@ final class SettingsStore {
     /// `sleepRobot()`. Users who want tap-to-wake can opt in.
     var wakeOnPat: Bool { didSet { save() } }
 
+    /// Whether tool-call rows (`⌘ → say {…}`, `⌘ ← get_weather (ok, 267ms) …`)
+    /// appear inline in the chat transcript. Default `true` keeps the
+    /// v0.1/v0.2 behaviour where tool I/O is visible alongside the
+    /// bubbles. Power users debugging see them; readers focused on
+    /// the conversation can hide them. The Activity tab still shows
+    /// tool moments either way.
+    var showToolCalls: Bool { didSet { save() } }
+
+    /// Persistent dimensions for the floating senses chip in the
+    /// portrait (combined video + audio overlay). The user drags the
+    /// corner grip; the committed size lives here so it survives
+    /// relaunch. Min / max bounds are enforced inside `SensesChip`
+    /// at the commit step. The naming keeps `visionChip*` for
+    /// continuity with the v0.x defaults stored in UserDefaults —
+    /// the chip is video-primary.
+    var visionChipWidth: Double { didSet { save() } }
+    var visionChipHeight: Double { didSet { save() } }
+
     /// Brain (LLM/VLM) backend choice. Values:
     ///   - `"auto"` (default): MLX-VLM if the brain sidecar venv is
     ///     installed AND the model loads, else LM Studio.
@@ -209,6 +227,13 @@ final class SettingsStore {
         self.wakeWord = d.string(forKey: Keys.wakeWord) ?? "rocky"
         self.wakeEngine = d.string(forKey: Keys.wakeEngine) ?? "stt"
         self.wakeOnPat = (d.object(forKey: Keys.wakeOnPat) as? Bool) ?? false
+        self.showToolCalls = (d.object(forKey: Keys.showToolCalls) as? Bool) ?? true
+        // Default 240×150 — a comfortable 16:9 senses chip that
+        // matches the relay's typical output resolution. Existing
+        // installs that stored the v1 dimensions (116×86) will pick
+        // up those persisted values via the d.object lookup.
+        self.visionChipWidth = (d.object(forKey: Keys.visionChipWidth) as? Double) ?? 240
+        self.visionChipHeight = (d.object(forKey: Keys.visionChipHeight) as? Double) ?? 150
         self.brainBackend = d.string(forKey: Keys.brainBackend) ?? "auto"
         self.brainModel = d.string(forKey: Keys.brainModel)
             ?? "mlx-community/Qwen3-VL-4B-Instruct-4bit"
@@ -275,6 +300,9 @@ final class SettingsStore {
         d.set(wakeWord, forKey: Keys.wakeWord)
         d.set(wakeEngine, forKey: Keys.wakeEngine)
         d.set(wakeOnPat, forKey: Keys.wakeOnPat)
+        d.set(showToolCalls, forKey: Keys.showToolCalls)
+        d.set(visionChipWidth, forKey: Keys.visionChipWidth)
+        d.set(visionChipHeight, forKey: Keys.visionChipHeight)
         d.set(brainBackend, forKey: Keys.brainBackend)
         d.set(brainModel, forKey: Keys.brainModel)
     }
@@ -447,6 +475,9 @@ final class SettingsStore {
         static let wakeWord = "rocky.wake.word"
         static let wakeEngine = "rocky.wake.engine"
         static let wakeOnPat = "rocky.wake.on.pat"
+        static let showToolCalls = "rocky.chat.show.tool.calls"
+        static let visionChipWidth = "rocky.portrait.vision.w"
+        static let visionChipHeight = "rocky.portrait.vision.h"
         static let brainBackend = "rocky.brain.backend"
         static let brainModel = "rocky.brain.model"
     }

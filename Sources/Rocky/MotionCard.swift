@@ -26,7 +26,11 @@ struct MotionCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            preview
+            // 3D Rocky preview removed — the live pose/antennas
+            // sliders + Stewart debug below are the actual signal
+            // here, and the SceneKit avatar made the card look like
+            // a duplicate of PortraitView. PortraitView is now the
+            // single canonical 3D rendering.
             headerStrip
             section("Head pose") {
                 AxisRow(label: "Yaw",
@@ -102,24 +106,6 @@ struct MotionCard: View {
                     .foregroundStyle(.secondary)
             }
         }
-    }
-
-    // MARK: - Preview
-
-    private var preview: some View {
-        ReachyMiniAvatar(
-            state: services.rockyState,
-            pose: services.lastRobotState?.headPose,
-            antennas: services.lastRobotState?.antennasPosition,
-            bodyYaw: services.lastRobotState?.bodyYaw,
-            headJoints: services.lastRobotState?.headJoints,
-            passiveJoints: services.lastRobotState?.passiveJoints
-        )
-        .aspectRatio(1, contentMode: .fit)
-        .frame(maxWidth: 360)
-        .frame(maxWidth: .infinity)
-        .background(.regularMaterial,
-                    in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
     // MARK: - Header strip

@@ -46,23 +46,13 @@ struct RootView: View {
 
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
-        ToolbarItem(placement: .navigation) {
-            Button {
-                Task {
-                    if services.isAsleep {
-                        await services.wakeRobot()
-                    } else {
-                        await services.sleepRobot()
-                    }
-                }
-            } label: {
-                Label(services.isAsleep ? "Wake" : "Sleep",
-                      systemImage: services.isAsleep ? "sun.max.fill" : "moon.fill")
-            }
-            .help(services.isAsleep
-                  ? "Wake Rocky up — enable motors and recover the neutral pose."
-                  : "Send Rocky to sleep — disable motors after the goodbye animation.")
-        }
+        // No wake/sleep button here — the canonical wake/sleep control
+        // is PortraitView's state-driven primary action, which is
+        // load-bearing (it also handles "Stop talking" mid-TTS and
+        // disables itself during transitions). A second copy in the
+        // toolbar was pure duplication and confused users about which
+        // one was authoritative. Command palette (⌘K) and the menu-bar
+        // extra still expose wake/sleep for always-accessible reach.
 
         ToolbarItem(placement: .secondaryAction) {
             Button {

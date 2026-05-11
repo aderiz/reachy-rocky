@@ -181,6 +181,7 @@ private struct BrainSettingsTab: View {
                 lmStudioSection
             }
             webSearchSection
+            conversationDisplaySection
             statusSection
         }
         .formStyle(.grouped)
@@ -351,6 +352,24 @@ private struct BrainSettingsTab: View {
             Text("Web search")
         } footer: {
             Text("Used by the `search_web` tool. Free tier allows 1 query/sec; leave blank to disable web search.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - Conversation display
+
+    private var conversationDisplaySection: some View {
+        Section {
+            Toggle("Show tool calls in chat",
+                   isOn: Binding(
+                       get: { services.settings.showToolCalls },
+                       set: { services.settings.showToolCalls = $0 }
+                   ))
+        } header: {
+            Text("Conversation")
+        } footer: {
+            Text("When off, the small `⌘ → tool · args` and `⌘ ← tool (ok, Nms) · result` lines are hidden between bubbles. Tool activity is still recorded in the Activity tab and the log.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
