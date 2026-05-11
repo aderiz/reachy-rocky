@@ -29,7 +29,8 @@ public actor MLXVLMBrain: BrainBackend {
         tools: [ToolSchema]?,
         image: BrainImage?
     ) -> AsyncThrowingStream<ChatChunk, Error> {
-        AsyncThrowingStream<ChatChunk, Error> { continuation in
+        let bus = self.logBus
+        return AsyncThrowingStream<ChatChunk, Error> { continuation in
             let task = Task {
                 do {
                     let request = ChatStreamRequest(
@@ -37,12 +38,25 @@ public actor MLXVLMBrain: BrainBackend {
                         tools: tools,
                         image_b64: image.map { $0.jpegData.base64EncodedString() }
                     )
+                    await bus.publish(.sidecarLog(
+                        sidecar: "brain", level: .debug,
+                        message: "chat_stream begin",
+                        fields: [
+                            "messages": "\(messages.count)",
+                            "tools": "\(tools?.count ?? 0)",
+                            "image": image == nil ? "none" : "\(image!.jpegData.count)B"
+                        ]
+                    ))
                     let stream = sidecar.stream(
                         method: "chat_stream",
                         params: request
                     )
                     var nextToolCallIndex = 0
+                    var chunkCount = 0
+                    var toolCallCount = 0
+                    var unknownCount = 0
                     for try await line in stream {
+                        chunkCount += 1
                         // Each `line` is the JSON object inside a
                         // `stream` envelope (SidecarRuntime extracts
                         // it). Decode whichever variant arrived.
@@ -57,6 +71,7 @@ public actor MLXVLMBrain: BrainBackend {
                         if let payload = try? JSONDecoder().decode(
                             ToolCallPayload.self, from: line
                         ), let call = payload.tool_call {
+                            toolCallCount += 1
                             let chunk = ChatChunk(
                                 toolCallDeltas: [
                                     ToolCallDelta(
@@ -71,10 +86,34 @@ public actor MLXVLMBrain: BrainBackend {
                             continuation.yield(chunk)
                             continue
                         }
-                        // Unknown envelope — ignore rather than fail.
+                        // Unknown envelope — log a sample so we can
+                        // see what we missed.
+                        unknownCount += 1
+                        if unknownCount <= 3 {
+                            let preview = String(data: line.prefix(160), encoding: .utf8) ?? "<binary>"
+                            await bus.publish(.sidecarLog(
+                                sidecar: "brain", level: .warn,
+                                message: "chat_stream: unknown envelope",
+                                fields: ["sample": preview]
+                            ))
+                        }
                     }
+                    await bus.publish(.sidecarLog(
+                        sidecar: "brain", level: .debug,
+                        message: "chat_stream end",
+                        fields: [
+                            "chunks": "\(chunkCount)",
+                            "tool_calls": "\(toolCallCount)",
+                            "unknown": "\(unknownCount)"
+                        ]
+                    ))
                     continuation.finish()
                 } catch {
+                    await bus.publish(.error(
+                        scope: "brain/chat_stream",
+                        message: "\(error)",
+                        recoverable: true
+                    ))
                     continuation.finish(throwing: error)
                 }
             }
