@@ -1,13 +1,22 @@
-"""Qwen3-TTS-12Hz CustomVoice backend (mlx-community / Qwen3 via mlx-audio).
+"""Qwen3-TTS-12Hz Base backend (mlx-community / Qwen3 via mlx-audio).
 
-Streaming: 97 ms first-packet latency via Qwen3-TTS-12Hz's dual-track LM
-architecture — emits PCM chunks as the model generates, so Rocky can
-start speaking before the full reply is synthesised. Voice cloning
-from a 3-second reference clip in
-`~/Library/Application Support/Rocky/voice/`.
+Streaming: ~800 ms first-packet on this Mac via Qwen3-TTS-12Hz's
+dual-track LM architecture — emits PCM chunks as the model generates,
+so Rocky can start speaking before the full reply is synthesised.
 
-Defaults to `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`; override via
-`ROCKY_TTS_QWEN3_MODEL`.
+Voice cloning: the **Base** variant supports in-context-learning (ICL)
+voice cloning from a 3-second reference clip in
+`~/Library/Application Support/Rocky/voice/reference.wav` plus the
+verbatim transcript of that clip in `ROCKY_TTS_REF_TEXT`. When both
+are present the model speaks in the cloned voice; otherwise it falls
+back to the model's default synthesis (no cloning).
+
+The sibling **CustomVoice** variant cannot clone — it uses a fixed
+roster of pretrained speakers. Rocky targets cloning, so we use Base.
+
+Defaults to `Qwen/Qwen3-TTS-12Hz-1.7B-Base`; override via
+`ROCKY_TTS_QWEN3_MODEL`. Reference clip path override via
+`ROCKY_TTS_REF_AUDIO`; transcript override via `ROCKY_TTS_REF_TEXT`.
 
 Both `synthesize` (full WAV) and `synthesize_stream` (chunked PCM)
 paths are exposed; the runner picks based on caller method.
@@ -24,13 +33,15 @@ from typing import Iterator
 from .backends import Backend, SynthesisResult
 
 
-DEFAULT_QWEN3_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+DEFAULT_QWEN3_MODEL = "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16"
 DEFAULT_REF_DIR = Path.home() / "Library" / "Application Support" / "Rocky" / "voice"
 DEFAULT_REF_NAME = "reference.wav"
 
 
 class Qwen3TTSBackend(Backend):
-    """Qwen3-TTS-12Hz with streaming-capable PCM emission."""
+    """Qwen3-TTS-12Hz with streaming-capable PCM emission. Chunks
+    flow up to Swift's `StreamingTTS`, which routes them to the
+    robot speaker via chunked upload + queued `play_sound` calls."""
 
     name = "qwen3-tts"
     supports_streaming = True
@@ -47,21 +58,60 @@ class Qwen3TTSBackend(Backend):
             or DEFAULT_QWEN3_MODEL
         )
         self.ref_audio_path = ref_audio_path or self._resolve_ref_audio()
-        self.ref_text = ref_text or os.environ.get("ROCKY_TTS_REF_TEXT") or None
+        # If ref_text wasn't passed explicitly or via env, try to load
+        # it from the sidecar transcript file that lives next to the
+        # reference clip (`sample.txt` / `reference.txt`).
+        self.ref_text = (
+            ref_text
+            or os.environ.get("ROCKY_TTS_REF_TEXT")
+            or self._resolve_ref_text()
+        )
         self._loaded = False
         self._model = None
         self._processor = None
 
     # ------------------------------------------------------------------
-    # Reference-audio resolution
+    # Reference-audio + reference-text resolution
     # ------------------------------------------------------------------
 
     def _resolve_ref_audio(self) -> str | None:
+        """Find a voice-reference WAV. Priority:
+        1. `ROCKY_TTS_REF_AUDIO` env var (absolute path)
+        2. `~/Library/Application Support/Rocky/voice/reference.wav`
+        3. `~/Library/Application Support/Rocky/voice/sample.wav`
+           (Rocky cockpit's onboarding writes here)
+        """
         env = os.environ.get("ROCKY_TTS_REF_AUDIO")
         if env and Path(env).is_file():
             return env
-        default = DEFAULT_REF_DIR / DEFAULT_REF_NAME
-        return str(default) if default.is_file() else None
+        for name in (DEFAULT_REF_NAME, "sample.wav"):
+            candidate = DEFAULT_REF_DIR / name
+            if candidate.is_file():
+                return str(candidate)
+        return None
+
+    def _resolve_ref_text(self) -> str | None:
+        """Load the transcript paired with the reference clip, looking
+        for `reference.txt` first, then `sample.txt`. Returns None
+        when no transcript is available — the model then falls back to
+        non-ICL synthesis."""
+        # If ref_audio_path is set, prefer a sibling .txt with the
+        # same stem (e.g. `sample.wav` → `sample.txt`).
+        if self.ref_audio_path:
+            sibling = Path(self.ref_audio_path).with_suffix(".txt")
+            if sibling.is_file():
+                try:
+                    return sibling.read_text(encoding="utf-8").strip() or None
+                except OSError:
+                    pass
+        for name in ("reference.txt", "sample.txt"):
+            candidate = DEFAULT_REF_DIR / name
+            if candidate.is_file():
+                try:
+                    return candidate.read_text(encoding="utf-8").strip() or None
+                except OSError:
+                    continue
+        return None
 
     def set_voice_ref(self, voice_ref_id: str, wav_bytes: bytes) -> None:
         """Persist a new voice reference under
@@ -128,41 +178,29 @@ class Qwen3TTSBackend(Backend):
     ) -> Iterator[tuple[bytes, int]]:
         self._ensure_loaded()
 
-        # mlx-audio's generate API for Qwen3-TTS exposes a
-        # generator-style `generate(text, ref_audio=..., ref_text=...,
-        # stream=True)` that yields chunks. The exact entry point
-        # varies between mlx-audio versions; try a few in priority
-        # order and fall back to a single-shot generate that yields
-        # the whole buffer at once.
-        try:
-            from mlx_audio.tts.models.qwen3_tts import generate as q_generate  # type: ignore
-            for chunk in q_generate(
-                model=self._model,
-                text=text,
-                ref_audio=self.ref_audio_path,
-                ref_text=self.ref_text,
-                stream=True,
-            ):
-                pcm = _to_int16_bytes(chunk.audio)
-                sr = int(getattr(chunk, "sample_rate", 16_000))
-                yield pcm, sr
-            return
-        except Exception:  # noqa: BLE001 — fall through to non-streaming
-            pass
-
-        # Non-streaming fallback — yields the full buffer in one
-        # chunk. Same on-the-wire shape; downstream players treat it
-        # as a single 'pcm_chunk' event followed by 'synth_end'.
-        from mlx_audio.tts.utils import generate_audio  # type: ignore
-        result = generate_audio(
-            model=self._model,
+        # `Model.generate(...)` from qwen3_tts is the canonical
+        # streaming generator — yields `GenerationResult` objects
+        # with `.audio` (mx.array) and `.sample_rate`. We call it
+        # directly instead of `mlx_audio.tts.generate.generate_audio`,
+        # which consumes the iterator internally for playback /
+        # save side-effects.
+        #
+        # Base model branches inside `generate`:
+        #   - ref_audio AND ref_text supplied → ICL voice cloning
+        #     (the Rocky path; uses the user's 3-second reference)
+        #   - otherwise → standard synthesis with the model's
+        #     default voice (no cloning; this is the first-run path
+        #     before the user has recorded a reference)
+        for result in self._model.generate(  # type: ignore[union-attr]
             text=text,
             ref_audio=self.ref_audio_path,
             ref_text=self.ref_text,
-        )
-        audio = getattr(result, "audio", result)
-        sr = int(getattr(result, "sample_rate", 16_000))
-        yield _to_int16_bytes(audio), sr
+            stream=True,
+            verbose=False,
+        ):
+            audio = getattr(result, "audio", result)
+            sr = int(getattr(result, "sample_rate", 16_000))
+            yield _to_int16_bytes(audio), sr
 
 
 # ---------------------------------------------------------------------------

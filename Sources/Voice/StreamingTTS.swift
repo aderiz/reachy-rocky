@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import RobotLink
 import SidecarHost
 import Telemetry
 
@@ -102,6 +103,77 @@ public actor StreamingTTS {
         setSpeaking(false)
     }
 
+    /// Play a stream of PCM chunks through the **robot speaker** by
+    /// accumulating all chunks, wrapping them in a single WAV, then
+    /// uploading + `play_sound` on the daemon. The `isSpeaking`
+    /// signal still flips `true` on the FIRST PCM chunk emitted by
+    /// the sidecar (so the echo gate engages as soon as synthesis
+    /// starts, not when the robot begins playing), and flips back
+    /// `false` after the daemon-side playback completes (estimated
+    /// from PCM duration + `sttPostRollS`).
+    ///
+    /// Returns the WAV duration (for stats) and the upload time.
+    /// The daemon's `/api/media/play_sound` is non-blocking so the
+    /// upload+play call returns quickly; we sleep for the audio's
+    /// duration before flipping isSpeaking off.
+    public struct RobotPlaybackStats: Sendable {
+        public let durationS: Double
+        public let uploadMs: Double
+    }
+
+    public func playToRobot(
+        chunks: AsyncThrowingStream<(pcm: Data, sampleRate: Int), Error>,
+        media: MediaClient,
+        filename: String
+    ) async throws -> RobotPlaybackStats {
+        var firstChunkAt: Date? = nil
+        var pcmAccumulator = Data()
+        var sampleRate: Int = 24_000
+
+        do {
+            for try await chunk in chunks {
+                if firstChunkAt == nil {
+                    firstChunkAt = Date()
+                    setSpeaking(true)
+                }
+                sampleRate = chunk.sampleRate
+                pcmAccumulator.append(chunk.pcm)
+            }
+        } catch {
+            setSpeaking(false)
+            throw error
+        }
+
+        let bytesPerFrame = 2  // s16le mono
+        let totalSamples = pcmAccumulator.count / bytesPerFrame
+        let durationS = Double(totalSamples) / Double(sampleRate)
+
+        // Wrap raw PCM in a minimal WAV header so the daemon's
+        // `play_sound` accepts it.
+        let wav = Self.wrapPCMInWAV(
+            pcm: pcmAccumulator, sampleRate: sampleRate
+        )
+        let uploadStart = Date()
+        _ = try await media.uploadSound(filename: filename, data: wav)
+        let uploadMs = Date().timeIntervalSince(uploadStart) * 1000
+        try await media.playSound(file: filename)
+
+        // Block until the audio finishes playing on the robot, plus
+        // the post-roll tail. play_sound is non-blocking on the
+        // daemon side — without this sleep we'd flip isSpeaking off
+        // immediately and the echo gate would let STT transcribe
+        // Rocky's own voice.
+        let waitS = durationS + sttPostRollS
+        if waitS > 0 {
+            try? await Task.sleep(
+                nanoseconds: UInt64(waitS * 1_000_000_000)
+            )
+        }
+        setSpeaking(false)
+
+        return RobotPlaybackStats(durationS: durationS, uploadMs: uploadMs)
+    }
+
     /// Stop playback immediately (cancel queued buffers).
     public func stop() {
         player.stop()
@@ -128,6 +200,34 @@ public actor StreamingTTS {
         if value == isSpeaking { return }
         isSpeaking = value
         isSpeakingContinuation.yield(value)
+    }
+
+    /// Wrap raw int16-LE mono PCM in a minimal WAV (RIFF) header so
+    /// the daemon's `play_sound` endpoint can consume it.
+    static func wrapPCMInWAV(pcm: Data, sampleRate: Int) -> Data {
+        let bits: UInt16 = 16
+        let channels: UInt16 = 1
+        let sr = UInt32(sampleRate)
+        let byteRate = sr * UInt32(channels) * UInt32(bits) / 8
+        let blockAlign = channels * bits / 8
+        let dataSize = UInt32(pcm.count)
+        let riffSize = 36 + dataSize
+
+        var header = Data()
+        header.append(Data("RIFF".utf8))
+        header.append(contentsOf: withUnsafeBytes(of: riffSize.littleEndian, Array.init))
+        header.append(Data("WAVEfmt ".utf8))
+        header.append(contentsOf: withUnsafeBytes(of: UInt32(16).littleEndian, Array.init))
+        header.append(contentsOf: withUnsafeBytes(of: UInt16(1).littleEndian, Array.init))
+        header.append(contentsOf: withUnsafeBytes(of: channels.littleEndian, Array.init))
+        header.append(contentsOf: withUnsafeBytes(of: sr.littleEndian, Array.init))
+        header.append(contentsOf: withUnsafeBytes(of: byteRate.littleEndian, Array.init))
+        header.append(contentsOf: withUnsafeBytes(of: blockAlign.littleEndian, Array.init))
+        header.append(contentsOf: withUnsafeBytes(of: bits.littleEndian, Array.init))
+        header.append(Data("data".utf8))
+        header.append(contentsOf: withUnsafeBytes(of: dataSize.littleEndian, Array.init))
+        header.append(pcm)
+        return header
     }
 
     /// Convert a slice of int16-LE mono PCM bytes into an

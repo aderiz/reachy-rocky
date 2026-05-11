@@ -1312,6 +1312,10 @@ final class AppServices {
                 var assistantBuffer = ""
                 var firstChunkMs: Double?
                 var assistantTurnId: UUID?
+                // Buffer the `say` tool's text argument captured at
+                // dispatch time so we can render it as the assistant
+                // bubble when the result returns.
+                var pendingSayText: String? = nil
                 let started = Date()
                 do {
                     for try await output in stream {
@@ -1356,6 +1360,15 @@ final class AppServices {
                             }
                         case .toolCallDispatched(let name, let argumentsJSON, _):
                             let detail = argumentsJSON
+                            // Stash the say text so we can mirror it into
+                            // an assistant bubble after the tool returns;
+                            // the chat then matches the audio rather than
+                            // showing whatever the model chatters next.
+                            if name == "say" {
+                                pendingSayText = Self.extractSayText(
+                                    from: argumentsJSON
+                                )
+                            }
                             await MainActor.run { [weak self] in
                                 self?.brainTurns.append(.init(
                                     role: "tool", content: "→ \(name)", detail: detail
@@ -1366,12 +1379,24 @@ final class AppServices {
                             let detail = result.resultJSON
                             let name = result.name
                             let ms = result.latencyMs
+                            let sayText: String? = {
+                                guard name == "say", result.ok else { return nil }
+                                let t = pendingSayText
+                                pendingSayText = nil
+                                return t
+                            }()
                             await MainActor.run { [weak self] in
-                                self?.brainTurns.append(.init(
+                                guard let self else { return }
+                                self.brainTurns.append(.init(
                                     role: "tool",
                                     content: "← \(name) (\(summary), \(Int(ms))ms)",
                                     detail: detail
                                 ))
+                                if let sayText, !sayText.isEmpty {
+                                    self.brainTurns.append(.init(
+                                        role: "assistant", content: sayText
+                                    ))
+                                }
                             }
                         case .error(let msg):
                             await MainActor.run { [weak self] in
@@ -1618,6 +1643,19 @@ final class AppServices {
 
     /// Watches mic RMS for a loud transient while sleeping, and wakes
     /// the robot when one fires. Single-tap detection: any RMS above
+    /// Parse the `text` argument out of a `say` tool's JSON arguments.
+    /// Returns `nil` when the JSON is malformed or `text` is absent —
+    /// the caller treats that as "no spoken text to mirror," so the
+    /// chat bubble stays untouched.
+    nonisolated private static func extractSayText(from argumentsJSON: String) -> String? {
+        guard let data = argumentsJSON.data(using: .utf8) else { return nil }
+        guard let obj = try? JSONSerialization.jsonObject(with: data)
+                as? [String: Any] else { return nil }
+        guard let text = obj["text"] as? String else { return nil }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     /// `spikeThreshold` triggers a wake, with a 3 s cooldown so a long
     /// loud event (e.g. someone speaking nearby) doesn't fire repeatedly.
     /// The earlier "two spikes within 0.8 s" gate was rejecting too

@@ -110,25 +110,78 @@ def _normalise_tool_call(payload: Any, idx: int) -> Optional[dict]:
     }
 
 
-def extract_tool_calls(
-    text: str, processor
-) -> tuple[str, list[dict]]:
-    """Strip recognised tool-call wrappers from `text` and return
-    (cleaned_text, [normalised_call_dicts]).
+class StreamFilter:
+    """Streaming-safe tool-call extractor. Feed token deltas in via
+    :meth:`feed`; get back (clean_text_to_emit, [completed_block_bodies]).
+    Inside a `<|tool_call>...<tool_call|>` block, deltas are buffered
+    silently (the conversation UI never sees the raw markers). When the
+    end marker arrives, the block body is returned for the caller to
+    parse + dispatch as a tool_call event.
 
-    Native path: mlx-vlm's tool-parser modules expose `tool_call_start` /
-    `tool_call_end` constants (e.g. `<|tool_call>` / `<tool_call|>` for
-    Gemma 4) and a `parse_tool_call(text, tools=None) -> dict` function
-    that parses a SINGLE call. We scan the text for every
-    start..end block, run `parse_tool_call` on each one, and strip
-    them from the visible reply.
+    Handles markers split across chunks: text is held back only when
+    `pending` ends with a partial start marker prefix; the safe
+    leading prefix is emitted on every feed.
+    """
 
-    Fallback: fenced-JSON / OpenAI-style `<tool_call>...</tool_call>`
-    for models that don't have a registered parser."""
-    calls: list[dict] = []
-    cleaned = text
+    def __init__(self, start: str, end: str) -> None:
+        self.start = start
+        self.end = end
+        self.pending = ""    # text not yet emitted
+        self.in_block = False
+        self.block = ""
 
-    # Native parser via the model's chat-template fingerprint.
+    def feed(self, delta: str) -> tuple[str, list[str]]:
+        emit_parts: list[str] = []
+        completed: list[str] = []
+        cursor = delta
+        while cursor:
+            if self.in_block:
+                self.block += cursor
+                cursor = ""
+                idx = self.block.find(self.end)
+                if idx >= 0:
+                    completed.append(self.block[:idx])
+                    cursor = self.block[idx + len(self.end):]
+                    self.block = ""
+                    self.in_block = False
+            else:
+                self.pending += cursor
+                cursor = ""
+                idx = self.pending.find(self.start)
+                if idx >= 0:
+                    emit_parts.append(self.pending[:idx])
+                    cursor = self.pending[idx + len(self.start):]
+                    self.pending = ""
+                    self.in_block = True
+                else:
+                    # Emit all of `pending` except the trailing window
+                    # that could still be a partial start marker.
+                    safe_len = max(0, len(self.pending) - len(self.start) + 1)
+                    if safe_len > 0:
+                        emit_parts.append(self.pending[:safe_len])
+                        self.pending = self.pending[safe_len:]
+        return "".join(emit_parts), completed
+
+    def finish(self) -> tuple[str, list[str]]:
+        """Flush any pending text at end-of-stream. Unclosed tool-call
+        blocks return their captured body as both a completed block
+        AND visible text (so the user sees what was there)."""
+        if self.in_block:
+            # Model never closed the block. Return body as completed
+            # (parser may recover) AND as visible text fallback.
+            unclosed_body = self.block
+            self.block = ""
+            self.in_block = False
+            return unclosed_body, [unclosed_body]
+        out = self.pending
+        self.pending = ""
+        return out, []
+
+
+def get_tool_markers(processor) -> tuple[str, str]:
+    """Resolve (start, end) tool-call markers for the active model.
+    Falls back to Gemma 4 defaults when no parser is registered, since
+    those are the most common shape Rocky targets in v0.2."""
     try:
         from mlx_vlm.tool_parsers import (
             _infer_tool_parser_from_processor,
@@ -140,70 +193,71 @@ def extract_tool_calls(
             module = load_tool_module(parser_name)
             start = getattr(module, "tool_call_start", None)
             end = getattr(module, "tool_call_end", None)
+            if start and end:
+                return start, end
+    except Exception as e:  # noqa: BLE001
+        trace(f"tool-marker resolution failed: {e!s}")
+    return "<|tool_call>", "<tool_call|>"
+
+
+def parse_tool_call_block(body: str, processor) -> list[dict]:
+    """Parse the body of a `<|tool_call>...<tool_call|>` block (the
+    text *between* the markers). Returns 0+ normalised calls."""
+    calls: list[dict] = []
+    try:
+        from mlx_vlm.tool_parsers import (
+            _infer_tool_parser_from_processor,
+            load_tool_module,
+        )
+
+        parser_name = _infer_tool_parser_from_processor(processor)
+        if parser_name:
+            module = load_tool_module(parser_name)
             parser_fn = (
                 getattr(module, "parse_tool_call", None)
                 or getattr(module, "parse_tool_calls", None)
             )
-            if start and end and callable(parser_fn):
-                # Walk every <start>...<end> block. The parser is
-                # singular-shaped on Gemma 4 (parse_tool_call) and
-                # throws ValueError when the block doesn't contain
-                # a callable form — swallow that.
-                start_idx = 0
-                while True:
-                    s = cleaned.find(start, start_idx)
-                    if s == -1:
-                        break
-                    e = cleaned.find(end, s + len(start))
-                    if e == -1:
-                        break
-                    block = cleaned[s + len(start) : e]
-                    try:
-                        parsed = parser_fn(block)
-                    except Exception as ex:  # noqa: BLE001
-                        trace(f"native parser rejected block: {ex!s}")
-                        parsed = None
-                    # parse_tool_call returns a single dict; the
-                    # (rare) plural form returns a list.
-                    if isinstance(parsed, dict):
+            if callable(parser_fn):
+                try:
+                    parsed = parser_fn(body)
+                except Exception as ex:  # noqa: BLE001
+                    trace(f"native parser rejected block: {ex!s}")
+                    parsed = None
+                if isinstance(parsed, dict):
+                    normalised = _normalise_tool_call(parsed, 1)
+                    if normalised:
+                        calls.append(normalised)
+                elif isinstance(parsed, list):
+                    for p in parsed:
                         normalised = _normalise_tool_call(
-                            parsed, len(calls) + 1
+                            p, len(calls) + 1
                         )
                         if normalised:
                             calls.append(normalised)
-                    elif isinstance(parsed, list):
-                        for p in parsed:
-                            normalised = _normalise_tool_call(
-                                p, len(calls) + 1
-                            )
-                            if normalised:
-                                calls.append(normalised)
-                    # Remove the entire block from the visible text.
-                    cleaned = cleaned[:s] + cleaned[e + len(end):]
-                    start_idx = s  # rescan from same offset; block is gone
-                trace(
-                    f"native parser={parser_name!r} found={len(calls)} "
-                    f"(start={start!r})"
-                )
     except Exception as e:  # noqa: BLE001
         trace(f"native tool-parser unavailable: {e!s}")
+    return calls
 
-    # Fallback patterns (Qwen / generic fenced-JSON / OpenAI-style).
-    if not calls:
-        for pat in FALLBACK_TOOL_CALL_PATTERNS:
-            def _consume(match: re.Match) -> str:
-                try:
-                    payload = json.loads(match.group("json"))
-                except json.JSONDecodeError:
-                    return match.group(0)
-                normalised = _normalise_tool_call(payload, len(calls) + 1)
-                if normalised:
-                    calls.append(normalised)
-                    return ""
+
+def fallback_extract_tool_calls(text: str) -> tuple[str, list[dict]]:
+    """For models without a registered native parser (e.g. Qwen3), look
+    for fenced-JSON / OpenAI-style `<tool_call>...</tool_call>` blocks
+    in the FULL text. Returns (cleaned_text, [normalised_calls])."""
+    calls: list[dict] = []
+    cleaned = text
+    for pat in FALLBACK_TOOL_CALL_PATTERNS:
+        def _consume(match: re.Match) -> str:
+            try:
+                payload = json.loads(match.group("json"))
+            except json.JSONDecodeError:
                 return match.group(0)
+            normalised = _normalise_tool_call(payload, len(calls) + 1)
+            if normalised:
+                calls.append(normalised)
+                return ""
+            return match.group(0)
 
-            cleaned = pat.sub(_consume, cleaned)
-
+        cleaned = pat.sub(_consume, cleaned)
     return cleaned.strip(), calls
 
 
@@ -366,9 +420,28 @@ class Brain:
             f"enable_thinking={self.enable_thinking}"
         )
 
-        # Stream tokens.
+        # Streaming-safe tool-call extraction. The StreamFilter
+        # suppresses bytes between `<|tool_call>` and `<tool_call|>` so
+        # the conversation UI never renders raw markers. Each captured
+        # block fires exactly ONE tool_call event — there is no
+        # post-stream re-parse on the same text (which was the source
+        # of the duplicate-speech bug).
+        start_marker, end_marker = get_tool_markers(self.processor)
+        stream_filter = StreamFilter(start_marker, end_marker)
         text_buffer: list[str] = []
+        tool_calls: list[dict] = []
+        call_seq = 0
         chunks_seen = 0
+
+        def emit_calls_from(blocks: list[str]) -> None:
+            nonlocal call_seq
+            for body in blocks:
+                for tc in parse_tool_call_block(body, self.processor):
+                    call_seq += 1
+                    tc["id"] = f"call_brain_{call_seq}"
+                    tool_calls.append(tc)
+                    emit({"id": request_id, "stream": {"tool_call": tc}})
+
         try:
             for chunk in stream_generate(
                 self.model,
@@ -388,9 +461,14 @@ class Brain:
                         f"prompt_tps={getattr(chunk, 'prompt_tps', 0):.1f}"
                     )
                 delta = getattr(chunk, "text", "") if not isinstance(chunk, str) else chunk
-                if delta:
-                    text_buffer.append(delta)
-                    emit({"id": request_id, "stream": {"delta": delta}})
+                if not delta:
+                    continue
+                clean_delta, blocks = stream_filter.feed(delta)
+                if clean_delta:
+                    text_buffer.append(clean_delta)
+                    emit({"id": request_id, "stream": {"delta": clean_delta}})
+                if blocks:
+                    emit_calls_from(blocks)
         except Exception as e:  # noqa: BLE001
             trace(f"stream_generate FAILED: {e!s}")
             emit({
@@ -399,19 +477,37 @@ class Brain:
             })
             return
 
-        full_text = "".join(text_buffer)
-        trace(f"generate done: text_len={len(full_text)} chunks_seen={chunks_seen}")
+        # Flush filter state at end-of-stream.
+        tail_text, tail_blocks = stream_filter.finish()
+        if tail_text:
+            text_buffer.append(tail_text)
+            emit({"id": request_id, "stream": {"delta": tail_text}})
+        if tail_blocks:
+            emit_calls_from(tail_blocks)
 
-        # Extract any tool calls the model emitted.
-        cleaned_text, tool_calls = extract_tool_calls(full_text, self.processor)
-        for tc in tool_calls:
-            emit({"id": request_id, "stream": {"tool_call": tc}})
+        full_text = "".join(text_buffer)
+        trace(
+            f"generate done: text_len={len(full_text)} "
+            f"chunks_seen={chunks_seen} tool_calls={len(tool_calls)}"
+        )
+
+        # Fallback for models without native start/end markers (Qwen3
+        # emits fenced-JSON or `<tool_call>...</tool_call>` instead).
+        # Only run when the stream filter captured nothing, so we never
+        # double-emit a call that was already caught natively.
+        if not tool_calls:
+            cleaned_fallback, fallback_calls = fallback_extract_tool_calls(full_text)
+            if fallback_calls:
+                for tc in fallback_calls:
+                    tool_calls.append(tc)
+                    emit({"id": request_id, "stream": {"tool_call": tc}})
+                full_text = cleaned_fallback
 
         emit({"id": request_id, "stream_end": True})
         emit({
             "id": request_id,
             "result": {
-                "text": cleaned_text,
+                "text": full_text.strip(),
                 "tool_calls": tool_calls,
                 "stop_reason": "stop",
             },

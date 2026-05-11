@@ -5,7 +5,8 @@
   "args": ["-u", "-m", "rocky_tts.runner"],
   "working_dir": "{sidecar_dir}",
   "env": {
-    "ROCKY_TTS_BACKEND": "chatterbox"
+    "ROCKY_TTS_BACKEND": "qwen3-tts",
+    "ROCKY_TTS_QWEN3_MODEL": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16"
   },
   "ready_event": "ready",
   "ready_timeout_s": 30,

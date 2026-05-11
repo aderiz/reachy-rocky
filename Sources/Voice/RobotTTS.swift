@@ -216,14 +216,22 @@ public actor RobotTTS {
             continuation.onTermination = { _ in task.cancel() }
         }
 
-        try await streamingPlayer.play(chunks: chunkStream)
+        // Stream PCM chunks → accumulate → upload WAV → play through
+        // the robot speaker. The `isSpeaking` signal still flips on
+        // the first PCM chunk (echo gate engages immediately), and
+        // flips back off after the daemon-side playback completes.
+        seq &+= 1
+        let filename = "rocky_tts_stream_\(seq).wav"
+        let playback = try await streamingPlayer.playToRobot(
+            chunks: chunkStream, media: media, filename: filename
+        )
         let totalMs = Date().timeIntervalSince(started) * 1000
         let firstChunkMs = timer.get()
         let stats = SpeakStats(
             synthMs: firstChunkMs ?? 0,
-            uploadMs: 0,
+            uploadMs: playback.uploadMs,
             totalMs: totalMs,
-            durationS: 0
+            durationS: playback.durationS
         )
         self.lastStats = stats
         await logBus.publish(.ttsRequest(

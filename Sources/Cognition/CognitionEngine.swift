@@ -407,6 +407,15 @@ public actor CognitionEngine {
                 ))
                 return
             }
+            // End the turn once `say` has fired. After Rocky has
+            // spoken, looping back to the brain causes the model to
+            // chatter on (a different sentence than what was spoken)
+            // and that follow-up text becomes the chat bubble — so
+            // the chat and TTS diverge. The semantic contract is
+            // "say IS the response"; nothing more is expected.
+            if spokeThisTurn {
+                return
+            }
             // Loop: feed tool outputs back to the model for another turn.
         }
 
