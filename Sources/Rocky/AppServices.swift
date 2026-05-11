@@ -244,14 +244,42 @@ final class AppServices {
                 tooltip: "Robot offline — \(reason)"
             )
         }
-        // LM Studio offline isn't fatal but is amber.
-        if case .offline(let reason) = llmStatus {
-            return HealthGlance(
-                label: "Brain offline",
-                symbol: "exclamationmark.triangle.fill",
-                tint: .orange,
-                tooltip: "LM Studio offline — \(reason)"
-            )
+        // Brain offline is amber-not-fatal. Only flag it when the
+        // *active* backend is unreachable — LM Studio being offline
+        // is fine when MLX-VLM is in charge.
+        switch settings.brainBackend {
+        case "lm-studio":
+            if case .offline(let reason) = llmStatus {
+                return HealthGlance(
+                    label: "Brain offline",
+                    symbol: "exclamationmark.triangle.fill",
+                    tint: .orange,
+                    tooltip: "LM Studio offline — \(reason)"
+                )
+            }
+        case "mlx-vlm":
+            switch brainSidecarState {
+            case .stopped, .failing, .circuitOpen:
+                return HealthGlance(
+                    label: "Brain offline",
+                    symbol: "exclamationmark.triangle.fill",
+                    tint: .orange,
+                    tooltip: "MLX-VLM brain — \(brainStateHumanReadable())"
+                )
+            case .ready, .starting:
+                break
+            }
+        default: // "auto"
+            let mlxReady = brainSidecarState == .ready
+            let lmReady: Bool = { if case .online = llmStatus { return true }; return false }()
+            if !mlxReady, !lmReady {
+                return HealthGlance(
+                    label: "Brain offline",
+                    symbol: "exclamationmark.triangle.fill",
+                    tint: .orange,
+                    tooltip: "No brain backend ready — \(brainStateHumanReadable())"
+                )
+            }
         }
         // Sidecar lifecycle issues.
         if let bad = firstUnhealthySidecar() {
@@ -947,10 +975,20 @@ final class AppServices {
         Task { [weak self] in
             while let self {
                 try? await Task.sleep(nanoseconds: 8_000_000_000)
-                let isOffline: Bool = await MainActor.run {
-                    if case .offline = self.llmStatus { return true } else { return false }
+                // Only probe LM Studio when it's the active brain
+                // (or "auto" with MLX-VLM not ready). Otherwise the
+                // 8-second poll keeps hitting a closed port and
+                // surfacing irrelevant offline errors.
+                let shouldProbe: Bool = await MainActor.run {
+                    let pref = self.settings.brainBackend
+                    if pref == "mlx-vlm" { return false }
+                    if pref == "auto", self.brainSidecarState == .ready {
+                        return false
+                    }
+                    if case .offline = self.llmStatus { return true }
+                    return false
                 }
-                if isOffline { await self.probeLMStudio() }
+                if shouldProbe { await self.probeLMStudio() }
             }
         }
 
@@ -1220,15 +1258,14 @@ final class AppServices {
             return
         }
 
-        // Probe LM Studio if we don't yet know it's online.
-        if case .unknown = llmStatus { await probeLMStudio() }
-        if case .offline(let reason) = llmStatus {
+        // Check the *active* brain backend rather than always
+        // probing LM Studio. When the user has picked MLX-VLM (or
+        // "auto" with the sidecar running), LM Studio being down
+        // is fine — the brain doesn't go through it.
+        if let offline = await brainOfflineMessage() {
             await MainActor.run {
                 self.brainTurns.append(.init(role: "user", content: trimmed))
-                self.brainTurns.append(.init(
-                    role: "assistant",
-                    content: "(brain offline · \(reason)) — start LM Studio to talk to Rocky."
-                ))
+                self.brainTurns.append(.init(role: "assistant", content: offline))
             }
             return
         }
@@ -1836,6 +1873,69 @@ final class AppServices {
                     recoverable: true
                 ))
             }
+        }
+    }
+
+    /// Returns nil if the active brain backend is online and ready
+    /// to take a turn. Otherwise returns a user-facing string
+    /// describing what's wrong and how to fix it — backend-aware:
+    /// "start LM Studio" only when LM Studio is actually the active
+    /// backend, not when MLX-VLM is in charge.
+    func brainOfflineMessage() async -> String? {
+        switch settings.brainBackend {
+        case "lm-studio":
+            if case .unknown = llmStatus { await probeLMStudio() }
+            if case .offline(let reason) = llmStatus {
+                return "(brain offline · \(reason)) — start LM Studio to talk to Rocky."
+            }
+            return nil
+        case "mlx-vlm":
+            if brainSidecar == nil {
+                return "(brain offline) — MLX-VLM selected but `Sidecars/brain/` venv not installed. Run `./Sidecars/brain/setup.sh` and choose Settings → Brain → Restart brain."
+            }
+            switch brainSidecarState {
+            case .ready: return nil
+            case .starting:
+                return "(brain warming up) — MLX-VLM is loading the model. First run downloads ~2.5 GB of weights; subsequent launches are fast."
+            case .stopped:
+                return "(brain offline) — MLX-VLM sidecar not running. Open Settings → Brain and tap Restart brain."
+            case .failing(let r):
+                return "(brain failing · \(r)) — MLX-VLM sidecar in restart loop. Check the logs."
+            case .circuitOpen(let until):
+                let fmt = until.formatted(.dateTime.hour().minute().second())
+                return "(brain backing off until \(fmt)) — MLX-VLM has hit its restart cap; waiting before re-trying."
+            }
+        default: // "auto"
+            // Pick whichever backend is alive. Prefer MLX-VLM if the
+            // sidecar's ready; fall back to LM Studio when it's not.
+            if brainSidecar != nil, brainSidecarState == .ready {
+                return nil
+            }
+            // Brain sidecar not (yet) ready — see if LM Studio is.
+            if case .unknown = llmStatus { await probeLMStudio() }
+            if case .online = llmStatus { return nil }
+            // Neither available — describe both states briefly.
+            var parts: [String] = []
+            if let brainSidecar {
+                _ = brainSidecar
+                parts.append(brainStateHumanReadable())
+            } else {
+                parts.append("MLX-VLM venv not installed")
+            }
+            if case .offline(let r) = llmStatus {
+                parts.append("LM Studio: \(r)")
+            }
+            return "(brain offline · \(parts.joined(separator: " · "))) — install/start either backend and choose Settings → Brain → Restart brain."
+        }
+    }
+
+    private func brainStateHumanReadable() -> String {
+        switch brainSidecarState {
+        case .ready:    return "MLX-VLM ready"
+        case .starting: return "MLX-VLM warming up"
+        case .stopped:  return "MLX-VLM stopped"
+        case .failing(let r): return "MLX-VLM failing (\(r))"
+        case .circuitOpen: return "MLX-VLM in backoff"
         }
     }
 
