@@ -461,11 +461,25 @@ public actor CognitionEngine {
             .map { "- " + $0.text.replacingOccurrences(of: "\n", with: " ") }
             .joined(separator: "\n")
         let body = """
-        Relevant snippets recalled from prior conversations with the user. \
-        Use them as background context only — do NOT quote them verbatim, \
-        do NOT mention that you 'remember', do NOT cite them. Just let the \
-        knowledge inform your reply naturally.
+        Background memories — Rocky's actual recollections of prior \
+        conversations with this user. They are real and you may rely \
+        on them.
 
+        How to use them:
+          • If the user asks what you remember about them, or asks \
+        about something you talked about before, cite the relevant \
+        items naturally in your own voice. Don't read raw timestamps \
+        or role tags aloud.
+          • For ordinary turns, let the memories inform your reply \
+        without forcing a citation — only mention them if they \
+        change what you'd say.
+          • If a memory contradicts something the user just said, \
+        prefer the new statement and treat the older memory as out \
+        of date.
+          • For deeper or more targeted searches, call the \
+        `recall_memory` tool with a specific query.
+
+        Memories:
         \(formatted)
         """
         Task { await logBus.publish(.error(
