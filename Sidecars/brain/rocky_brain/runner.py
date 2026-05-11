@@ -114,7 +114,17 @@ def extract_tool_calls(
     text: str, processor
 ) -> tuple[str, list[dict]]:
     """Strip recognised tool-call wrappers from `text` and return
-    (cleaned_text, [normalised_call_dicts])."""
+    (cleaned_text, [normalised_call_dicts]).
+
+    Native path: mlx-vlm's tool-parser modules expose `tool_call_start` /
+    `tool_call_end` constants (e.g. `<|tool_call>` / `<tool_call|>` for
+    Gemma 4) and a `parse_tool_call(text, tools=None) -> dict` function
+    that parses a SINGLE call. We scan the text for every
+    start..end block, run `parse_tool_call` on each one, and strip
+    them from the visible reply.
+
+    Fallback: fenced-JSON / OpenAI-style `<tool_call>...</tool_call>`
+    for models that don't have a registered parser."""
     calls: list[dict] = []
     cleaned = text
 
@@ -128,25 +138,53 @@ def extract_tool_calls(
         parser_name = _infer_tool_parser_from_processor(processor)
         if parser_name:
             module = load_tool_module(parser_name)
-            # Most parsers expose either `parse_tool_calls(text) ->
-            # list` or `tool_call_start` / `tool_call_end` markers
-            # we can strip after parsing. Try the first; the
-            # gemma4 parser exposes `parse_tool_calls`.
-            parser_fn = getattr(module, "parse_tool_calls", None)
-            if callable(parser_fn):
-                native_calls = parser_fn(cleaned) or []
-                trace(f"native parser={parser_name!r} found={len(native_calls)}")
-                for c in native_calls:
-                    normalised = _normalise_tool_call(c, len(calls) + 1)
-                    if normalised:
-                        calls.append(normalised)
-                start = getattr(module, "tool_call_start", None)
-                end = getattr(module, "tool_call_end", None)
-                if start and end:
-                    pattern = re.compile(
-                        re.escape(start) + r"[\s\S]*?" + re.escape(end)
-                    )
-                    cleaned = pattern.sub("", cleaned)
+            start = getattr(module, "tool_call_start", None)
+            end = getattr(module, "tool_call_end", None)
+            parser_fn = (
+                getattr(module, "parse_tool_call", None)
+                or getattr(module, "parse_tool_calls", None)
+            )
+            if start and end and callable(parser_fn):
+                # Walk every <start>...<end> block. The parser is
+                # singular-shaped on Gemma 4 (parse_tool_call) and
+                # throws ValueError when the block doesn't contain
+                # a callable form — swallow that.
+                start_idx = 0
+                while True:
+                    s = cleaned.find(start, start_idx)
+                    if s == -1:
+                        break
+                    e = cleaned.find(end, s + len(start))
+                    if e == -1:
+                        break
+                    block = cleaned[s + len(start) : e]
+                    try:
+                        parsed = parser_fn(block)
+                    except Exception as ex:  # noqa: BLE001
+                        trace(f"native parser rejected block: {ex!s}")
+                        parsed = None
+                    # parse_tool_call returns a single dict; the
+                    # (rare) plural form returns a list.
+                    if isinstance(parsed, dict):
+                        normalised = _normalise_tool_call(
+                            parsed, len(calls) + 1
+                        )
+                        if normalised:
+                            calls.append(normalised)
+                    elif isinstance(parsed, list):
+                        for p in parsed:
+                            normalised = _normalise_tool_call(
+                                p, len(calls) + 1
+                            )
+                            if normalised:
+                                calls.append(normalised)
+                    # Remove the entire block from the visible text.
+                    cleaned = cleaned[:s] + cleaned[e + len(end):]
+                    start_idx = s  # rescan from same offset; block is gone
+                trace(
+                    f"native parser={parser_name!r} found={len(calls)} "
+                    f"(start={start!r})"
+                )
     except Exception as e:  # noqa: BLE001
         trace(f"native tool-parser unavailable: {e!s}")
 
