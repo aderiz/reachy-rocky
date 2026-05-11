@@ -1843,26 +1843,15 @@ final class AppServices {
             }
             return
         }
+        // start() throws SidecarError.alreadyRunning if the sidecar
+        // is already in .ready or .starting state — that's not a
+        // failure, just "already up." Suppress it; any other error
+        // is real and demotes us to LMStudioBrain.
         do {
             try await brainSidecar.start()
-            // If the user changed `brainModel` since the last apply,
-            // the sidecar's loaded model still matches whatever env
-            // it spawned with. Send `set_model` to hot-swap.
-            await self.requestBrainModel(settings.brainModel)
-            let mlx = MLXVLMBrain(sidecar: brainSidecar, logBus: logBus)
-            await cognition.setBrain(mlx)
-            // Wire the latest camera frame so the VLM has eyes.
-            let provider: CognitionEngine.ImageProvider = { [weak self] in
-                guard let self else { return nil }
-                let frame = await MainActor.run { self.lastCameraFrame }
-                return frame.map { BrainImage(jpegData: $0.jpeg) }
-            }
-            await cognition.setImageProvider(provider)
-            await logBus.publish(.sidecarLog(
-                sidecar: "brain", level: .info,
-                message: "Brain backend: MLX-VLM (\(settings.brainModel))",
-                fields: [:]
-            ))
+        } catch SidecarError.alreadyRunning {
+            // Expected on re-apply (e.g. user changed model in
+            // Settings — the sidecar is still running from boot).
         } catch {
             await cognition.setBrain(LMStudioBrain(client: llm))
             await cognition.setImageProvider(nil)
@@ -1873,7 +1862,27 @@ final class AppServices {
                     recoverable: true
                 ))
             }
+            return
         }
+        // If the user changed `brainModel` since the last apply,
+        // the sidecar's loaded model still matches whatever env it
+        // spawned with. Send `set_model` to hot-swap. No-op when the
+        // requested model is already loaded.
+        await self.requestBrainModel(settings.brainModel)
+        let mlx = MLXVLMBrain(sidecar: brainSidecar, logBus: logBus)
+        await cognition.setBrain(mlx)
+        // Wire the latest camera frame so the VLM has eyes.
+        let provider: CognitionEngine.ImageProvider = { [weak self] in
+            guard let self else { return nil }
+            let frame = await MainActor.run { self.lastCameraFrame }
+            return frame.map { BrainImage(jpegData: $0.jpeg) }
+        }
+        await cognition.setImageProvider(provider)
+        await logBus.publish(.sidecarLog(
+            sidecar: "brain", level: .info,
+            message: "Brain backend: MLX-VLM (\(settings.brainModel))",
+            fields: [:]
+        ))
     }
 
     /// Returns nil if the active brain backend is online and ready
