@@ -309,6 +309,14 @@ public actor SidecarRuntime: Sidecar {
             stderrBuffer.removeSubrange(stderrBuffer.startIndex...nl)
             let text = String(data: line, encoding: .utf8) ?? ""
             if !text.isEmpty {
+                // Mirror to the parent's stderr so Console.app /
+                // terminal launches can see sidecar diagnostic
+                // output (e.g. brain's chat_stream traces) without
+                // having to open the in-app Logs view.
+                let prefixed = "[sidecar:\(name)] \(text)\n"
+                if let data = prefixed.data(using: .utf8) {
+                    FileHandle.standardError.write(data)
+                }
                 await logBus.publish(.sidecarLog(
                     sidecar: name, level: .info, message: text, fields: ["stream": "stderr"]
                 ))
