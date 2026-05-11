@@ -1,50 +1,34 @@
 """Brain sidecar runner — JSON-line wire over stdin/stdout.
 
-Honors Rocky's `SidecarHost` contract (`docs/concepts/sidecar-convention.md`):
-emits a one-shot `{"event":"ready"}` on stdout once the model is loaded
-and ready to serve requests; thereafter handles `chat_stream` /
-`set_model` / `health` requests by their `id` correlation.
+Follows the mlx-vlm v0.5.0 canonical chat pattern from
+`mlx_vlm/chat.py` exactly:
 
-Streaming protocol for `chat_stream`:
+  - messages use the OpenAI content-parts shape:
+        {"role": "...", "content": [{"type": "text", "text": "..."}]}
+  - apply_chat_template receives `model.config` (the object, not a
+    dict) and the typed `tools=` kwarg
+  - chat_template_kwargs={"enable_thinking": False} suppresses the
+    thinking channel on models that support it
+  - images travel as a list of `data:image/...;base64,...` URIs which
+    mlx-vlm's `load_image` decodes natively
+  - vision_cache + prompt_cache_state are per-instance (KV cache
+    reuse across turns; first-frame vision encode cached when the
+    same image is sent twice)
+  - chunk iteration is `chunk.text` directly — `GenerationResult` is
+    the canonical type
+  - tool calls are extracted via mlx_vlm.tool_parsers's gemma4 parser
+    when the model emits the Gemma 4 `<|tool_call>...<tool_call|>`
+    format; otherwise the fenced-JSON path runs as a fallback
 
-    Request:
-      {"id":"<id>", "method":"chat_stream",
-       "params":{
-         "messages": [{"role":"system","content":"..."}, ...],
-         "tools": [...optional OpenAI tool schemas...],
-         "image_b64": "<optional base64 JPEG>",
-         "max_tokens": 768,
-         "temperature": 0.6
-       }}
-
-    Stream:
-      {"id":"<id>","stream":{"delta":"<token-text>"}}
-      {"id":"<id>","stream":{"delta":"<token-text>"}}
-      ...
-      {"id":"<id>","stream":{"tool_call":{
-          "id":"call_xyz","name":"get_weather","arguments":"{...}"}}}
-      {"id":"<id>","stream_end":true}
-
-    Final result:
-      {"id":"<id>","result":{
-          "text":"<full reply>",
-          "tool_calls":[...],
-          "stop_reason":"length"|"stop"|"eos"|"tool_calls",
-          "vision_cache_hit": true|false }}
-
-For now `tool_calls` are extracted post-hoc from the assistant's
-text via a fenced-JSON / `<tool_call>` parser identical in spirit to
-the v0.1 fenced-JSON path on `LMStudioClient`. Native Qwen3-coder
-tool calling emits inside `<tool_call>...</tool_call>` tags; we
-strip those from the user-facing text and surface them as discrete
-events.
+The streaming wire to Swift stays the same: `delta` events per chunk,
+`tool_call` events for each parsed invocation, `stream_end`, then a
+final `result` envelope.
 """
 
 from __future__ import annotations
 
 import base64
 import hashlib
-import io
 import json
 import logging
 import os
@@ -54,10 +38,6 @@ import threading
 import time
 from collections import OrderedDict
 from typing import Any, Optional
-
-# Heavy imports go inside `Brain.load()` so the manifest's
-# ready_timeout_s budget covers the actual model load, not Python
-# import overhead.
 
 logger = logging.getLogger("rocky.brain")
 LOCK = threading.Lock()
@@ -71,7 +51,6 @@ def emit(envelope: dict) -> None:
 
 
 def emit_log(level: str, message: str, **fields: Any) -> None:
-    """Structured log line consumed by Rocky's LogBus."""
     emit({
         "log": {
             "level": level,
@@ -82,54 +61,112 @@ def emit_log(level: str, message: str, **fields: Any) -> None:
     })
 
 
+def trace(line: str) -> None:
+    sys.stderr.write(f"[brain.py] {line}\n")
+    sys.stderr.flush()
+
+
 # ---------------------------------------------------------------------------
-# Tool-call parser
+# Tool-call extraction
 # ---------------------------------------------------------------------------
 
-# Qwen3-coder format: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
-TOOL_CALL_TAG = re.compile(
-    r"<tool_call>\s*(?P<json>\{[\s\S]*?\})\s*</tool_call>",
-    flags=re.IGNORECASE,
-)
+# Fallback: catch the few wrappers we know about regardless of the
+# model's preferred format. The native mlx-vlm `gemma4` parser is
+# tried first for models whose template uses `<|tool_call>` /
+# `<tool_call|>`; this regex picks up anything else (Qwen3 fenced
+# JSON, OpenAI-style `<tool_call>...</tool_call>`).
+FALLBACK_TOOL_CALL_PATTERNS = [
+    re.compile(r"<tool_call>\s*(?P<json>\{[\s\S]*?\})\s*</tool_call>", re.I),
+    re.compile(r"```json\s*(?P<json>\{[\s\S]*?\})\s*```", re.I),
+]
 
 
-def split_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
-    """Strip <tool_call>...</tool_call> blocks from `text`, return
-    (cleaned_text, [tool_call_dicts]). Each tool_call is normalised
-    to {"id": ..., "name": ..., "arguments": "<json-string>"} so it
-    drops directly into the OpenAI-shape `tool_calls` Rocky's
-    CognitionEngine expects.
-    """
-    calls: list[dict[str, Any]] = []
-    counter = [0]
+def _normalise_tool_call(payload: Any, idx: int) -> Optional[dict]:
+    """Coerce whatever the parser/regex spat out into the OpenAI shape
+    `{"id":..., "name":..., "arguments":<json-str>}`."""
+    if not isinstance(payload, dict):
+        return None
+    name = payload.get("name") or payload.get("tool") or payload.get("function")
+    if isinstance(name, dict):
+        name = name.get("name")
+    if not isinstance(name, str):
+        return None
+    arguments = (
+        payload.get("arguments")
+        or payload.get("args")
+        or payload.get("parameters")
+        or {}
+    )
+    if isinstance(arguments, dict):
+        arguments_str = json.dumps(arguments, separators=(",", ":"))
+    elif isinstance(arguments, str):
+        arguments_str = arguments
+    else:
+        arguments_str = json.dumps(arguments)
+    return {
+        "id": f"call_brain_{idx}",
+        "name": name,
+        "arguments": arguments_str,
+    }
 
-    def replace(match: re.Match) -> str:
-        try:
-            payload = json.loads(match.group("json"))
-        except json.JSONDecodeError:
-            # Malformed tool_call — leave the text intact for the user
-            # so it isn't silently swallowed.
-            return match.group(0)
-        name = payload.get("name") or payload.get("tool")
-        if not isinstance(name, str):
-            return match.group(0)
-        arguments = payload.get("arguments") or payload.get("args") or {}
-        if isinstance(arguments, dict):
-            arguments_str = json.dumps(arguments, separators=(",", ":"))
-        elif isinstance(arguments, str):
-            arguments_str = arguments
-        else:
-            arguments_str = json.dumps(arguments)
-        counter[0] += 1
-        calls.append({
-            "id": f"call_brain_{counter[0]}",
-            "name": name,
-            "arguments": arguments_str,
-        })
-        return ""
 
-    cleaned = TOOL_CALL_TAG.sub(replace, text).strip()
-    return cleaned, calls
+def extract_tool_calls(
+    text: str, processor
+) -> tuple[str, list[dict]]:
+    """Strip recognised tool-call wrappers from `text` and return
+    (cleaned_text, [normalised_call_dicts])."""
+    calls: list[dict] = []
+    cleaned = text
+
+    # Native parser via the model's chat-template fingerprint.
+    try:
+        from mlx_vlm.tool_parsers import (
+            _infer_tool_parser_from_processor,
+            load_tool_module,
+        )
+
+        parser_name = _infer_tool_parser_from_processor(processor)
+        if parser_name:
+            module = load_tool_module(parser_name)
+            # Most parsers expose either `parse_tool_calls(text) ->
+            # list` or `tool_call_start` / `tool_call_end` markers
+            # we can strip after parsing. Try the first; the
+            # gemma4 parser exposes `parse_tool_calls`.
+            parser_fn = getattr(module, "parse_tool_calls", None)
+            if callable(parser_fn):
+                native_calls = parser_fn(cleaned) or []
+                trace(f"native parser={parser_name!r} found={len(native_calls)}")
+                for c in native_calls:
+                    normalised = _normalise_tool_call(c, len(calls) + 1)
+                    if normalised:
+                        calls.append(normalised)
+                start = getattr(module, "tool_call_start", None)
+                end = getattr(module, "tool_call_end", None)
+                if start and end:
+                    pattern = re.compile(
+                        re.escape(start) + r"[\s\S]*?" + re.escape(end)
+                    )
+                    cleaned = pattern.sub("", cleaned)
+    except Exception as e:  # noqa: BLE001
+        trace(f"native tool-parser unavailable: {e!s}")
+
+    # Fallback patterns (Qwen / generic fenced-JSON / OpenAI-style).
+    if not calls:
+        for pat in FALLBACK_TOOL_CALL_PATTERNS:
+            def _consume(match: re.Match) -> str:
+                try:
+                    payload = json.loads(match.group("json"))
+                except json.JSONDecodeError:
+                    return match.group(0)
+                normalised = _normalise_tool_call(payload, len(calls) + 1)
+                if normalised:
+                    calls.append(normalised)
+                    return ""
+                return match.group(0)
+
+            cleaned = pat.sub(_consume, cleaned)
+
+    return cleaned.strip(), calls
 
 
 # ---------------------------------------------------------------------------
@@ -138,36 +175,42 @@ def split_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
 
 
 class Brain:
-    """Wraps an mlx-vlm model + processor, vision encoder cache, and
-    the core `chat_stream` loop. Single-threaded by design; the runner
-    serialises requests with `LOCK` so two `chat_stream` calls don't
-    fight over the model state."""
+    """Wraps an mlx-vlm model + processor + per-instance caches. Single-
+    threaded by design; the runner serialises requests with `LOCK` so two
+    `chat_stream` calls don't fight."""
 
     def __init__(self, model_id: str) -> None:
         self.model_id = model_id
         self.model = None
         self.processor = None
-        self.vision_cache: OrderedDict[str, Any] = OrderedDict()
-        self.vision_cache_size = int(
-            os.environ.get("ROCKY_BRAIN_VISION_CACHE_SIZE", "8")
-        )
+        self.vision_cache = None
+        self.prompt_cache_state = None
         self.default_max_tokens = int(
             os.environ.get("ROCKY_BRAIN_MAX_TOKENS", "768")
         )
         self.default_temperature = float(
             os.environ.get("ROCKY_BRAIN_TEMPERATURE", "0.6")
         )
+        # User-configurable: thinking-channel models (gemma 4, Harmony
+        # variants) emit `<|channel|>thought<channel|>...` before the
+        # final answer. Default off so Rocky gets the direct response.
+        self.enable_thinking = (
+            os.environ.get("ROCKY_BRAIN_ENABLE_THINKING", "").lower()
+            in {"1", "true", "yes"}
+        )
 
     def load(self) -> None:
-        # Lazy heavy imports.
-        from mlx_vlm import load as mlx_load  # type: ignore
+        from mlx_vlm import load as mlx_load
+        from mlx_vlm.vision_cache import VisionFeatureCache
+        from mlx_vlm.generate import PromptCacheState
 
-        emit_log("info", "loading brain model", model=self.model_id)
+        trace(f"loading model {self.model_id}")
         started = time.monotonic()
-        model, processor = mlx_load(self.model_id)
-        self.model = model
-        self.processor = processor
+        self.model, self.processor = mlx_load(self.model_id)
+        self.vision_cache = VisionFeatureCache()
+        self.prompt_cache_state = PromptCacheState()
         elapsed_ms = int((time.monotonic() - started) * 1000)
+        trace(f"model loaded in {elapsed_ms} ms")
         emit_log(
             "info",
             "brain model loaded",
@@ -176,14 +219,13 @@ class Brain:
         )
 
     def hot_swap(self, model_id: str) -> None:
-        """Replace the in-memory model with a new one. Drops the
-        vision cache because the encoder is part of the model."""
         if model_id == self.model_id and self.model is not None:
             return
         self.model_id = model_id
         self.model = None
         self.processor = None
-        self.vision_cache.clear()
+        self.vision_cache = None
+        self.prompt_cache_state = None
         self.load()
 
     def health(self) -> dict[str, Any]:
@@ -191,25 +233,51 @@ class Brain:
             "backend": "mlx-vlm",
             "model": self.model_id,
             "loaded": self.model is not None,
-            "vision_cache_size": len(self.vision_cache),
-            "vision_cache_capacity": self.vision_cache_size,
+            "enable_thinking": self.enable_thinking,
         }
 
     # ------------------------------------------------------------------
     # Chat
     # ------------------------------------------------------------------
 
+    def _to_content_parts(self, messages: list[dict]) -> list[dict]:
+        """Convert OpenAI-shape `{"role":..., "content": "..."}` messages
+        to mlx-vlm's `{"role":..., "content": [{"type":"text","text":...}]}`
+        shape. Tool-shaped messages (with `tool_calls` or
+        `tool_call_id`) are passed through verbatim — mlx-vlm's
+        templater preserves them for the Jinja tool path."""
+        out: list[dict] = []
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            if not isinstance(role, str):
+                continue
+            # Pass tool-call-bearing messages straight through so the
+            # template's tool-calling branch sees them.
+            if "tool_calls" in m or "tool_call_id" in m or role == "tool":
+                out.append(m)
+                continue
+            raw_content = m.get("content")
+            if isinstance(raw_content, list):
+                # Already in parts form — pass through.
+                out.append({"role": role, "content": raw_content})
+                continue
+            text = raw_content if isinstance(raw_content, str) else ""
+            out.append({
+                "role": role,
+                "content": [{"type": "text", "text": text}],
+            })
+        return out
+
     def chat_stream(self, request_id: str, params: dict[str, Any]) -> None:
-        """Drive a single chat turn. Emits `stream` envelopes for each
-        token delta + a final `result` envelope. Catches and surfaces
-        errors as `error` envelopes so the caller can recover."""
-        from mlx_vlm import stream_generate  # type: ignore
-        from mlx_vlm.prompt_utils import apply_chat_template  # type: ignore
+        from mlx_vlm import stream_generate
+        from mlx_vlm.prompt_utils import apply_chat_template
 
         if self.model is None:
             self.load()
 
-        messages = params.get("messages") or []
+        raw_messages = params.get("messages") or []
         tools = params.get("tools") or []
         image_b64 = params.get("image_b64")
         max_tokens = int(params.get("max_tokens") or self.default_max_tokens)
@@ -217,206 +285,97 @@ class Brain:
             params.get("temperature") or self.default_temperature
         )
 
-        # Fold tool schemas into the SYSTEM message before templating.
-        # Appending to the templated string (after `apply_chat_template`)
-        # places the tool listing inside the assistant turn — Gemma/
-        # Qwen treat it as already-emitted assistant output and produce
-        # zero tokens. Putting it in the system message keeps the chat
-        # template's assistant boundary intact and the model knows the
-        # turn hasn't started yet. Many tokenizer templates also accept
-        # a `tools=` kwarg natively; we try that first.
-        templated_messages = [dict(m) for m in messages]  # shallow copies
-        if tools:
-            tool_lines = []
-            for t in tools:
-                fn = t.get("function") if isinstance(t, dict) else None
-                if isinstance(fn, dict):
-                    name = fn.get("name", "?")
-                    desc = fn.get("description", "")
-                    tool_lines.append(f"- {name}: {desc}")
-            tools_system_block = (
-                "You have access to these tools. To call one, emit exactly "
-                "<tool_call>{\"name\":\"<tool>\",\"arguments\":{...}}</tool_call> "
-                "in your response — nothing else inside the tags. "
-                "Available tools:\n" + "\n".join(tool_lines)
-            )
-            if templated_messages and templated_messages[0].get("role") == "system":
-                templated_messages[0]["content"] = (
-                    (templated_messages[0].get("content") or "")
-                    + "\n\n"
-                    + tools_system_block
-                )
-            else:
-                templated_messages.insert(
-                    0, {"role": "system", "content": tools_system_block}
-                )
+        messages = self._to_content_parts(raw_messages)
 
-        # Compose the prompt via the model's chat template. mlx-vlm's
-        # `apply_chat_template` accepts a list of message dicts and
-        # places image/audio tokens only on the last user message.
+        # Image: pass as a data URI which mlx-vlm's `load_image`
+        # decodes natively. Lists per the canonical chat.py.
+        image_list = None
+        if image_b64:
+            image_list = [f"data:image/jpeg;base64,{image_b64}"]
+
+        # Apply chat template using model.config (the OBJECT, not a
+        # dict) and native tools=. enable_thinking forwarded.
         try:
-            num_images = 1 if image_b64 else 0
-            cfg = getattr(self.model, "config", None) or getattr(
-                self.processor, "config", None
+            prompt = apply_chat_template(
+                self.processor,
+                self.model.config,
+                messages,
+                num_images=1 if image_list else 0,
+                tools=tools or None,
+                enable_thinking=self.enable_thinking,
             )
-            # Try the native `tools=` kwarg first; falls back to the
-            # already-folded system-message path if the tokenizer
-            # template rejects it.
-            try:
-                prompt = apply_chat_template(
-                    self.processor, cfg, templated_messages,
-                    num_images=num_images,
-                    tools=tools or None,
-                )
-            except Exception:
-                prompt = apply_chat_template(
-                    self.processor, cfg, templated_messages,
-                    num_images=num_images,
-                )
-        except Exception as e:  # noqa: BLE001 — surface the error
-            sys.stderr.write(f"[brain.py] apply_chat_template FAILED: {e!s}\n")
-            sys.stderr.flush()
+        except TypeError:
+            # Older mlx-vlm builds don't accept `tools=` and/or
+            # `enable_thinking=` — retry without them.
+            prompt = apply_chat_template(
+                self.processor,
+                self.model.config,
+                messages,
+                num_images=1 if image_list else 0,
+            )
+        except Exception as e:  # noqa: BLE001
+            trace(f"apply_chat_template FAILED: {e!s}")
             emit({
                 "id": request_id,
-                "error": {
-                    "code": 500,
-                    "message": f"prompt template failed: {e!s}",
-                },
+                "error": {"code": 500, "message": f"prompt template failed: {e!s}"},
             })
             return
-        sys.stderr.write(
-            f"[brain.py] chat_stream: messages={len(messages)} "
-            f"tools={len(tools or [])} image={'yes' if image_b64 else 'no'} "
+
+        trace(
+            f"chat_stream: messages={len(messages)} tools={len(tools)} "
+            f"image={'yes' if image_list else 'no'} "
             f"prompt_chars={len(prompt)} "
-            f"tail={prompt[-120:]!r}\n"
+            f"enable_thinking={self.enable_thinking}"
         )
-        sys.stderr.flush()
 
-        # Image: decode base64 → PIL image.
-        image_args: list[Any] = []
-        vision_cache = None
-        cache_hit = False
-        if image_b64:
-            try:
-                from PIL import Image  # type: ignore
-                img_bytes = base64.b64decode(image_b64)
-                image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                image_args = [image]
-                # Vision encoder cache, keyed by SHA256(image_b64).
-                key = hashlib.sha256(img_bytes).hexdigest()[:16]
-                if key in self.vision_cache:
-                    vision_cache = self.vision_cache[key]
-                    cache_hit = True
-                    self.vision_cache.move_to_end(key)
-                else:
-                    try:
-                        from mlx_vlm import VisionFeatureCache  # type: ignore
-                        vision_cache = VisionFeatureCache()
-                    except ImportError:
-                        vision_cache = None
-                    self.vision_cache[key] = vision_cache
-                    if len(self.vision_cache) > self.vision_cache_size:
-                        self.vision_cache.popitem(last=False)
-            except Exception as e:  # noqa: BLE001
-                emit_log("warn", "image decode failed; skipping vision", error=str(e))
-                image_args = []
-                vision_cache = None
-
-        # Stream tokens. Some Gemma / non-VLM-shaped MLX builds
-        # accept image kwargs but generate zero tokens when the
-        # image is present (the model's tokenizer adds an <image>
-        # placeholder it can't decode). Retry once without the
-        # image if the first attempt yields nothing.
-        def _run(use_image: bool) -> tuple[list[str], int, int]:
-            buf: list[str] = []
-            chunks_seen = 0
-            kwargs: dict[str, Any] = {
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-            }
-            if use_image and image_args:
-                kwargs["image"] = image_args
-            if use_image and vision_cache is not None:
-                kwargs["vision_cache"] = vision_cache
-            sys.stderr.write(
-                f"[brain.py] stream_generate begin: prompt_len={len(prompt)} "
-                f"use_image={use_image} max_tokens={max_tokens}\n"
-            )
-            sys.stderr.flush()
-            first_chunk_logged = False
+        # Stream tokens.
+        text_buffer: list[str] = []
+        chunks_seen = 0
+        try:
             for chunk in stream_generate(
-                self.model, self.processor, prompt, **kwargs
+                self.model,
+                self.processor,
+                prompt,
+                image=image_list,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                vision_cache=self.vision_cache,
+                prompt_cache_state=self.prompt_cache_state,
             ):
                 chunks_seen += 1
-                if not first_chunk_logged:
-                    first_chunk_logged = True
-                    sys.stderr.write(
-                        f"[brain.py] first chunk type={type(chunk).__name__} "
-                        f"attrs={sorted(vars(chunk).keys()) if hasattr(chunk, '__dict__') else 'str'} "
-                        f"repr={chunk!r}\n"[:600]
+                if chunks_seen == 1:
+                    trace(
+                        f"first chunk type={type(chunk).__name__} "
+                        f"prompt_tokens={getattr(chunk, 'prompt_tokens', '?')} "
+                        f"prompt_tps={getattr(chunk, 'prompt_tps', 0):.1f}"
                     )
-                    sys.stderr.flush()
-                # GenerationResult has .text (str). Plain-str chunks
-                # are also seen in some mlx-vlm builds — handle both.
-                if isinstance(chunk, str):
-                    delta = chunk
-                else:
-                    delta = getattr(chunk, "text", "") or ""
+                delta = getattr(chunk, "text", "") if not isinstance(chunk, str) else chunk
                 if delta:
-                    buf.append(delta)
+                    text_buffer.append(delta)
                     emit({"id": request_id, "stream": {"delta": delta}})
-            sys.stderr.write(
-                f"[brain.py] stream_generate end: text_len={sum(len(s) for s in buf)} "
-                f"chunks_seen={chunks_seen}\n"
-            )
-            sys.stderr.flush()
-            return buf, chunks_seen, sum(len(s) for s in buf)
-
-        text_buffer: list[str] = []
-        try:
-            text_buffer, _, total = _run(use_image=bool(image_args))
-            if total == 0 and image_args:
-                sys.stderr.write(
-                    "[brain.py] zero tokens with image — retrying without\n"
-                )
-                sys.stderr.flush()
-                text_buffer, _, _ = _run(use_image=False)
         except Exception as e:  # noqa: BLE001
-            sys.stderr.write(f"[brain.py] generate FAILED: {e!s}\n")
-            sys.stderr.flush()
+            trace(f"stream_generate FAILED: {e!s}")
             emit({
                 "id": request_id,
-                "error": {
-                    "code": 500,
-                    "message": f"generate failed: {e!s}",
-                },
+                "error": {"code": 500, "message": f"generate failed: {e!s}"},
             })
             return
 
-        # Post-process: extract any <tool_call>...</tool_call> blocks
-        # and strip them from the user-visible text.
         full_text = "".join(text_buffer)
-        cleaned_text, tool_calls = split_tool_calls(full_text)
+        trace(f"generate done: text_len={len(full_text)} chunks_seen={chunks_seen}")
 
-        # Stream-emit each tool call so callers can dispatch as soon
-        # as they land (CognitionEngine expects the same shape).
+        # Extract any tool calls the model emitted.
+        cleaned_text, tool_calls = extract_tool_calls(full_text, self.processor)
         for tc in tool_calls:
-            emit({
-                "id": request_id,
-                "stream": {"tool_call": tc},
-            })
+            emit({"id": request_id, "stream": {"tool_call": tc}})
 
-        emit({
-            "id": request_id,
-            "stream_end": True,
-        })
+        emit({"id": request_id, "stream_end": True})
         emit({
             "id": request_id,
             "result": {
                 "text": cleaned_text,
                 "tool_calls": tool_calls,
                 "stop_reason": "stop",
-                "vision_cache_hit": cache_hit,
             },
         })
 
@@ -435,17 +394,7 @@ def serve() -> None:
     try:
         brain.load()
     except Exception as e:  # noqa: BLE001
-        emit({
-            "log": {
-                "level": "error",
-                "ts": time.time(),
-                "msg": f"brain failed to load: {e!s}",
-                "fields": {"model": model_id},
-            }
-        })
-        # Still emit ready so the supervisor sees us — health() will
-        # report `loaded: false` and the caller can decide to fall
-        # back to the LM Studio backend.
+        emit_log("error", f"brain failed to load: {e!s}", model=model_id)
     emit({"event": "ready", "payload": {"model": model_id}})
 
     for line in sys.stdin:
@@ -455,10 +404,7 @@ def serve() -> None:
         try:
             envelope = json.loads(line)
         except json.JSONDecodeError as e:
-            emit({
-                "id": None,
-                "error": {"code": 400, "message": f"invalid JSON: {e!s}"},
-            })
+            emit({"id": None, "error": {"code": 400, "message": f"invalid JSON: {e!s}"}})
             continue
         request_id = envelope.get("id")
         method = envelope.get("method")
@@ -471,35 +417,24 @@ def serve() -> None:
         if method == "set_model":
             target = params.get("name")
             if not isinstance(target, str) or not target:
-                emit({
-                    "id": request_id,
-                    "error": {"code": 400, "message": "missing 'name'"},
-                })
+                emit({"id": request_id, "error": {"code": 400, "message": "missing 'name'"}})
                 continue
             try:
                 brain.hot_swap(target)
                 emit({"id": request_id, "result": {"model": target}})
             except Exception as e:  # noqa: BLE001
-                emit({
-                    "id": request_id,
-                    "error": {"code": 500, "message": f"set_model: {e!s}"},
-                })
+                emit({"id": request_id, "error": {"code": 500, "message": f"set_model: {e!s}"}})
             continue
 
         if method == "chat_stream":
             try:
                 brain.chat_stream(request_id, params)
             except Exception as e:  # noqa: BLE001
-                emit({
-                    "id": request_id,
-                    "error": {"code": 500, "message": f"chat_stream: {e!s}"},
-                })
+                trace(f"chat_stream dispatch FAILED: {e!s}")
+                emit({"id": request_id, "error": {"code": 500, "message": f"chat_stream: {e!s}"}})
             continue
 
-        emit({
-            "id": request_id,
-            "error": {"code": 404, "message": f"unknown method: {method}"},
-        })
+        emit({"id": request_id, "error": {"code": 404, "message": f"unknown method: {method}"}})
 
 
 if __name__ == "__main__":
