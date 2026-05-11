@@ -253,6 +253,12 @@ class Brain:
                 "block in your response:\n" + tool_schemas_json
             )
             prompt = prompt + tool_note
+        sys.stderr.write(
+            f"[brain.py] chat_stream: messages={len(messages)} "
+            f"tools={len(tools or [])} image={'yes' if image_b64 else 'no'} "
+            f"prompt_chars={len(prompt)}\n"
+        )
+        sys.stderr.flush()
 
         # Image: decode base64 → PIL image.
         image_args: list[Any] = []
@@ -284,29 +290,54 @@ class Brain:
                 image_args = []
                 vision_cache = None
 
-        # Stream tokens.
-        text_buffer: list[str] = []
-        try:
+        # Stream tokens. Some Gemma / non-VLM-shaped MLX builds
+        # accept image kwargs but generate zero tokens when the
+        # image is present (the model's tokenizer adds an <image>
+        # placeholder it can't decode). Retry once without the
+        # image if the first attempt yields nothing.
+        def _run(use_image: bool) -> tuple[list[str], int, int]:
+            buf: list[str] = []
+            chunks_seen = 0
             kwargs: dict[str, Any] = {
                 "max_tokens": max_tokens,
                 "temperature": temperature,
             }
-            if image_args:
+            if use_image and image_args:
                 kwargs["image"] = image_args
-            if vision_cache is not None:
+            if use_image and vision_cache is not None:
                 kwargs["vision_cache"] = vision_cache
-
+            sys.stderr.write(
+                f"[brain.py] stream_generate begin: prompt_len={len(prompt)} "
+                f"use_image={use_image} max_tokens={max_tokens}\n"
+            )
+            sys.stderr.flush()
             for chunk in stream_generate(
                 self.model, self.processor, prompt, **kwargs
             ):
+                chunks_seen += 1
                 delta = getattr(chunk, "text", None)
                 if delta:
-                    text_buffer.append(delta)
-                    emit({
-                        "id": request_id,
-                        "stream": {"delta": delta},
-                    })
+                    buf.append(delta)
+                    emit({"id": request_id, "stream": {"delta": delta}})
+            sys.stderr.write(
+                f"[brain.py] stream_generate end: text_len={sum(len(s) for s in buf)} "
+                f"chunks_seen={chunks_seen}\n"
+            )
+            sys.stderr.flush()
+            return buf, chunks_seen, sum(len(s) for s in buf)
+
+        text_buffer: list[str] = []
+        try:
+            text_buffer, _, total = _run(use_image=bool(image_args))
+            if total == 0 and image_args:
+                sys.stderr.write(
+                    "[brain.py] zero tokens with image — retrying without\n"
+                )
+                sys.stderr.flush()
+                text_buffer, _, _ = _run(use_image=False)
         except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"[brain.py] generate FAILED: {e!s}\n")
+            sys.stderr.flush()
             emit({
                 "id": request_id,
                 "error": {
