@@ -176,14 +176,65 @@ Hero card surfaces the latest.
 ## Echo gate
 
 When Rocky speaks, his TTS bleeds into his own mic and the STT pipeline
-will dutifully transcribe it. The gate that prevents this is in
-`AppServices.say` (the tool handler): it stamps `ttsBusyUntil` to
-`Date() + estimated_speech_duration + 1.5s_tail` *before* the
-`robotTTS.speak` await begins, and the voice-output handler discards
-final transcripts whose timestamp falls inside that window. The 1.5 s
-tail covers the fall-off of the speaker after the audio frame itself
-ends. Without this, Rocky frequently dispatched fragments of his own
-last reply as the user's next input.
+will dutifully transcribe it. Two gates running side by side:
+
+- **Streaming path (default since v0.2 with Qwen3-TTS).**
+  `StreamingTTS.playToRobot` flips `isSpeaking = true` on the **first
+  PCM chunk** emitted by the sidecar (echo gate engages as soon as
+  synthesis starts, not when the robot begins playing), and flips back
+  off after `durationS + sttPostRollS` (default 0.5 s) has elapsed.
+  This is the ground-truth signal the persona's M6 plan asked for —
+  `ttsBusyUntil` is updated from `isSpeakingStream` rather than guessed.
+- **Legacy non-streaming path (Chatterbox or any backend reporting
+  `streams: false`).** `AppServices.say` stamps `ttsBusyUntil` to
+  `Date() + estimated_speech_duration + 1.5s_tail` before the
+  `robotTTS.speak` await begins, then refines after `speak` returns
+  with the real `durationS + 1.5s`. The voice-output handler discards
+  finals whose timestamp falls inside the window.
+
+In both cases the 0.5–1.5 s tail covers the fall-off of the speaker
+after the audio frame itself ends. Without this, Rocky frequently
+dispatched fragments of his own last reply as the user's next input.
+
+## TTS playback target — robot speaker only
+
+Synthesised audio always plays through the **robot speaker**, never
+the Mac. Both the legacy `RobotTTS.speak` (full-WAV → upload →
+`play_sound`) and the streaming `speakStreaming` (PCM chunks
+accumulated by `StreamingTTS.playToRobot` → single WAV → upload →
+`play_sound`) terminate at the daemon's `/api/media/play_sound`
+endpoint. The `AVAudioEngine`-backed Mac-local path in
+`StreamingTTS.play(chunks:)` still exists for testing but has no
+production caller.
+
+The trade-off is that chunked streaming through the robot is not
+incremental — we wait for synthesis to finish before sending the
+WAV — because the daemon's `play_sound` is not a streaming endpoint.
+First-chunk-on-Mac (97 ms target) becomes first-audio-on-robot
+(synthesis time + upload, currently ~3 s with ICL cloning on a 6 s
+reference). Trueing this up requires either chunked play_sound on
+the daemon side or a parallel WebRTC audio stream, neither of which
+exists yet.
+
+## Vision integration with the brain
+
+When the brain backend is MLX-VLM (the v0.2 default), the latest
+JPEG from `lastCameraFrame` is passed to the model at the start of
+every chat turn via the `imageProvider` closure in `CognitionEngine`.
+Rocky can answer questions about visible content ("what am I
+holding?", "how do I look?") because the model gets the pixels with
+the user's text in the same prompt. The persona (v6+) carries a
+VISION section with worked examples so the model actually uses the
+frame instead of falling back to "Rocky not know".
+
+Two toolbar toggles control the camera-to-brain feed:
+
+- **Vision** (`eye.fill` / `eye.slash.fill`) — gates the
+  `imageProvider`. Off = text-only conversation, camera sidecar
+  keeps running for the Vision card and face tracker.
+- **Face tracking** (`face.smiling.inverse` / `face.dashed`) — pauses
+  / resumes `MacFaceTracker.setEnabled` so the head stops following
+  faces but the camera keeps streaming.
 
 ## See also
 

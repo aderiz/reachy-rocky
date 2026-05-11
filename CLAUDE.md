@@ -4,12 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-**Rocky** — a native macOS app that acts as the *nervous system* for a **Reachy Mini Wireless** robot. Cognition (LM Studio brain), perception (face tracking), audition (mic + STT), voice (cloned-voice TTS via Chatterbox FP16), and observability all run on the Mac; the robot is reduced to a clean network endpoint over REST + WebSocket.
+**Rocky** — a native macOS app that acts as the *nervous system* for a **Reachy Mini Wireless** robot. Cognition (MLX-VLM brain with vision; LM Studio is the text-only fallback), perception (face tracking), audition (mic + STT), voice (cloned-voice TTS via Qwen3-TTS-12Hz-1.7B-Base-bf16 ICL), and observability all run on the Mac; the robot is reduced to a clean network endpoint over REST + WebSocket. Audio plays only through the robot speaker — the Mac stays silent.
 
 - **OS target**: macOS 15+, Apple Silicon. Swift 6, SwiftUI.
 - **Bundle ID**: `ai.amplified.Rocky` (drives TCC, `defaults read/write`, Console.app filtering).
 - **Robot variant**: Wireless (CM4 onboard, WiFi). Daemon at `http://reachy-mini.local:8000` — live OpenAPI snapshot in `docs/sources/daemon-openapi-1.7.1.md`.
-- **LLM**: LM Studio (OpenAI-compatible at `localhost:1234/v1`). Default model: `gemma-4-e4b-it-mlx`.
+- **Brain**: MLX-VLM sidecar (`Sidecars/brain/`) loading `mlx-community/Qwen3-VL-4B-Instruct-4bit` by default. Gemma 4 26B-A4B (also vision-capable) works via the same sidecar. LM Studio fallback at `localhost:1234/v1` when explicitly selected or auto + sidecar absent.
 
 The implementation plan lives at `~/.claude/plans/i-d-like-this-to-swirling-octopus.md`. Always read it for the rationale behind a structural choice before changing one.
 
@@ -73,14 +73,16 @@ Open `Package.swift` directly in Xcode for IDE indexing. Note: `⌘R` in Xcode r
 Each sidecar is independent. Setup is one-shot per sidecar:
 
 ```bash
+./Sidecars/brain/setup.sh                       # mlx-vlm + Qwen3-VL 4B Instruct 4-bit (~3.5 GB)
 ./Sidecars/face-tracker/setup.sh                # synthetic-target test scaffold (stdlib only)
-./Sidecars/mlx-tts/setup.sh                     # `say` backend (no deps)
-FT_EXTRAS=mlx ./Sidecars/mlx-tts/setup.sh       # Chatterbox FP16 via mlx-audio
+./Sidecars/mlx-tts/setup.sh                     # mlx-audio 0.4.3 + Qwen3-TTS-12Hz-1.7B-Base-bf16 (~3.5 GB)
 ./Sidecars/robot-mic/setup.sh                   # reachy_mini SDK over WebRTC
-./Sidecars/robot-camera/setup.sh                # reachy_mini SDK over WebRTC; feeds MacFaceTracker
+./Sidecars/robot-camera/setup.sh                # reachy_mini SDK over WebRTC; feeds MacFaceTracker + the brain's imageProvider
 ```
 
-Venvs are written to `~/Library/Application Support/Rocky/sidecars/<name>/.venv/`. AppServices auto-detects venv presence to pick defaults: robot mic when `robot-mic/.venv` exists, Chatterbox TTS when `mlx-tts/.venv` exists. The face-tracker sidecar runs in `synthetic` mode regardless of any `ROCKY_FT_MODE` setting — its `[sam]` extras and `sam` mode are unimplemented stubs (`runner.py:92-94`); real face tracking happens Swift-side in `Sources/Perception/MacFaceTracker.swift`.
+Venvs are written to `~/Library/Application Support/Rocky/sidecars/<name>/.venv/`. AppServices auto-detects venv presence: MLX-VLM brain when `brain/.venv` exists (else LM Studio fallback), robot mic when `robot-mic/.venv` exists, Qwen3-TTS when `mlx-tts/.venv` exists. The face-tracker sidecar runs in `synthetic` mode regardless of any `ROCKY_FT_MODE` setting — its `[sam]` extras and `sam` mode are unimplemented stubs (`runner.py:92-94`); real face tracking happens Swift-side in `Sources/Perception/MacFaceTracker.swift`.
+
+Voice cloning needs a reference clip + transcript in `~/Library/Application Support/Rocky/voice/`. The TTS backend auto-finds `reference.wav`+`reference.txt` first, then falls back to `sample.wav`+`sample.txt`. Trim the WAV to 3–10 s; longer references degrade ICL quality.
 
 ### Resetting state
 
@@ -125,5 +127,8 @@ When in doubt about a wire shape or daemon behaviour, re-fetch `http://reachy-mi
 
 - **Robot safety**: never stack motion-control changes. One tweak per iteration, verify calm, then next. After two failed tweaks in the same direction, stop and name the real problem; revert if needed.
 - **Face tracker design**: state-driven, world-frame target, critically-damped 50 Hz controller. Do **not** regress to per-frame P-control on raw image error. The shipped implementation lives in `Sources/Perception/MacFaceTracker.swift` (Apple Vision detection on `robot-camera` frames). The Python sidecar's `controller.py` is a parallel implementation for the synthetic-target test scaffold and the same design constraints apply if you ever bring an ML detector back inside it.
-- **Voice engine**: TTS uses **Chatterbox FP16** (via `mlx-audio`), not F5-TTS-MLX. The `say` backend is a placeholder.
+- **Voice engine**: TTS uses **Qwen3-TTS-12Hz-1.7B-Base-bf16** via `mlx-audio` 0.4.3 with ICL voice cloning (Base variant — the `CustomVoice` sibling can't clone). Call `Model.generate(... stream=True, streaming_interval=0.32)` directly; `mlx_audio.tts.generate.generate_audio` consumes the iterator internally for playback side effects. Chatterbox is the legacy fallback. The `say` backend is a placeholder.
+- **TTS playback target**: audio plays **only through the robot speaker** via `StreamingTTS.playToRobot` → daemon `play_sound`. The Mac-local `AVAudioEngine` path in `StreamingTTS.play(chunks:)` survives for testing but has no production caller.
+- **Brain backend selection**: `BrainBackend` protocol with two implementations — `MLXVLMBrain` (default, vision-aware) and `LMStudioBrain` (text-only fallback). The active backend is set via `SettingsStore.brainBackend` (`auto` / `mlx-vlm` / `lm-studio`). The camera frame is auto-fed to the brain via `CognitionEngine.imageProvider` when `AppServices.visionEnabled` is true.
+- **End-turn-after-say**: when the `say` tool fires, the cognition turn ends. Looping back to the brain after speaking causes the model to chatter with a different sentence than what was spoken, diverging chat and audio. Don't undo this without first making the bubble-vs-audio test pass.
 - **Don't band-aid**: when iterative single-parameter tweaks aren't fixing a complaint, the problem is in the signal or architecture, not the tuning. Stop, diagnose, propose a real fix or revert.

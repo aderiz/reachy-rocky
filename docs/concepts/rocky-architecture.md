@@ -42,30 +42,34 @@ Rocky is a native macOS app that acts as the *nervous system* for a Reachy Mini 
 |     |     |- AppleSpeechSTT (default; STTEngine protocol = pluggable)  |
 |     |     |- WakeFilter     (address-pattern + 60s window)              |
 |     |     |- VoiceCoordinator                                           |
-|     |     \- RobotTTS       (sidecar -> MediaClient -> robot speaker)   |
+|     |     |- StreamingTTS    (PCM chunks -> WAV -> robot speaker)       |
+|     |     \- RobotTTS        (sidecar -> StreamingTTS.playToRobot)      |
 |     |                                                                   |
 |     |--- Cognition                                                      |
-|     |     |- LMStudioClient (URLSession SSE, OpenAI-compatible)        |
-|     |     |- ToolRegistry   (8+ handlers wired into RobotLink/Voice)    |
-|     |     \- CognitionEngine (turn loop, tool dispatch, transcript)     |
-|     |                                                                   |
+|     |     |- BrainBackend protocol                                      |
+|     |     |   |- MLXVLMBrain    (default; brain sidecar, vision-aware)  |
+|     |     |   \- LMStudioBrain  (fallback; URLSession SSE, text-only)   |
+|     |     |- ToolRegistry   (handlers wired into RobotLink/Voice)       |
+|     |     \- CognitionEngine (turn loop, tool dispatch, transcript;     |
+|     |                         imageProvider feeds latest camera frame)  |
 |     |                                                                   |
 |     |--- Perception                                                     |
 |     |     \- MacFaceTracker  (Apple Vision; consumes robot-camera frames|
 |     |                         and pushes targets into TargetStreamer)   |
 |     |                                                                   |
 |     \--- SidecarSupervisor                                              |
+|           |- brain         (Python + mlx-vlm + Qwen3-VL 4B Instruct 4b) |
 |           |- face-tracker  (Python; synthetic-target test scaffold)     |
 |           |- robot-camera  (Python; WebRTC RGB stream)                  |
 |           |- robot-mic     (Python; WebRTC 4-mic ReSpeaker)             |
 |           |- mempalace     (Python; local memory store)                 |
-|           \- mlx-tts       (Python + Chatterbox FP16 [or `say`])        |
+|           \- mlx-tts       (Python + Qwen3-TTS-12Hz-1.7B-Base-bf16)     |
 |                                                                         |
 +-------------------------------------------------------------------------+
         |                                |                       |
         v                                v                       v
    reachy-mini.local:8000          localhost:1234/v1        local stdio
-   (REST + WS + WebRTC)            (LM Studio)              (sidecars)
+   (REST + WS + WebRTC)            (LM Studio fallback)     (sidecars)
 ```
 
 ## Threads of control
@@ -74,7 +78,7 @@ Live data flows in **three independent loops**, each with its own cadence and ow
 
 1. **Robot state loop** (~10 Hz). `StateSubscriber` reads the daemon's `WS /api/state/ws/full` stream → `LogBus.motorState` → `AppServices.lastRobotState` → `MotionCard` redraws.
 2. **Face-tracker target loop** (50 Hz). Active path: `robot-camera` JPEG stream → `MacFaceTracker` (Apple Vision `VNDetectFaceRectanglesRequest`) → EMA + critically-damped controller → `TargetStreamer` → `POST /api/move/set_target`. The Python `face-tracker` sidecar is a synthetic-target test scaffold (Lissajous), wired in via `FaceTrackerService` → `FaceTargetBridge` for development without a robot or camera.
-3. **Voice / brain / TTS loop** (event-driven). Mic → VAD → STT → WakeFilter → CognitionEngine → tool dispatch (which may invoke `RobotTTS.speak` → mlx-tts → MediaClient.upload + play_sound).
+3. **Voice / brain / TTS loop** (event-driven). Mic → VAD → STT → WakeFilter → `CognitionEngine` → at turn start `imageProvider()` captures `lastCameraFrame` (gated by `visionEnabled`) → `BrainBackend.chatStream(messages, tools, image)` → tool dispatch (which may invoke `say` → `RobotTTS.speakStreaming` → mlx-tts → PCM chunks → `StreamingTTS.playToRobot` → daemon `play_sound` on the robot speaker). The turn ends when `say` returns OK; the engine does not loop back to the brain after speaking. The chat bubble is the `say` tool's `text` argument, so chat and audio agree.
 
 These loops never call into each other directly. Cross-loop signaling happens through `LogBus`, Observable mirrors on the main actor, or actor-message methods (e.g. `setSuppressed`).
 

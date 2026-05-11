@@ -1,7 +1,7 @@
 ---
 title: Wiki Index
 type: index
-last_updated: 2026-05-08
+last_updated: 2026-05-11
 ---
 
 # Index
@@ -53,6 +53,7 @@ The catalog of every page in the wiki.
 - [0001 — Target platform](decisions/0001-target-platform.md) — Wireless on-robot Python is the default for upstream Pollen apps.
 - [0002 — Rocky as a macOS-native nervous system](decisions/0002-rocky-app.md) — explains why Rocky is a Swift app, not a Python app on the CM4.
 - [0003 — Sidecar convention for external processes](decisions/0003-sidecar-convention.md) — JSON manifests, line-delimited JSON wire format, supervisor with restart policy + circuit breaker.
+- [0005 — Brain backend as a protocol, MLX-VLM as the default](decisions/0005-brain-backend-protocol.md) — `BrainBackend` seam, vision-aware default, Status panel resolves rows by active backend.
 
 ## Rocky implementation
 

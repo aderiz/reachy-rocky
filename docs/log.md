@@ -2,6 +2,48 @@
 
 Append-only chronological record. Each entry: `## [YYYY-MM-DD] <op> | <subject>`. Run `grep "^## \[" log.md | tail -20` for the recent timeline.
 
+## [2026-05-11] code | Brain + TTS + vision: end-to-end fixes for the chat/audio divergence
+
+Closed three real defects and one missing feature spotted while testing the v0.2 stack on the `rearchitect` branch.
+
+**Brain runner — streaming-safe tool-call extraction.** Previously the runner streamed raw `<|tool_call>...<tool_call|>` markers to the UI then re-parsed them post-stream, which (a) leaked the markers into the chat bubble and (b) double-emitted tool_call events (one from the post-stream parse, one from the model retrying after the first call errored). New `StreamFilter` in `Sidecars/brain/rocky_brain/runner.py` suppresses bytes between the markers token-by-token, and emits each captured block exactly once via `parse_tool_call_block` (mlx-vlm's `gemma4` parser, singular form). The post-stream re-extract is gone; a fenced-JSON fallback only runs when the streaming filter captured nothing.
+
+**CognitionEngine — end turn after `say`.** When the model called `say`, we looped back to the brain for another round and the model would chatter with a *different* sentence in plain text — that follow-up text became the assistant bubble, so chat and audio diverged. After `say` fires, the turn ends. The semantic contract is "say IS the response."
+
+**AppServices — mirror `say` text into the chat bubble.** When the `say` tool returns OK, drainBrainStream now appends a fresh assistant bubble with the spoken text (`extractSayText` reads it from the dispatched args). The bubble matches the audio rather than rendering whatever the model emitted as plain text in a later round.
+
+**TTS — Qwen3-TTS-12Hz-1.7B-Base via mlx-audio 0.4.3.** Three composite fixes:
+1. Switched model to `mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16` (native MLX BF16). `CustomVoice` variant doesn't support ICL cloning; `Base` does.
+2. Call `Model.generate(text=…, ref_audio=…, ref_text=…, stream=True, streaming_interval=0.32)` directly instead of going through `mlx_audio.tts.generate.generate_audio` — that helper consumes the iterator internally for playback / save side effects, so the per-chunk PCM never reaches the caller. `streaming_interval=0.32` is the canonical low-latency value from the mlx-audio v0.4.3 Qwen3-TTS README.
+3. Auto-resolve `ref_audio` + `ref_text` from `~/Library/Application Support/Rocky/voice/sample.{wav,txt}` (fallback to `reference.{wav,txt}`). Long references degrade ICL — operationally we trim to 3–10 s; 22 s was producing ~2× too-long output.
+
+**TTS — `StreamingTTS.playToRobot(chunks:media:filename:)`.** New method that accumulates PCM chunks from the Qwen3-TTS streaming generator, wraps them in a WAV, uploads to the daemon, and calls `play_sound`. Audio now plays only through the robot speaker; the Mac stays silent. `isSpeaking` still flips on the first PCM chunk (echo gate engages as soon as synthesis starts), then flips back off after `durationS + sttPostRollS`. `RobotTTS.speakStreaming` was rewired to call `playToRobot` instead of the `AVAudioEngine`-backed Mac path. The Mac-local `play(chunks:)` method survives but has no callers.
+
+**Persona v6 — VISION section with worked examples.** Wiring for the camera→brain feed (RobotCameraService → lastCameraFrame → CognitionEngine.imageProvider → MLXVLMBrain.image_b64) was already in place and verified to work with Gemma 4 26B-A4B (which IS a vision model — early hunch that it was text-only was wrong; it has `vision_config` + `image_token_id`). The bottleneck was the persona, which had zero vision examples — Rocky's strict voice rules made the model default to "Rocky not know" on visual questions. New VISION block lists when to look + five examples (mug, kitchen, shirt, book, empty/dark frame). `currentPersonaVersion` bumped 5 → 6 so the migration overwrites stale personas on next launch.
+
+**Cockpit — toolbar toggles for vision + face tracking.** Two new buttons in `RootView.swift` next to mic + speaker mute. `eye.fill` / `eye.slash.fill` gates whether the camera frame is forwarded to the brain (camera sidecar keeps running for face tracker + Vision card); `face.smiling.inverse` / `face.dashed` toggles the existing `setFaceTrackingEnabled` from a place users actually look. New `visionEnabled` observable on AppServices; `imageProvider` returns nil when off.
+
+**Status panel — "Think" reflects active backend.** Previously the LM Studio row always showed, even when `brainBackend == "mlx-vlm"`, so users saw a confusing "LM Studio offline" card next to a working MLX brain. New `brainRow` picks between `mlxBrainRow` (sidecar state + model short name) and `llmRow` based on `settings.brainBackend`; in `auto` mode it resolves to whichever is currently ready. Both the capability tile and the section content read from the same row.
+
+Files touched:
+
+- `Sidecars/brain/rocky_brain/runner.py` — StreamFilter, parse_tool_call_block, get_tool_markers, fallback_extract_tool_calls; streaming loop suppresses markers and no longer double-extracts.
+- `Sidecars/mlx-tts/rocky_tts/qwen3_tts_backend.py` — Base model, ICL cloning, streaming_interval=0.32, auto ref_text resolution from sample.txt.
+- `Sidecars/mlx-tts/manifest.json` — default ROCKY_TTS_BACKEND=qwen3-tts, ROCKY_TTS_QWEN3_MODEL=mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16.
+- `Sources/Cognition/CognitionEngine.swift` — end-turn-after-say.
+- `Sources/Rocky/AppServices.swift` — pendingSayText buffer + mirror, visionEnabled flag + setVisionEnabled, extractSayText, imageProvider gated by visionEnabled.
+- `Sources/Rocky/SettingsStore.swift` — persona v6 VISION section.
+- `Sources/Rocky/RootView.swift` — vision + face tracking toolbar buttons.
+- `Sources/Rocky/StatusView.swift` — brainRow / mlxBrainRow / llmRow, capability + section wiring.
+- `Sources/Voice/StreamingTTS.swift` — playToRobot, wrapPCMInWAV; imports RobotLink.
+- `Sources/Voice/RobotTTS.swift` — speakStreaming routes via playToRobot.
+
+End-to-end verification on the `mlx-community/Qwen3-VL-4B-Instruct-4bit` brain + `mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16` TTS combo:
+
+- Vision: shown a yellow circle (PIL test JPEG) → model said "yellow circle in the center" (Qwen3-VL) and "I see a yellow circle in the center of the image" (Gemma 4 26B-A4B).
+- TTS streaming: first chunk at ~2.9 s (ICL prefill floor), 6.96 s of audio for ~7 s of expected speech with a 6 s reference — correct pacing. 13 s outputs from a 22 s reference confirmed the long-reference degradation.
+- Tool-call extraction: `<|tool_call>call:search_web{query:<|"|>what is Claude Code<|"|>}<tool_call|>` → exactly one tool_call event, no marker leak in emitted deltas.
+
 ## [2026-05-09] doc | Correction — face tracking is Apple Vision, not SAM 3.1
 
 The README and several docs claimed face tracking ran on SAM 3.1 via
