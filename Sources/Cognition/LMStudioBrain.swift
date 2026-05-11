@@ -25,6 +25,7 @@ public actor LMStudioBrain: BrainBackend {
     ) -> AsyncThrowingStream<ChatChunk, Error> {
         // image is intentionally ignored — text-only backend.
         _ = image
+        fputs("[brain] LMStudioBrain.chatStream: messages=\(messages.count) tools=\(tools?.count ?? 0)\n", stderr)
         return client.chatStream(messages: messages, tools: tools)
     }
 }

@@ -38,6 +38,9 @@ public actor MLXVLMBrain: BrainBackend {
                         tools: tools,
                         image_b64: image.map { $0.jpegData.base64EncodedString() }
                     )
+                    // Diagnostic: stderr so it shows up in
+                    // `Console.app` and the user's stderr capture.
+                    fputs("[brain] chat_stream begin: messages=\(messages.count) tools=\(tools?.count ?? 0) image=\(image == nil ? "none" : "\(image!.jpegData.count)B")\n", stderr)
                     await bus.publish(.sidecarLog(
                         sidecar: "brain", level: .debug,
                         message: "chat_stream begin",
@@ -98,6 +101,7 @@ public actor MLXVLMBrain: BrainBackend {
                             ))
                         }
                     }
+                    fputs("[brain] chat_stream end: chunks=\(chunkCount) tool_calls=\(toolCallCount) unknown=\(unknownCount)\n", stderr)
                     await bus.publish(.sidecarLog(
                         sidecar: "brain", level: .debug,
                         message: "chat_stream end",
@@ -109,6 +113,7 @@ public actor MLXVLMBrain: BrainBackend {
                     ))
                     continuation.finish()
                 } catch {
+                    fputs("[brain] chat_stream error: \(error)\n", stderr)
                     await bus.publish(.error(
                         scope: "brain/chat_stream",
                         message: "\(error)",

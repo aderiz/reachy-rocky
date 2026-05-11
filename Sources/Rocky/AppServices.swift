@@ -1804,6 +1804,7 @@ final class AppServices {
     func applyBrainBackend() async {
         let pref = settings.brainBackend
         let wantsMLX = (pref == "auto" || pref == "mlx-vlm")
+        fputs("[brain] applyBrainBackend: pref=\(pref) wantsMLX=\(wantsMLX) sidecar=\(brainSidecar == nil ? "nil" : "present")\n", stderr)
         // Force LM Studio path: clean up the sidecar if running,
         // wire the HTTP backend, drop the camera-frame provider.
         if !wantsMLX {
@@ -1848,11 +1849,15 @@ final class AppServices {
         // failure, just "already up." Suppress it; any other error
         // is real and demotes us to LMStudioBrain.
         do {
+            fputs("[brain] applyBrainBackend: brainSidecar.start() begin\n", stderr)
             try await brainSidecar.start()
+            fputs("[brain] applyBrainBackend: brainSidecar.start() OK\n", stderr)
         } catch SidecarError.alreadyRunning {
             // Expected on re-apply (e.g. user changed model in
             // Settings — the sidecar is still running from boot).
+            fputs("[brain] applyBrainBackend: alreadyRunning (continuing)\n", stderr)
         } catch {
+            fputs("[brain] applyBrainBackend: start() ERROR \(error) — falling back to LM Studio\n", stderr)
             await cognition.setBrain(LMStudioBrain(client: llm))
             await cognition.setImageProvider(nil)
             if pref == "mlx-vlm" {
@@ -1871,6 +1876,7 @@ final class AppServices {
         await self.requestBrainModel(settings.brainModel)
         let mlx = MLXVLMBrain(sidecar: brainSidecar, logBus: logBus)
         await cognition.setBrain(mlx)
+        fputs("[brain] applyBrainBackend: cognition.brain = MLXVLMBrain (\(settings.brainModel))\n", stderr)
         // Wire the latest camera frame so the VLM has eyes.
         let provider: CognitionEngine.ImageProvider = { [weak self] in
             guard let self else { return nil }
