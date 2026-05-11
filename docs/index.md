@@ -22,6 +22,7 @@ The catalog of every page in the wiki.
 - [Voice / listen pipeline](concepts/voice-pipeline.md) — mic → ring buffer → VAD → STT → wake filter → cognition; pre-roll buffer, queued segment, calibration, echo gate.
 - [Tools registry](concepts/tools-registry.md) — schema/handler shape, dispatch path, fenced-JSON fallback for Gemma, inventory of the shipped tools.
 - [Permissions authority](concepts/permissions-authority.md) — single source of truth, 5-state enum, TCC + signing pitfalls, debug-binary trap.
+- [On-bot media relay](concepts/on-bot-media-relay.md) — `rocky_media_relay` Reachy Mini App + Mac-side WS subscribers; replaces WebRTC.
 
 ## Reference
 
@@ -35,6 +36,7 @@ The catalog of every page in the wiki.
 - [Dev loop on Wireless](workflows/dev-loop-wireless.md) — sshfs Approach A (recommended).
 - [Create an app](workflows/create-app.md) — `reachy-mini-app-assistant` CLI.
 - [Run and debug](workflows/run-and-debug.md) — daemon logs, `journalctl`, common pitfalls.
+- [Deploy the on-bot media relay](workflows/deploy-media-relay.md) — `reachy-mini-app-assistant check/publish`, dev-iteration loop on the bot, start/stop via daemon REST.
 
 ## Patterns
 
@@ -76,8 +78,9 @@ Swift packages (see `Package.swift`):
 Sidecars (`Sidecars/`):
 
 - `face-tracker` — synthetic-target test scaffold (Lissajous pattern, stdlib only). Real face tracking is Swift-side in `Sources/Perception/MacFaceTracker.swift` (Apple Vision on `robot-camera` frames); the sidecar's `[sam]` mode was never implemented.
-- `robot-mic` — 4-mic ReSpeaker array via WebRTC + reachy_mini SDK.
-- `robot-camera` — RGB stream via WebRTC; frames feed `MacFaceTracker`.
+- `robot-mic` — 4-mic ReSpeaker array; v0.2 subscribes to the on-bot `rocky_media_relay` over WebSocket (was WebRTC).
+- `robot-camera` — RGB stream; v0.2 subscribes to the on-bot `rocky_media_relay` over WebSocket (was WebRTC). Frames still feed `MacFaceTracker`.
+- (on bot) `rocky_media_relay` — Reachy Mini App that captures the camera + mic locally and exposes them at `ws://reachy-mini.local:8042/ws/{audio,video}`. Source: `OnBot/rocky_media_relay/`.
 - `mlx-tts` — Chatterbox FP16 voice cloning (default `say` backend without ML extras).
 - `mempalace` — local memory store (recall + record).
 - `echo` — reference / contract test.

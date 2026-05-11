@@ -2747,14 +2747,20 @@ final class AppServices {
             .path(percentEncoded: false) ?? "."
         return SidecarManifest(
             name: "robot-mic",
-            version: "0.1.0-dev",
+            version: "0.2.0-dev",
             binary: venvPython.path,
             args: ["-u", "-m", "rocky_robot_mic.runner"],
             workingDir: dir,
             env: [
                 "PYTHONPATH": dir,
+                // v0.2: sidecar is a WebSocket subscriber to the
+                // on-bot `rocky_media_relay` Reachy Mini App (port
+                // 8042 by default — the app's `custom_app_url`).
+                // ROCKY_ROBOT_PORT is no longer used by this
+                // sidecar; the daemon's REST API on :8000 is hit by
+                // Swift directly elsewhere.
                 "ROCKY_ROBOT_HOST": "reachy-mini.local",
-                "ROCKY_ROBOT_PORT": "8000",
+                "ROCKY_RELAY_PORT": "8042",
             ],
             readyTimeoutS: 30,
             shutdownGraceS: 3,
@@ -2803,17 +2809,18 @@ final class AppServices {
             .path(percentEncoded: false) ?? "."
         return SidecarManifest(
             name: "robot-camera",
-            version: "0.1.0-dev",
+            version: "0.2.0-dev",
             binary: venvPython.path,
             args: ["-u", "-m", "rocky_robot_camera.runner"],
             workingDir: dir,
             env: [
                 "PYTHONPATH": dir,
+                // v0.2: same WebSocket subscriber pattern as
+                // robot-mic. FPS / width / quality are now set
+                // on the bot-side relay app, not here — the relay
+                // does the JPEG encode using its own constants.
                 "ROCKY_ROBOT_HOST": "reachy-mini.local",
-                "ROCKY_ROBOT_PORT": "8000",
-                "ROCKY_CAM_FPS": "30",
-                "ROCKY_CAM_WIDTH": "384",
-                "ROCKY_CAM_QUALITY": "55",
+                "ROCKY_RELAY_PORT": "8042",
             ],
             readyTimeoutS: 30,
             shutdownGraceS: 3,

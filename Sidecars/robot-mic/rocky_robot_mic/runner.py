@@ -1,21 +1,51 @@
-"""Robot-mic sidecar entry point.
+"""Robot-mic sidecar entry point (v0.2 — WebSocket subscriber).
 
-Pulls audio from the Reachy Mini onboard microphone array via the
-`reachy_mini` SDK (auto-uses WebRTC when run remotely from the Mac) and
-emits PCM chunks as line-delimited JSON events.
+Connects to the on-bot `rocky_media_relay` Reachy Mini App over a
+plain WebSocket and republishes audio + DoA events to the Swift side
+in the existing SidecarHost JSON-line envelope. The Swift adapter
+(`RobotMicService`) sees no protocol change — only the underlying
+transport between bot and Mac is now WebSocket instead of WebRTC.
+
+Why the swap: the WebRTC-over-WiFi path was dropping its signalling
+channel repeatedly, leaving the sidecar in a respawn cycle and
+producing silent / zero-valued PCM for stretches. The on-bot relay
+captures via the SDK's LOCAL media backend (IPC + direct GStreamer)
+and pushes plain JSON-framed PCM over WS — a TCP transport that
+doesn't need DTLS / ICE / signalling.
+
+Stdin RPCs (unchanged):
+  start_recording → POST /control/start_recording on the bot relay,
+                    open the audio WS subscription if not already up.
+  stop_recording  → POST /control/stop_recording. Audio WS stays
+                    open so re-starting is fast.
+  health          → returns connection + counters.
+  shutdown        → graceful exit.
+
+Stdout events (unchanged):
+  ready  — once the sidecar has acquired the bot relay connection.
+  audio  — { samples_b64, sample_rate, channels, rms }
+  doa    — { angle_rad, is_speech }
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
 import sys
 import threading
 import time
-from typing import Any, Optional
+from typing import Any
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
 
 import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Wire I/O — same envelopes as before.
+# ---------------------------------------------------------------------------
 
 
 _io_lock = threading.Lock()
@@ -29,7 +59,8 @@ def emit(obj: dict[str, Any]) -> None:
 
 
 def log(level: str, msg: str, **fields: Any) -> None:
-    emit({"log": {"level": level, "msg": msg, "fields": {k: str(v) for k, v in fields.items()}}})
+    emit({"log": {"level": level, "msg": msg,
+                  "fields": {k: str(v) for k, v in fields.items()}}})
 
 
 def respond(req_id: str, result: Any) -> None:
@@ -40,364 +71,275 @@ def respond_error(req_id: str, code: int, message: str) -> None:
     emit({"id": req_id, "error": {"code": code, "message": message}})
 
 
-class Runner:
-    # Three-tier stall recovery. Each tier is more invasive than
-    # the last; the goal is to absorb most stalls invisibly without
-    # going to process respawn (which trips the supervisor's circuit
-    # breaker after 3 restarts/minute and locks the mic out for 60 s).
-    #
-    # 1. T1 — soft refresh at STALL_REFRESH_S: `release_media +
-    #    acquire_media`. Most transient WebRTC hiccups recover here.
-    # 2. T2 — in-process SDK reconnect at STALL_RECONNECT_S: tear
-    #    down ReachyMini and recreate it without exiting. Fresh
-    #    WebRTC peer without supervisor involvement.
-    # 3. T3 — fatal exit at STALL_FATAL_S: release media cleanly
-    #    so the bot's WebRTC peer state is freed, then `os._exit(1)`
-    #    so the supervisor respawns us with a clean slate.
-    #
-    # Timeouts are deliberately patient. WebRTC re-negotiations can
-    # take 10–20 s to settle on their own; firing too aggressively
-    # interrupts natural recovery and compounds the problem.
-    STALL_REFRESH_S = 5.0
-    STALL_RECONNECT_S = 12.0
-    STALL_FATAL_S = 30.0
-    REFRESH_COOLDOWN_S = 8.0
-    RECONNECT_COOLDOWN_S = 15.0
+def _stderr(msg: str) -> None:
+    sys.stderr.write(f"[robot-mic] {msg}\n")
+    sys.stderr.flush()
+
+
+# ---------------------------------------------------------------------------
+# Bot relay config
+# ---------------------------------------------------------------------------
+
+
+# `rocky_media_relay`'s custom_app_url is `http://0.0.0.0:8042` on the
+# bot. From the Mac we reach it at the bot's hostname + that port.
+DEFAULT_HOST = os.environ.get("ROCKY_ROBOT_HOST", "reachy-mini.local")
+RELAY_PORT = int(os.environ.get("ROCKY_RELAY_PORT", "8042"))
+HTTP_BASE = f"http://{DEFAULT_HOST}:{RELAY_PORT}"
+WS_URL = f"ws://{DEFAULT_HOST}:{RELAY_PORT}/ws/audio"
+
+
+# ---------------------------------------------------------------------------
+# Subscriber — single asyncio loop in a dedicated thread.
+# ---------------------------------------------------------------------------
+
+
+class RelaySubscriber:
+    """Owns the WebSocket connection to the bot relay. Runs in its
+    own asyncio loop on a background thread so the stdin dispatch
+    thread (which is synchronous) stays simple."""
+
+    RECONNECT_BACKOFF_S = (1.0, 2.0, 5.0, 10.0)
 
     def __init__(self) -> None:
-        self.host = os.environ.get("ROCKY_ROBOT_HOST", "reachy-mini.local")
-        self.port = int(os.environ.get("ROCKY_ROBOT_PORT", "8000"))
-        self.recording = False
-        self.shutdown_flag = threading.Event()
-        self.mini = None
-        self.sample_rate: int = 16_000
-        self.channels: int = 1
-        self.last_doa_emit_ts: float = 0.0
-        self.last_frame_ts: float = time.monotonic()
-        self._watchdog_thread: threading.Thread | None = None
-        self._audio_thread: threading.Thread | None = None
-        # Serialises every operation that mutates `self.mini` or
-        # invokes a multi-step SDK call against it. Without this,
-        # the audio thread (`mini.media.get_audio_sample`), the
-        # main stdin thread (`mini.media.start_recording`), and the
-        # watchdog (`_refresh_media` / `_reconnect_sdk` reassigning
-        # `self.mini`) can observe two different SDK instances mid-
-        # operation. Held briefly during reassignments; not held
-        # during long blocking calls.
-        self._mini_lock = threading.Lock()
-
-        # Connect on the MAIN thread before stdin loop. GStreamer's GLib
-        # main-loop integration is finicky from a background thread, which
-        # caused silent hangs in earlier builds.
-        from reachy_mini import ReachyMini
-
-        log("info", "connecting to robot", host=self.host, port=self.port)
-        self.mini = ReachyMini(
-            host=self.host, port=self.port,
-            connection_mode="network", media_backend="webrtc",
-            automatic_body_yaw=False,
-            log_level="WARNING",
+        self.shutdown = threading.Event()
+        self.connected = threading.Event()
+        self.sample_rate = 16_000
+        self.channels = 1
+        self.last_rms: float = 0.0
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._task: asyncio.Task | None = None
+        self._thread = threading.Thread(
+            target=self._thread_entry, name="ws-subscriber", daemon=True
         )
-        log("info", "connected to robot")
-
-    # --- audio streaming ---
-
-    def audio_loop(self) -> None:
-        assert self.mini is not None
-        # Idempotent acquire before start_recording. ReachyMini's
-        # __init__ already configures the media manager, but when the
-        # bot has just finished a power-cycle the daemon may not have
-        # the WebRTC receiver peer fully attached. Calling
-        # `acquire_media()` is a no-op when `_media_released = False`
-        # (which is the post-init state), so this is safe; when the
-        # peer was torn down by a prior T2 reconnect it nudges the
-        # daemon to re-attach the audio track. Without this, fresh
-        # sidecars sometimes come up green-but-silent — RMS = 0 forever.
-        try:
-            self.mini.acquire_media()
-        except Exception as exc:  # noqa: BLE001
-            log("warn", "acquire_media before start_recording failed",
-                error=str(exc))
-
-        self.mini.media.start_recording()
-        try:
-            self.sample_rate = int(self.mini.media.get_input_audio_samplerate() or 16_000)
-            self.channels = int(self.mini.media.get_input_channels() or 1)
-        except Exception:
-            pass
-
-        log("info", "recording started",
-            sr=self.sample_rate, ch=self.channels)
-        # Mirror to stderr too — the JSON-envelope `log` goes to stdout
-        # which only the in-app LogsView sees. Mirroring lets terminal
-        # / Console.app observers see the recording-start handshake.
-        sys.stderr.write(
-            f"[robot-mic] recording started sr={self.sample_rate} ch={self.channels}\n"
-        )
-        sys.stderr.flush()
-        self.last_frame_ts = time.monotonic()
-        # Diagnostics: log the first audio frame's shape + a coarse
-        # peak so a "green but silent" sidecar is debuggable from the
-        # log. Without this you can't tell whether the bot is sending
-        # zero-valued PCM or the conversion is wrong on our side.
         self._logged_first_frame = False
-        self._peak_log_ts = time.monotonic()
+        self._peak_log_ts = 0.0
         self._window_peak = 0.0
-        # Spawn the stall watchdog at most once per process — a
-        # reconnect-tier recovery restarts audio_loop, but we don't
-        # want a second watchdog stacking on the first.
-        if self._watchdog_thread is None or not self._watchdog_thread.is_alive():
-            self._watchdog_thread = threading.Thread(
-                target=self._stall_watchdog,
-                name="stall-watchdog",
-                daemon=True,
-            )
-            self._watchdog_thread.start()
 
-        # Reachy Mini's mic array delivers float32 stereo at 16 kHz; we
-        # downmix to mono and emit ~30-50 Hz worth of PCM at a time.
-        while not self.shutdown_flag.is_set() and self.recording:
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self.shutdown.set()
+        loop = self._loop
+        if loop is not None:
+            loop.call_soon_threadsafe(loop.stop)
+
+    # ---- thread / asyncio plumbing ----
+
+    def _thread_entry(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(self._supervise())
+        except Exception as exc:  # noqa: BLE001
+            _stderr(f"supervisor crashed: {exc}")
+        finally:
             try:
-                samples = self.mini.media.get_audio_sample()
-            except Exception as exc:
-                log("warn", "get_audio_sample failed", error=str(exc))
-                time.sleep(0.05)
-                continue
-            if samples is None or len(samples) == 0:
-                time.sleep(0.005)
-                continue
+                self._loop.close()
+            except Exception:
+                pass
 
-            # samples: shape (N, 2) float32 typically
-            arr = np.asarray(samples, dtype=np.float32)
+    async def _supervise(self) -> None:
+        """Reconnect loop. Exponential-ish backoff; cancellable
+        cleanly when shutdown is requested."""
+        attempt = 0
+        while not self.shutdown.is_set():
+            try:
+                await self._connect_once()
+                attempt = 0  # successful run; reset backoff
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:  # noqa: BLE001
+                wait = self.RECONNECT_BACKOFF_S[min(
+                    attempt, len(self.RECONNECT_BACKOFF_S) - 1
+                )]
+                _stderr(f"ws disconnected ({type(exc).__name__}: {exc}); "
+                        f"reconnect in {wait}s")
+                self.connected.clear()
+                attempt += 1
+                # interruptible sleep
+                for _ in range(int(wait * 10)):
+                    if self.shutdown.is_set():
+                        return
+                    await asyncio.sleep(0.1)
+
+    async def _connect_once(self) -> None:
+        # Lazy import so a missing `websockets` dep surfaces here
+        # rather than at module load.
+        import websockets
+
+        _stderr(f"connecting to {WS_URL}")
+        async with websockets.connect(
+            WS_URL,
+            ping_interval=10,
+            ping_timeout=20,
+            max_size=None,  # video frames can be ~30 KB; relay sends
+                            # audio chunks of ~1 KB — no useful cap.
+            close_timeout=5,
+        ) as ws:
+            self.connected.set()
+            _stderr(f"ws connected to {WS_URL}")
+            try:
+                async for raw in ws:
+                    self._handle_message(raw)
+            finally:
+                self.connected.clear()
+
+    def _handle_message(self, raw) -> None:
+        # `websockets` yields bytes for binary frames, str for text.
+        # The relay sends one envelope as `ws.send_bytes` (utf-8 JSON
+        # line) per message; the hello frame is `send_text`.
+        if isinstance(raw, (bytes, bytearray)):
+            try:
+                text = raw.decode("utf-8").rstrip("\n")
+            except UnicodeDecodeError:
+                _stderr("dropping non-utf8 binary message")
+                return
+        else:
+            text = raw.rstrip("\n") if isinstance(raw, str) else ""
+        if not text:
+            return
+        try:
+            obj = json.loads(text)
+        except json.JSONDecodeError:
+            return
+        t = obj.get("type")
+        if t == "audio":
+            self._handle_audio(obj)
+        elif t == "doa":
+            self._handle_doa(obj)
+        elif t == "hello":
+            sr = obj.get("sr")
+            if isinstance(sr, int):
+                self.sample_rate = sr
+            ch = obj.get("ch")
+            if isinstance(ch, int):
+                self.channels = ch
+            _stderr(f"hello: sr={self.sample_rate} ch={self.channels} "
+                    f"build={obj.get('build')}")
+
+    def _handle_audio(self, obj: dict[str, Any]) -> None:
+        pcm_b64 = obj.get("pcm_b64")
+        sr = obj.get("sr") or self.sample_rate
+        rms = float(obj.get("rms") or 0.0)
+        if not isinstance(pcm_b64, str):
+            return
+        # Re-emit on the SAME wire envelope the Swift side already
+        # consumes — `samples_b64` int16 LE mono at 16 kHz, plus rms.
+        # No transformation: the relay already produced int16 mono.
+        emit({
+            "event": "audio",
+            "payload": {
+                "samples_b64": pcm_b64,
+                "sample_rate": int(sr),
+                "channels": 1,
+                "rms": rms,
+            },
+        })
+        self.sample_rate = int(sr)
+        self.last_rms = rms
+
+        # Periodic peak instrumentation — same shape as the v0.1
+        # WebRTC sidecar so the terminal log surface is unchanged.
+        # We decode just enough to compute peak; the bot already
+        # computed RMS so we don't recompute that.
+        if not self._logged_first_frame or (time.monotonic() - self._peak_log_ts) >= 1.0:
+            try:
+                pcm = base64.b64decode(pcm_b64)
+                i16 = np.frombuffer(pcm, dtype="<i2")
+                peak_i = int(np.max(np.abs(i16))) if i16.size else 0
+                peak = peak_i / 32768.0
+            except Exception:
+                peak = 0.0
+            if peak > self._window_peak:
+                self._window_peak = peak
+            now = time.monotonic()
             if not self._logged_first_frame:
                 self._logged_first_frame = True
-                peak = float(np.max(np.abs(arr))) if arr.size else 0.0
-                log("info", "first audio frame",
-                    shape=str(arr.shape), dtype=str(arr.dtype),
-                    peak=f"{peak:.5f}")
-                sys.stderr.write(
-                    f"[robot-mic] first audio frame shape={arr.shape} "
-                    f"dtype={arr.dtype} peak={peak:.5f}\n"
-                )
-                sys.stderr.flush()
-            # Periodic peak telemetry: once per second log the running
-            # max so the user can see whether their voice is reaching
-            # the mic, without flooding the log per-frame.
-            now = time.monotonic()
-            frame_peak = float(np.max(np.abs(arr))) if arr.size else 0.0
-            if frame_peak > self._window_peak:
-                self._window_peak = frame_peak
-            if now - self._peak_log_ts >= 1.0:
-                sys.stderr.write(
-                    f"[robot-mic] peak (last 1s) = {self._window_peak:.5f}\n"
-                )
-                sys.stderr.flush()
+                _stderr(f"first audio frame sr={sr} samples={len(pcm_b64) // 4 * 3} "
+                        f"peak={peak:.5f}")
+                self._peak_log_ts = now
+            elif now - self._peak_log_ts >= 1.0:
+                _stderr(f"peak (last 1s) = {self._window_peak:.5f}")
                 self._window_peak = 0.0
                 self._peak_log_ts = now
-            if arr.ndim == 2 and arr.shape[1] >= 1:
-                mono = arr.mean(axis=1)
-            else:
-                mono = arr.reshape(-1)
 
-            # Convert to int16 for compact transit
-            clipped = np.clip(mono * 32767.0, -32768, 32767).astype(np.int16)
-            data_b64 = base64.b64encode(clipped.tobytes()).decode("ascii")
-            rms = float(np.sqrt(np.mean(mono * mono))) if mono.size else 0.0
+    def _handle_doa(self, obj: dict[str, Any]) -> None:
+        angle = obj.get("angle_rad")
+        is_speech = obj.get("is_speech")
+        if angle is None:
+            return
+        emit({
+            "event": "doa",
+            "payload": {
+                "angle_rad": float(angle),
+                "is_speech": bool(is_speech),
+            },
+        })
 
-            emit({
-                "event": "audio",
-                "payload": {
-                    "samples_b64": data_b64,
-                    "sample_rate": self.sample_rate,
-                    "channels": 1,
-                    "rms": rms,
-                },
-            })
-            self.last_frame_ts = time.monotonic()
 
-            # DoA at most once per 200 ms when speech is present
-            now = time.monotonic()
-            if now - self.last_doa_emit_ts >= 0.2:
-                try:
-                    doa = self.mini.media.get_DoA()
-                    if doa is not None:
-                        angle, is_speech = doa
-                        emit({
-                            "event": "doa",
-                            "payload": {
-                                "angle_rad": float(angle),
-                                "is_speech": bool(is_speech),
-                            },
-                        })
-                        self.last_doa_emit_ts = now
-                except Exception:
-                    pass
+# ---------------------------------------------------------------------------
+# Synchronous HTTP control plane (start/stop recording on bot)
+# ---------------------------------------------------------------------------
 
+
+def _post(path: str, timeout: float = 5.0) -> dict[str, Any]:
+    url = urljoin(HTTP_BASE + "/", path.lstrip("/"))
+    req = Request(url, data=b"", method="POST")
+    with urlopen(req, timeout=timeout) as resp:
+        body = resp.read()
+        if not body:
+            return {}
         try:
-            self.mini.media.stop_recording()
-        except Exception:
-            pass
-        log("info", "recording stopped")
+            return json.loads(body)
+        except json.JSONDecodeError:
+            return {}
 
-    def _refresh_media(self) -> bool:
-        """T1 — best-effort `acquire_media` on the bot.
-        Crucially, we do NOT call `release_media` here. The bot's
-        media lock is shared with the camera sidecar; if mic's
-        soft-refresh released the lock, the camera lost its peer
-        too. Both sidecars then thrashed in lockstep. `acquire_media`
-        on its own is idempotent — when the connection is healthy
-        it's a cheap no-op, and when WebRTC has half-dropped on the
-        bot side it nudges the daemon to re-establish without
-        kicking the camera. If the connection is fully dead, T2's
-        full SDK reconnect handles it."""
-        with self._mini_lock:
-            mini = self.mini
-        if mini is None:
-            return False
-        try:
-            mini.acquire_media()
-            log("info", "media reacquired (no release)")
-            return True
-        except Exception as exc:  # noqa: BLE001
-            log("warn", "acquire_media failed", error=str(exc))
-            return False
 
-    def _reconnect_sdk(self) -> bool:
-        """T2 — tear down ReachyMini and recreate it without exiting.
-        Avoids the supervisor circuit breaker (3 restarts/min →
-        60 s cooldown) and gives a fresh WebRTC peer without leaving
-        stale state on the bot. Returns True if the new SDK
-        connected and media was acquired."""
-        # Stop the current audio loop and wait for it to exit. We
-        # capture the thread reference up-front so we can `join()`
-        # — the previous version's blind 0.5 s sleep meant a slow
-        # audio loop iteration could still be holding the OLD
-        # `self.mini` reference when we reassigned it, and the
-        # restart could spawn a SECOND concurrent audio loop.
+# ---------------------------------------------------------------------------
+# Runner — dispatch loop on stdin
+# ---------------------------------------------------------------------------
+
+
+class Runner:
+    def __init__(self) -> None:
+        self.subscriber = RelaySubscriber()
+        self.subscriber.start()
+        # Block briefly so the supervisor's `ready` envelope reflects
+        # whether the WS came up. We don't WAIT_FOR_CONNECT — the
+        # bot relay may be down at first launch and that's fine; we
+        # just emit ready and let reconnects continue in background.
+        self.subscriber.connected.wait(timeout=2.0)
         self.recording = False
-        old_thread = self._audio_thread
-        if old_thread is not None and old_thread.is_alive():
-            old_thread.join(timeout=2.0)
-            if old_thread.is_alive():
-                log("warn", "audio thread did not exit within 2s")
-
-        with self._mini_lock:
-            self.mini = None
-        # Don't `release_media` on the old SDK — that's a server-
-        # side hangup that would also tear down the camera's peer.
-        # The old ReachyMini instance is dropped by Python GC when
-        # this scope ends; its WebRTC peer cleans up
-        # asynchronously. New SDK below opens its own fresh peer
-        # via `acquire_media`.
-
-        try:
-            from reachy_mini import ReachyMini
-            new_mini = ReachyMini(
-                host=self.host, port=self.port,
-                connection_mode="network", media_backend="webrtc",
-                automatic_body_yaw=False,
-                log_level="WARNING",
-            )
-            new_mini.acquire_media()
-        except Exception as exc:  # noqa: BLE001
-            log("error", "SDK reconnect failed", error=str(exc))
-            return False
-
-        with self._mini_lock:
-            self.mini = new_mini
-
-        # Grace period — WebRTC re-negotiation can take a few
-        # seconds to produce its first frame. Without offsetting
-        # `last_frame_ts` into the future, the watchdog wakes up
-        # right after reconnect and immediately re-trips T1.
-        self.last_frame_ts = time.monotonic() + 5.0
-        self.recording = True
-        self._audio_thread = threading.Thread(
-            target=self.audio_loop, name="audio", daemon=True
-        )
-        self._audio_thread.start()
-        log("info", "SDK reconnected in-process")
-        return True
-
-    def _stall_watchdog(self) -> None:
-        """Three-tier stall recovery for the audio loop. Most invasive
-        tier checked first — `if/elif` so a single watchdog tick
-        never fires multiple tiers (the previous code could T1+T2
-        in the same iteration, with T2 destroying the SDK that T1
-        had just refreshed). Cooldowns prevent hammering on a
-        connection that needs more time to recover."""
-        last_refresh = 0.0
-        last_reconnect = 0.0
-        while not self.shutdown_flag.is_set():
-            time.sleep(1.0)
-            if not self.recording:
-                self.last_frame_ts = time.monotonic()
-                continue
-            now = time.monotonic()
-            stalled = now - self.last_frame_ts
-
-            if stalled > self.STALL_FATAL_S:
-                # T3 — fatal exit with cleanup. Releasing media
-                # before `os._exit` matters: a hard exit without
-                # it leaves a half-connected WebRTC peer on the
-                # bot, and every subsequent respawn inherits the
-                # corruption.
-                log("error", "audio dead — exiting for supervisor restart",
-                    stalled_s=f"{stalled:.1f}")
-                try:
-                    with self._mini_lock:
-                        if self.mini is not None:
-                            self.mini.release_media()
-                except Exception:  # noqa: BLE001
-                    pass
-                os._exit(1)
-            elif (stalled > self.STALL_RECONNECT_S
-                  and now - last_reconnect > self.RECONNECT_COOLDOWN_S):
-                # T2 — in-process SDK reconnect.
-                log("warn", "audio still stalled — reconnecting SDK in-process",
-                    stalled_s=f"{stalled:.1f}")
-                self._reconnect_sdk()
-                last_reconnect = now
-            elif (stalled > self.STALL_REFRESH_S
-                  and now - last_refresh > self.REFRESH_COOLDOWN_S):
-                # T1 — soft media refresh.
-                log("warn", "audio stalled — refreshing media",
-                    stalled_s=f"{stalled:.1f}")
-                self._refresh_media()
-                last_refresh = now
-
-    # --- request dispatch ---
+        log("info", "robot-mic starting", host=DEFAULT_HOST, port=str(RELAY_PORT))
 
     def handle(self, req: dict[str, Any]) -> None:
         rid = req.get("id")
         method = req.get("method")
-        params = req.get("params") or {}
         if rid is None or not method:
             return
-
         try:
             if method == "start_recording":
-                if not self.recording:
-                    self.recording = True
-                    self._audio_thread = threading.Thread(
-                        target=self.audio_loop, name="audio", daemon=True
-                    )
-                    self._audio_thread.start()
+                _post("/control/start_recording")
+                self.recording = True
                 respond(rid, {"recording": True})
             elif method == "stop_recording":
+                _post("/control/stop_recording")
                 self.recording = False
                 respond(rid, {"recording": False})
             elif method == "health":
                 respond(rid, {
-                    "connected": self.mini is not None,
+                    "connected": self.subscriber.connected.is_set(),
                     "recording": self.recording,
-                    "sample_rate": self.sample_rate,
-                    "channels": self.channels,
-                    "host": self.host,
-                    "port": self.port,
+                    "sample_rate": self.subscriber.sample_rate,
+                    "channels": self.subscriber.channels,
+                    "host": DEFAULT_HOST,
+                    "port": RELAY_PORT,
+                    "transport": "websocket",
                 })
             elif method == "shutdown":
-                self.shutdown_flag.set()
+                self.subscriber.stop()
                 self.recording = False
                 respond(rid, {"ok": True})
             else:
@@ -407,8 +349,6 @@ class Runner:
 
     def serve_stdin(self) -> None:
         for line in sys.stdin:
-            if self.shutdown_flag.is_set():
-                break
             line = line.strip()
             if not line:
                 continue
@@ -421,34 +361,15 @@ class Runner:
 
 
 def main() -> None:
-    log("info", "robot-mic starting", host=os.environ.get("ROCKY_ROBOT_HOST", "?"))
-    try:
-        runner = Runner()
-    except Exception as exc:  # noqa: BLE001
-        log("error", "init failed", error=str(exc))
-        # Still emit ready so SidecarHost doesn't time out; subsequent
-        # method calls will return errors with the actual reason.
-        emit({"event": "ready"})
-        for line in sys.stdin:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                req = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            rid = req.get("id")
-            if rid:
-                respond_error(rid, 503, f"sidecar init failed: {exc}")
-        return
+    _stderr(f"starting host={DEFAULT_HOST} port={RELAY_PORT}")
+    runner = Runner()
     emit({"event": "ready"})
     try:
         runner.serve_stdin()
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
-        runner.shutdown_flag.set()
-        runner.recording = False
+        runner.subscriber.stop()
 
 
 if __name__ == "__main__":

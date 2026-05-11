@@ -2,6 +2,22 @@
 
 Append-only chronological record. Each entry: `## [YYYY-MM-DD] <op> | <subject>`. Run `grep "^## \[" log.md | tail -20` for the recent timeline.
 
+## [2026-05-11] code | On-bot media relay — rearchitect on `on-bot-media-relay` branch
+
+Replaced the Mac-side WebRTC media path with a bot-side Reachy Mini App + plain WebSocket. The motivation came from days of WebRTC instability on WiFi: signalling drops, DTLS errors, sidecar respawn loops, silent / zero PCM, VAD over-segmentation. The official remote-media path is WebRTC; the v0.3 path uses the Apps system instead.
+
+**`OnBot/rocky_media_relay/`** — new Reachy Mini App scaffolded via `reachy-mini-app-assistant create`. Subclasses `ReachyMiniApp`. Inside `run()` it polls `mini.media.get_audio_sample()` / `get_frame()` / `get_DoA()` from the SDK's LOCAL backend (IPC + direct GStreamer, no encode/decode hop), JSON-line-encodes each, and fans them out to subscribers via WebSockets mounted on `self.settings_app` at `/ws/audio` and `/ws/video`. Per-client queues are bounded (200 messages) and drop-oldest under pressure. `POST /control/{start,stop}_recording` toggles audio capture; `GET /health` returns counters. Passes `reachy-mini-app-assistant check`'s structural + install probes.
+
+**`Sidecars/robot-mic` / `Sidecars/robot-camera` rewritten as WS subscribers.** Each runs its own asyncio loop on a background thread with exponential-ish reconnect (1 → 2 → 5 → 10 s). Translates the relay's envelope into the existing SidecarHost stdout shape (`audio` / `doa` / `frame`) — Swift adapters unchanged. Dropped the heavy `reachy-mini` SDK dep from both Mac sidecars; pyprojects now pull only `websockets` (+ `numpy` for the mic's peak diagnostics).
+
+**Swift manifests** updated to set `ROCKY_RELAY_PORT=8042` (the app's `custom_app_url`) and drop `ROCKY_ROBOT_PORT`/camera tuning vars (camera FPS / quality / width now live on the bot side).
+
+**Trade-offs.** Plain WS over LAN has none of WebRTC's encryption / NAT / codec-renegotiation features — Rocky doesn't need them. The bot's "only one app at a time" constraint applies: `rocky_media_relay` consumes the single app slot. Lower latency (no encode/decode), higher stability (TCP), simpler debugging.
+
+**Wiki.** New `docs/concepts/on-bot-media-relay.md`, new `docs/workflows/deploy-media-relay.md`, index updated. Both Mac sidecars came up clean and entered their reconnect loop with no bot relay running — the supervisor never sees them as failed because they emit `ready` before the network attempt.
+
+Branch: `on-bot-media-relay`. Per the rearchitect-branch convention, the WebRTC sidecar revisions live on `rearchitect` and are NOT carried forward when this branch lands.
+
 ## [2026-05-11] code | Brain + TTS + vision: end-to-end fixes for the chat/audio divergence
 
 Closed three real defects and one missing feature spotted while testing the v0.2 stack on the `rearchitect` branch.

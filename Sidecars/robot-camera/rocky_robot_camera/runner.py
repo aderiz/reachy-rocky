@@ -1,18 +1,36 @@
-"""Robot camera sidecar entry point."""
+"""Robot-camera sidecar entry point (v0.2 — WebSocket subscriber).
+
+Connects to the on-bot `rocky_media_relay` Reachy Mini App over a
+plain WebSocket at `/ws/video` and republishes camera frames to the
+Swift side using the existing `frame` event envelope. The Swift
+adapter (`RobotCameraService`) sees no protocol change.
+
+Stdin RPCs:
+  start_streaming → POST /control/start_recording on the bot relay
+                    (audio gating; video is always streaming on the
+                    bot side when a /ws/video client is connected,
+                    so this is a no-op for the camera path but
+                    kept for adapter symmetry).
+  stop_streaming  → no-op.
+  health          → connection + counters.
+  shutdown        → graceful exit.
+
+Stdout events:
+  ready  — once the WS supervisor is alive.
+  frame  — { jpeg_b64, width, height, seq,
+             source_width, source_height }
+"""
 
 from __future__ import annotations
 
-import base64
-import io
+import asyncio
 import json
 import os
 import sys
 import threading
-import time
 from typing import Any
-
-import numpy as np
-from PIL import Image
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
 
 
 _io_lock = threading.Lock()
@@ -26,7 +44,8 @@ def emit(obj: dict[str, Any]) -> None:
 
 
 def log(level: str, msg: str, **fields: Any) -> None:
-    emit({"log": {"level": level, "msg": msg, "fields": {k: str(v) for k, v in fields.items()}}})
+    emit({"log": {"level": level, "msg": msg,
+                  "fields": {k: str(v) for k, v in fields.items()}}})
 
 
 def respond(req_id: str, result: Any) -> None:
@@ -37,201 +56,203 @@ def respond_error(req_id: str, code: int, message: str) -> None:
     emit({"id": req_id, "error": {"code": code, "message": message}})
 
 
+def _stderr(msg: str) -> None:
+    sys.stderr.write(f"[robot-camera] {msg}\n")
+    sys.stderr.flush()
+
+
+DEFAULT_HOST = os.environ.get("ROCKY_ROBOT_HOST", "reachy-mini.local")
+RELAY_PORT = int(os.environ.get("ROCKY_RELAY_PORT", "8042"))
+HTTP_BASE = f"http://{DEFAULT_HOST}:{RELAY_PORT}"
+WS_URL = f"ws://{DEFAULT_HOST}:{RELAY_PORT}/ws/video"
+
+
+class RelaySubscriber:
+    """WS subscriber on its own asyncio thread. Reconnects with
+    exponential-ish backoff. Translates the bot's `frame` envelope
+    into the Swift-expected shape (adds a monotonic `seq` plus
+    `source_*` so the Vision card can show original-resolution
+    metadata even though the relay downscaled to ~480 wide)."""
+
+    RECONNECT_BACKOFF_S = (1.0, 2.0, 5.0, 10.0)
+
+    def __init__(self) -> None:
+        self.shutdown = threading.Event()
+        self.connected = threading.Event()
+        self.frames_received = 0
+        self.last_w = 0
+        self.last_h = 0
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._seq = 0
+        self._thread = threading.Thread(
+            target=self._thread_entry, name="ws-subscriber", daemon=True
+        )
+        self._logged_first_frame = False
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self.shutdown.set()
+        loop = self._loop
+        if loop is not None:
+            loop.call_soon_threadsafe(loop.stop)
+
+    def _thread_entry(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(self._supervise())
+        except Exception as exc:  # noqa: BLE001
+            _stderr(f"supervisor crashed: {exc}")
+        finally:
+            try:
+                self._loop.close()
+            except Exception:
+                pass
+
+    async def _supervise(self) -> None:
+        attempt = 0
+        while not self.shutdown.is_set():
+            try:
+                await self._connect_once()
+                attempt = 0
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:  # noqa: BLE001
+                wait = self.RECONNECT_BACKOFF_S[min(
+                    attempt, len(self.RECONNECT_BACKOFF_S) - 1
+                )]
+                _stderr(f"ws disconnected ({type(exc).__name__}: {exc}); "
+                        f"reconnect in {wait}s")
+                self.connected.clear()
+                attempt += 1
+                for _ in range(int(wait * 10)):
+                    if self.shutdown.is_set():
+                        return
+                    await asyncio.sleep(0.1)
+
+    async def _connect_once(self) -> None:
+        import websockets
+
+        _stderr(f"connecting to {WS_URL}")
+        async with websockets.connect(
+            WS_URL,
+            ping_interval=10,
+            ping_timeout=20,
+            max_size=None,
+            close_timeout=5,
+        ) as ws:
+            self.connected.set()
+            _stderr(f"ws connected to {WS_URL}")
+            try:
+                async for raw in ws:
+                    self._handle_message(raw)
+            finally:
+                self.connected.clear()
+
+    def _handle_message(self, raw) -> None:
+        if isinstance(raw, (bytes, bytearray)):
+            try:
+                text = raw.decode("utf-8").rstrip("\n")
+            except UnicodeDecodeError:
+                return
+        else:
+            text = raw.rstrip("\n") if isinstance(raw, str) else ""
+        if not text:
+            return
+        try:
+            obj = json.loads(text)
+        except json.JSONDecodeError:
+            return
+        t = obj.get("type")
+        if t == "frame":
+            self._handle_frame(obj)
+        elif t == "hello":
+            _stderr(f"hello: build={obj.get('build')} "
+                    f"fps_cap={obj.get('fps_cap')}")
+
+    def _handle_frame(self, obj: dict[str, Any]) -> None:
+        jpeg_b64 = obj.get("jpeg_b64")
+        w = obj.get("w") or obj.get("width")
+        h = obj.get("h") or obj.get("height")
+        if not isinstance(jpeg_b64, str) or w is None or h is None:
+            return
+        self._seq += 1
+        # The bot relay already downscales to ~480 wide. The Vision
+        # card's "source resolution" badge expects an upstream native
+        # size; we don't have access to the raw sensor size here so
+        # we report the relay-output size as source too. The brain's
+        # VLM works on the delivered dimensions; only the badge text
+        # is affected.
+        emit({
+            "event": "frame",
+            "payload": {
+                "jpeg_b64": jpeg_b64,
+                "width": int(w),
+                "height": int(h),
+                "seq": self._seq,
+                "source_width": int(w),
+                "source_height": int(h),
+            },
+        })
+        self.frames_received += 1
+        self.last_w = int(w)
+        self.last_h = int(h)
+        if not self._logged_first_frame:
+            self._logged_first_frame = True
+            _stderr(f"first frame {w}x{h} (jpeg ~{len(jpeg_b64) * 3 // 4} bytes)")
+
+
+def _post(path: str, timeout: float = 5.0) -> dict[str, Any]:
+    url = urljoin(HTTP_BASE + "/", path.lstrip("/"))
+    req = Request(url, data=b"", method="POST")
+    with urlopen(req, timeout=timeout) as resp:
+        body = resp.read()
+        if not body:
+            return {}
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError:
+            return {}
+
+
 class Runner:
     def __init__(self) -> None:
-        self.host = os.environ.get("ROCKY_ROBOT_HOST", "reachy-mini.local")
-        self.port = int(os.environ.get("ROCKY_ROBOT_PORT", "8000"))
-        self.fps = float(os.environ.get("ROCKY_CAM_FPS", "10"))
-        self.target_width = int(os.environ.get("ROCKY_CAM_WIDTH", "480"))
-        self.jpeg_quality = int(os.environ.get("ROCKY_CAM_QUALITY", "65"))
+        self.subscriber = RelaySubscriber()
+        self.subscriber.start()
+        self.subscriber.connected.wait(timeout=2.0)
         self.streaming = False
-        self.shutdown_flag = threading.Event()
-        self.frame_seq = 0
-
-        # Connect on the MAIN thread before stdin loop. GStreamer's GLib
-        # main-loop integration is finicky from a background thread.
-        from reachy_mini import ReachyMini
-
-        log("info", "connecting to robot",
-            host=self.host, port=self.port, fps=self.fps)
-        self.mini = ReachyMini(
-            host=self.host, port=self.port,
-            connection_mode="network", media_backend="webrtc",
-            automatic_body_yaw=False,
-            log_level="WARNING",
-        )
-        self._acquire_media()
-        log("info", "connected to robot")
-
-    def _acquire_media(self) -> bool:
-        """Try to acquire camera/audio media from the daemon. Idempotent."""
-        try:
-            self.mini.acquire_media()
-            log("info", "media acquired")
-            return True
-        except Exception as exc:  # noqa: BLE001
-            log("warn", "acquire_media failed", error=str(exc))
-            return False
-
-    def _refresh_media(self) -> bool:
-        """Best-effort `acquire_media` to nudge a silently-dropped
-        WebRTC peer back. We do NOT call `release_media` here —
-        the bot's media lock is shared with the mic sidecar, and
-        releasing it on a transient stall would tear down the
-        mic's peer too. `acquire_media` alone is idempotent: a
-        no-op when healthy, a re-arm when the daemon has
-        half-dropped. If the SDK's internal state is genuinely
-        broken, the fatal-exit tier respawns us with a clean
-        instance."""
-        return self._acquire_media()
-
-    def stream_loop(self) -> None:
-        log("info", "frame stream started",
-            target_width=self.target_width, jpeg_quality=self.jpeg_quality)
-        period = 1.0 / max(1.0, self.fps)
-        last_emit = 0.0
-        last_success = time.monotonic()
-        last_health_log = time.monotonic()
-        last_refresh = 0.0
-        consecutive_none = 0
-        was_stale = False
-
-        # Tunables — keep conservative.
-        STALE_REFRESH_S = float(os.environ.get("ROCKY_CAM_STALE_REFRESH_S", "3"))
-        FATAL_S = float(os.environ.get("ROCKY_CAM_FATAL_S", "20"))
-        HEALTH_LOG_PERIOD_S = 5.0
-        REFRESH_COOLDOWN_S = 8.0
-
-        while not self.shutdown_flag.is_set() and self.streaming:
-            now = time.monotonic()
-            if now - last_emit < period:
-                time.sleep(0.005)
-                continue
-
-            staleness = now - last_success
-
-            # Periodic health log so the user can see what's happening.
-            if now - last_health_log > HEALTH_LOG_PERIOD_S:
-                log("debug", "camera health",
-                    frames=self.frame_seq, stale_s=f"{staleness:.1f}",
-                    consecutive_none=consecutive_none)
-                last_health_log = now
-
-            # If staleness exceeds threshold, try to refresh the WebRTC
-            # connection by releasing + re-acquiring media. Cooldown to
-            # avoid hammering on a totally broken connection.
-            if staleness > STALE_REFRESH_S and now - last_refresh > REFRESH_COOLDOWN_S:
-                log("warn", "camera stale — refreshing media",
-                    stale_s=f"{staleness:.1f}")
-                self._refresh_media()
-                last_refresh = now
-                # Don't reset last_success; if refresh works the next
-                # successful frame will reset it naturally.
-
-            # If staleness exceeds the fatal threshold, exit non-zero.
-            # The supervisor will restart this sidecar with fresh state.
-            if staleness > FATAL_S:
-                log("error", "camera dead — exiting for supervisor restart",
-                    stale_s=f"{staleness:.1f}")
-                sys.exit(2)
-
-            try:
-                frame = self.mini.media.get_frame()
-            except Exception as exc:
-                log("warn", "get_frame failed", error=str(exc))
-                time.sleep(0.05)
-                continue
-
-            if frame is None:
-                consecutive_none += 1
-                time.sleep(0.01)
-                continue
-
-            try:
-                arr = np.asarray(frame, dtype=np.uint8)
-            except Exception as exc:  # noqa: BLE001
-                log("warn", "asarray failed", error=str(exc))
-                time.sleep(0.05)
-                continue
-
-            if arr.ndim != 3 or arr.shape[2] != 3:
-                log("warn", "unexpected frame shape", shape=str(arr.shape))
-                time.sleep(0.05)
-                continue
-            h, w, _ = arr.shape
-
-            scale = self.target_width / float(w)
-            new_w = self.target_width
-            new_h = max(1, int(h * scale))
-            try:
-                pil = Image.fromarray(arr)
-                pil = pil.resize((new_w, new_h), Image.BILINEAR)
-                buf = io.BytesIO()
-                pil.save(buf, format="JPEG", quality=self.jpeg_quality, optimize=False)
-                jpeg = buf.getvalue()
-            except Exception as exc:
-                log("warn", "encode failed", error=str(exc))
-                time.sleep(0.05)
-                continue
-
-            # Recovery message — emit once per regression.
-            if was_stale:
-                log("info", "camera recovered",
-                    after_stale_s=f"{staleness:.1f}")
-                was_stale = False
-            elif staleness > STALE_REFRESH_S:
-                was_stale = True
-
-            self.frame_seq += 1
-            consecutive_none = 0
-            last_success = now
-            emit({
-                "event": "frame",
-                "payload": {
-                    "seq": self.frame_seq,
-                    "width": new_w,
-                    "height": new_h,
-                    "jpeg_b64": base64.b64encode(jpeg).decode("ascii"),
-                    "source_width": w,
-                    "source_height": h,
-                },
-            })
-            last_emit = now
-
-        log("info", "frame stream stopped",
-            total_frames=self.frame_seq)
+        log("info", "robot-camera starting (ws relay)",
+            host=DEFAULT_HOST, port=str(RELAY_PORT))
 
     def handle(self, req: dict[str, Any]) -> None:
         rid = req.get("id")
         method = req.get("method")
-        params = req.get("params") or {}
         if rid is None or not method:
             return
-
         try:
             if method == "start_streaming":
-                if not self.streaming:
-                    self.streaming = True
-                    threading.Thread(target=self.stream_loop, name="camera",
-                                     daemon=True).start()
+                # Video is on whenever a /ws/video client is connected.
+                # Kept for adapter symmetry with the mic side.
+                self.streaming = True
                 respond(rid, {"streaming": True})
             elif method == "stop_streaming":
                 self.streaming = False
                 respond(rid, {"streaming": False})
-            elif method == "set_fps":
-                self.fps = float(params.get("fps", self.fps))
-                respond(rid, {"fps": self.fps})
             elif method == "health":
                 respond(rid, {
+                    "connected": self.subscriber.connected.is_set(),
                     "streaming": self.streaming,
-                    "fps": self.fps,
-                    "target_width": self.target_width,
-                    "frame_seq": self.frame_seq,
-                    "host": self.host,
-                    "port": self.port,
+                    "frames_received": self.subscriber.frames_received,
+                    "last_w": self.subscriber.last_w,
+                    "last_h": self.subscriber.last_h,
+                    "host": DEFAULT_HOST,
+                    "port": RELAY_PORT,
+                    "transport": "websocket",
                 })
             elif method == "shutdown":
-                self.shutdown_flag.set()
+                self.subscriber.stop()
                 self.streaming = False
                 respond(rid, {"ok": True})
             else:
@@ -241,8 +262,6 @@ class Runner:
 
     def serve_stdin(self) -> None:
         for line in sys.stdin:
-            if self.shutdown_flag.is_set():
-                break
             line = line.strip()
             if not line:
                 continue
@@ -255,34 +274,15 @@ class Runner:
 
 
 def main() -> None:
-    log("info", "robot-camera starting",
-        host=os.environ.get("ROCKY_ROBOT_HOST", "?"))
-    try:
-        runner = Runner()
-    except Exception as exc:  # noqa: BLE001
-        log("error", "init failed", error=str(exc))
-        emit({"event": "ready"})
-        for line in sys.stdin:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                req = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            rid = req.get("id")
-            if rid:
-                respond_error(rid, 503, f"sidecar init failed: {exc}")
-        return
-
+    _stderr(f"starting host={DEFAULT_HOST} port={RELAY_PORT}")
+    runner = Runner()
     emit({"event": "ready"})
     try:
         runner.serve_stdin()
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
-        runner.shutdown_flag.set()
-        runner.streaming = False
+        runner.subscriber.stop()
 
 
 if __name__ == "__main__":

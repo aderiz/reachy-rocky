@@ -1,11 +1,11 @@
 [project]
 name = "rocky-robot-mic"
-version = "0.1.0"
-description = "Streams the Reachy Mini onboard microphone array to Rocky over the Sidecar wire."
+version = "0.2.0"
+description = "Streams the Reachy Mini onboard microphone array to Rocky over the Sidecar wire. v0.2 swaps the WebRTC media client for a WebSocket subscriber that consumes the on-bot rocky_media_relay app — bypasses the WebRTC stack entirely, which has been unreliable on WiFi."
 requires-python = ">=3.12"
 dependencies = [
-    "reachy-mini>=1.7",
     "numpy>=1.26",
+    "websockets>=12",
 ]
 
 [build-system]

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "rocky_media_relay"
+version = "0.1.0"
+description = "On-bot audio + video relay for Rocky. Captures the bot's camera and ReSpeaker mic via the SDK's LOCAL media backend, then fans frames out over plain WebSocket to remote clients — replaces the unreliable WebRTC path for Mac-side Rocky."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "reachy-mini",
+    "numpy",
+    "pillow",
+]
+keywords = ["reachy-mini-app"]
+
+[project.entry-points."reachy_mini_apps"]
+rocky_media_relay = "rocky_media_relay.main:RockyMediaRelay"
+
+[tool.setuptools]
+package-dir = { "" = "." }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+rocky_media_relay = ["**/*"] # Also include all non-.py files
