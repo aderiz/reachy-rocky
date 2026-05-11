@@ -217,20 +217,65 @@ class Brain:
             params.get("temperature") or self.default_temperature
         )
 
+        # Fold tool schemas into the SYSTEM message before templating.
+        # Appending to the templated string (after `apply_chat_template`)
+        # places the tool listing inside the assistant turn — Gemma/
+        # Qwen treat it as already-emitted assistant output and produce
+        # zero tokens. Putting it in the system message keeps the chat
+        # template's assistant boundary intact and the model knows the
+        # turn hasn't started yet. Many tokenizer templates also accept
+        # a `tools=` kwarg natively; we try that first.
+        templated_messages = [dict(m) for m in messages]  # shallow copies
+        if tools:
+            tool_lines = []
+            for t in tools:
+                fn = t.get("function") if isinstance(t, dict) else None
+                if isinstance(fn, dict):
+                    name = fn.get("name", "?")
+                    desc = fn.get("description", "")
+                    tool_lines.append(f"- {name}: {desc}")
+            tools_system_block = (
+                "You have access to these tools. To call one, emit exactly "
+                "<tool_call>{\"name\":\"<tool>\",\"arguments\":{...}}</tool_call> "
+                "in your response — nothing else inside the tags. "
+                "Available tools:\n" + "\n".join(tool_lines)
+            )
+            if templated_messages and templated_messages[0].get("role") == "system":
+                templated_messages[0]["content"] = (
+                    (templated_messages[0].get("content") or "")
+                    + "\n\n"
+                    + tools_system_block
+                )
+            else:
+                templated_messages.insert(
+                    0, {"role": "system", "content": tools_system_block}
+                )
+
         # Compose the prompt via the model's chat template. mlx-vlm's
-        # `apply_chat_template` takes (processor, config, messages,
-        # num_images=...).
+        # `apply_chat_template` accepts a list of message dicts and
+        # places image/audio tokens only on the last user message.
         try:
             num_images = 1 if image_b64 else 0
-            # mlx-vlm 0.4+ exposes the model config on `model.config`;
-            # earlier versions accept `processor.config`. Try both.
             cfg = getattr(self.model, "config", None) or getattr(
                 self.processor, "config", None
             )
-            prompt = apply_chat_template(
-                self.processor, cfg, messages, num_images=num_images
-            )
+            # Try the native `tools=` kwarg first; falls back to the
+            # already-folded system-message path if the tokenizer
+            # template rejects it.
+            try:
+                prompt = apply_chat_template(
+                    self.processor, cfg, templated_messages,
+                    num_images=num_images,
+                    tools=tools or None,
+                )
+            except Exception:
+                prompt = apply_chat_template(
+                    self.processor, cfg, templated_messages,
+                    num_images=num_images,
+                )
         except Exception as e:  # noqa: BLE001 — surface the error
+            sys.stderr.write(f"[brain.py] apply_chat_template FAILED: {e!s}\n")
+            sys.stderr.flush()
             emit({
                 "id": request_id,
                 "error": {
@@ -239,24 +284,11 @@ class Brain:
                 },
             })
             return
-
-        # Tool schemas: not all Qwen3-VL builds honour native tool
-        # calling via the chat template; for the fenced-JSON safety
-        # net we append a system note describing the available tools
-        # in qwen3-coder style. CognitionEngine's existing fenced-
-        # JSON parser will recover any markdown-wrapped calls.
-        if tools:
-            tool_schemas_json = json.dumps(tools, indent=2)
-            tool_note = (
-                "\n\nYou may call any of these tools by emitting a "
-                "<tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call> "
-                "block in your response:\n" + tool_schemas_json
-            )
-            prompt = prompt + tool_note
         sys.stderr.write(
             f"[brain.py] chat_stream: messages={len(messages)} "
             f"tools={len(tools or [])} image={'yes' if image_b64 else 'no'} "
-            f"prompt_chars={len(prompt)}\n"
+            f"prompt_chars={len(prompt)} "
+            f"tail={prompt[-120:]!r}\n"
         )
         sys.stderr.flush()
 
@@ -311,11 +343,25 @@ class Brain:
                 f"use_image={use_image} max_tokens={max_tokens}\n"
             )
             sys.stderr.flush()
+            first_chunk_logged = False
             for chunk in stream_generate(
                 self.model, self.processor, prompt, **kwargs
             ):
                 chunks_seen += 1
-                delta = getattr(chunk, "text", None)
+                if not first_chunk_logged:
+                    first_chunk_logged = True
+                    sys.stderr.write(
+                        f"[brain.py] first chunk type={type(chunk).__name__} "
+                        f"attrs={sorted(vars(chunk).keys()) if hasattr(chunk, '__dict__') else 'str'} "
+                        f"repr={chunk!r}\n"[:600]
+                    )
+                    sys.stderr.flush()
+                # GenerationResult has .text (str). Plain-str chunks
+                # are also seen in some mlx-vlm builds — handle both.
+                if isinstance(chunk, str):
+                    delta = chunk
+                else:
+                    delta = getattr(chunk, "text", "") or ""
                 if delta:
                     buf.append(delta)
                     emit({"id": request_id, "stream": {"delta": delta}})
