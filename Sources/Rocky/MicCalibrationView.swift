@@ -1,5 +1,6 @@
 import SwiftUI
 import RobotLink
+import RockyKit  // RPYPose
 
 /// Guided microphone calibration. Three-phase capture plus an optional
 /// verify pass. Each phase has a distinct noise / signal model, so the
@@ -44,21 +45,37 @@ struct MicCalibrationView: View {
     @State private var roomSamples: [Float] = []
     @State private var robotSamples: [Float] = []
     @State private var voiceSamples: [Float] = []
+    /// Direct-address samples — captured while the user speaks to Rocky
+    /// from their usual seating position. Used to derive the
+    /// `AddressFilter`'s loudness floor / ratio (and the DoA centre /
+    /// tolerance, when the robot mic is the active source). Separate
+    /// from `voiceSamples` because the voice phase asks the user to
+    /// "talk naturally" (any direction); this one asks them to
+    /// directly address Rocky.
+    @State private var addressSamples: [Float] = []
+    @State private var addressDoASamples: [Double] = []
     @State private var verifySamples: [Float] = []
     @State private var verifyTriggers: Int = 0
     @State private var verifyAboveLastTick: Bool = false
     @State private var recommendedThreshold: Float? = nil
+    /// Outputs of the new address phase. Populated by
+    /// `computeAddressCalibration()` after the address phase finishes.
+    @State private var recommendedAddressRMSFloor: Double? = nil
+    @State private var recommendedAddressLoudnessRatio: Double? = nil
+    @State private var recommendedAddressDoACenter: Double? = nil
+    @State private var recommendedAddressDoATolerance: Double? = nil
     @State private var failureReason: String? = nil
     @State private var phaseTask: Task<Void, Never>? = nil
 
     /// Per-phase durations. Tuned in conversation with the user — the
     /// previous 2 + 3 = 5 s flow felt rushed and didn't separate room
-    /// from robot. Total active time is ~26 s (+ 8 s if the user runs
-    /// verify), plus the wake/sleep transitions which can add another
-    /// 3-4 s when a robot is connected.
+    /// from robot. Total active time is ~34 s with the address phase
+    /// added (+ 8 s if the user runs verify), plus wake/sleep
+    /// transitions when a robot is connected.
     private let roomSeconds: Double = 8.0
     private let robotSeconds: Double = 6.0
     private let voiceSeconds: Double = 12.0
+    private let addressSeconds: Double = 8.0
     private let verifySeconds: Double = 8.0
 
     /// Sampling cadence. 30 Hz over a 30 ms VAD frame gives roughly one
@@ -73,14 +90,23 @@ struct MicCalibrationView: View {
         case preRoomSleeping     // sending goToSleep, waiting for completion
         case room
         case waking              // wakeUp in flight
-        case robot
+        case robot               // head + body motion + capture
+        case voicePrompt         // waiting for user to press Start
         case voice
+        case addressPrompt       // waiting for user to press Start
+        case address             // direct-address capture for AddressFilter
         case computing
         case results
         case verify
         case applied
         case failed
     }
+
+    /// Bumped by the footer's "Start speaking" button. The async
+    /// orchestration loop polls this counter so it can yield back to
+    /// SwiftUI while waiting — simpler than continuation plumbing
+    /// across @State + actors.
+    @State private var userStartTicks: Int = 0
 
     var body: some View {
         VStack(spacing: 18) {
@@ -118,15 +144,18 @@ struct MicCalibrationView: View {
     /// Once we hit `.computing` or beyond, all three are filled. The
     /// `.verify` and `.applied` states sit beyond the stepper.
     private var phaseStepper: some View {
-        HStack(spacing: 14) {
+        HStack(spacing: 10) {
             stepLabel(index: 1, name: "Room", active: phase == .room,
                       done: stepDoneAt(1))
             connector(filled: stepDoneAt(1))
             stepLabel(index: 2, name: "Rocky", active: phase == .robot,
                       done: stepDoneAt(2))
             connector(filled: stepDoneAt(2))
-            stepLabel(index: 3, name: "Your voice", active: phase == .voice,
+            stepLabel(index: 3, name: "Voice", active: phase == .voice,
                       done: stepDoneAt(3))
+            connector(filled: stepDoneAt(3))
+            stepLabel(index: 4, name: "Address", active: phase == .address,
+                      done: stepDoneAt(4))
         }
         .font(.caption)
     }
@@ -134,16 +163,22 @@ struct MicCalibrationView: View {
     private func stepDoneAt(_ index: Int) -> Bool {
         switch (index, phase) {
         case (1, .robot), (1, .waking),
-             (1, .voice), (1, .computing),
-             (1, .results), (1, .verify),
-             (1, .applied):
+             (1, .voicePrompt), (1, .voice),
+             (1, .addressPrompt), (1, .address),
+             (1, .computing), (1, .results),
+             (1, .verify), (1, .applied):
             return true
-        case (2, .voice), (2, .computing),
-             (2, .results), (2, .verify),
-             (2, .applied):
+        case (2, .voicePrompt), (2, .voice),
+             (2, .addressPrompt), (2, .address),
+             (2, .computing), (2, .results),
+             (2, .verify), (2, .applied):
             return true
-        case (3, .computing), (3, .results),
+        case (3, .addressPrompt), (3, .address),
+             (3, .computing), (3, .results),
              (3, .verify), (3, .applied):
+            return true
+        case (4, .computing), (4, .results),
+             (4, .verify), (4, .applied):
             return true
         default:
             return false
@@ -212,11 +247,28 @@ struct MicCalibrationView: View {
                 subtitle: "Don't speak. We're capturing motor and fan noise.",
                 duration: robotSeconds
             )
+        case .voicePrompt:
+            phaseInstruction(
+                title: "Ready to speak?",
+                subtitle: "Press Start, then talk for about ten seconds. Try a few short sentences with natural pauses — the weather, what's on tomorrow, anything."
+            )
         case .voice:
             phaseRecording(
                 title: "Now speak normally",
-                subtitle: "Talk for about ten seconds. Try a few short sentences with natural pauses — the weather, what's on tomorrow, anything. The white line on the bar marks the noise floor: aim for your voice to cross it on every word.",
+                subtitle: "Talk for about ten seconds. Try a few short sentences with natural pauses. The white line on the bar marks the noise floor: aim for your voice to cross it on every word.",
                 duration: voiceSeconds,
+                showCutoff: true
+            )
+        case .addressPrompt:
+            phaseInstruction(
+                title: "Ready to address Rocky?",
+                subtitle: "Press Start when you're seated where you normally sit, then read these to Rocky: \"Rocky, what time is it?\"  \"Rocky, what's the weather?\"  \"Rocky, set a timer for ten minutes.\""
+            )
+        case .address:
+            phaseRecording(
+                title: "Address Rocky from your usual spot",
+                subtitle: "Talk directly TO Rocky — face him. This teaches him what 'addressed-to-me' sounds and looks like.",
+                duration: addressSeconds,
                 showCutoff: true
             )
         case .computing:
@@ -302,8 +354,9 @@ struct MicCalibrationView: View {
 
         // Cutoff at noise_ceiling × multiplier (matches the cutoff
         // used by `speechOnlyVoiceSamples` and `computeThreshold`).
-        let noiseCeiling = max(percentile(roomSamples, 0.99),
-                                percentile(robotSamples, 0.99))
+        // Room-only — robot motion samples don't represent the noise
+        // floor Rocky sees while listening.
+        let noiseCeiling = percentile(roomSamples, 0.99)
         let cutoff = Double(max(noiseCeiling * Float(Self.speechFloorMultiplier),
                                  0.003))
         let cutoffNorm = min(cutoff / Self.vuFullScaleRMS, 1.0)
@@ -488,8 +541,12 @@ struct MicCalibrationView: View {
                 .keyboardShortcut(.cancelAction)
             Spacer()
             switch phase {
-            case .intro, .preRoomSleeping, .room, .waking, .robot, .voice, .computing:
+            case .intro, .preRoomSleeping, .room, .waking, .robot, .voice, .address, .computing:
                 Button("Recording…") {}.disabled(true)
+            case .voicePrompt, .addressPrompt:
+                Button("Start") { userStartTicks += 1 }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
             case .results:
                 Button("Apply without verify") { applyAndDismiss() }
                 Button("Test it") { Task { await runVerify() } }
@@ -549,7 +606,10 @@ struct MicCalibrationView: View {
         }
         if !robotWasAwake,
            services.daemonReachability == .online {
-            Task { try? await services.robotLink.goToSleep() }
+            // Use the Mac-side sleepRobot() so the streamer is
+            // suppressed during the slump — same reason as the
+            // wake path in runFullFlow().
+            Task { await services.sleepRobot() }
         }
     }
 
@@ -561,9 +621,15 @@ struct MicCalibrationView: View {
             roomSamples = []
             robotSamples = []
             voiceSamples = []
+            addressSamples = []
+            addressDoASamples = []
             verifySamples = []
             verifyTriggers = 0
             recommendedThreshold = nil
+            recommendedAddressRMSFloor = nil
+            recommendedAddressLoudnessRatio = nil
+            recommendedAddressDoACenter = nil
+            recommendedAddressDoATolerance = nil
             failureReason = nil
             phase = .intro
         }
@@ -574,17 +640,15 @@ struct MicCalibrationView: View {
         if Task.isCancelled { return }
 
         // Phase 1: Room. If Rocky's awake, send him to sleep first
-        // so motor noise doesn't pollute the room sample.
+        // so motor noise doesn't pollute the room sample. Use the
+        // Mac-side `sleepRobot()` (not the raw `robotLink.goToSleep`)
+        // so the 50 Hz face-tracker streamer is suppressed for the
+        // sleep duration via `transitioningUntil` — without that
+        // gate, the streamer fights the daemon's slump animation.
         if services.daemonReachability == .online,
            robotWasAwake {
             await MainActor.run { phase = .preRoomSleeping }
-            do {
-                try await services.robotLink.goToSleep()
-            } catch {
-                // Non-fatal — proceed with room capture even if the
-                // sleep request failed; the user will see Rocky in
-                // whatever state he ended up in.
-            }
+            await services.sleepRobot()
         }
         if Task.isCancelled { return }
 
@@ -608,13 +672,14 @@ struct MicCalibrationView: View {
         // the wake fails.
         if services.daemonReachability == .online {
             await MainActor.run { phase = .waking }
-            do {
-                try await services.robotLink.wakeUp()
-            } catch {
-                // Wake failed — skip phase 2, threshold will just
-                // use room noise.
-                await MainActor.run { phase = .room }  // leaves stepper at room-done
-            }
+            // Use the Mac-side wakeRobot() (not raw robotLink.wakeUp())
+            // so the face-tracker streamer is suppressed for the wake
+            // duration via `transitioningUntil`. Otherwise the
+            // streamer's 50 Hz set_target stream overrides the
+            // daemon's minjerk goto-neutral immediately, and Rocky
+            // ends up pointed at whatever face is in view rather than
+            // his home position.
+            await services.wakeRobot()
             if Task.isCancelled { return }
 
             // Brief settle so the wake-up move's tail doesn't show
@@ -623,21 +688,75 @@ struct MicCalibrationView: View {
             if Task.isCancelled { return }
 
             await MainActor.run { phase = .robot }
+            // Take exclusive control of the motors for the motor
+            // phase so nothing else can steal attention. Three
+            // layers of suppression:
+            //   1. transitioningUntil — gates the AppServices
+            //      streamer-control watcher loop.
+            //   2. targetStreamer.setPrimaryMoveActive(true) —
+            //      direct streamer suppression with no watcher lag.
+            //   3. setFaceTrackingEnabled(false) — stops the
+            //      MacFaceTracker from generating new targets at all
+            //      (so even if the streamer un-suppresses, there's
+            //      nothing to stream).
+            // All three are restored at the end of the phase.
+            let wasFaceTracking = services.faceTrackingEnabled
+            await MainActor.run {
+                services.transitioningUntil =
+                    Date().addingTimeInterval(robotSeconds + 1.5)
+            }
+            await services.targetStreamer.setPrimaryMoveActive(true)
+            await services.setFaceTrackingEnabled(false)
+
+            // Smooth 50 Hz parametric sweep — same cadence the face
+            // tracker uses, so Rocky reads as "tracking something"
+            // rather than executing a series of discrete poses with
+            // pauses between them. Continuous motion is what makes
+            // the motors run continuously, which is what we need to
+            // measure their realistic operational noise floor.
+            async let motion: Void = streamLissajousMotion(during: robotSeconds)
             robotSamples = await capturePhase(seconds: robotSeconds)
+            _ = await motion
+
+            // Return to neutral and restore the suppressed signals.
+            // Goto blocks until the move completes so we don't hand
+            // control back to face tracking mid-arc.
+            try? await services.robotLink.goto(
+                headPose: RPYPose(roll: 0, pitch: 0, yaw: 0),
+                antennas: nil, bodyYaw: 0, durationS: 1.0
+            )
+            await services.targetStreamer.setPrimaryMoveActive(false)
+            await services.setFaceTrackingEnabled(wasFaceTracking)
+            await MainActor.run { services.transitioningUntil = nil }
             if Task.isCancelled { return }
 
-            let robotLoud = robotSamples.filter { $0 > 0.02 }.count
-            if !robotSamples.isEmpty,
-               Double(robotLoud) / Double(robotSamples.count) > 0.2 {
-                await failOut(reason: "We picked up speech during the Rocky phase. Stay quiet while Rocky's motors settle.")
-                return
-            }
+            // No "user spoke during Rocky" sanity check here. The
+            // motion sequence drives the motors deliberately, and
+            // peak motor RMS routinely exceeds 0.02 — which is
+            // precisely what we want to MEASURE, not a failure
+            // condition.
         }
 
-        // Phase 3: Voice. The robot stays awake (or stays offline)
-        // — that's the realistic operating condition.
+        // Phase 3: Voice — user-gated. Show the prompt and wait for
+        // the Start button before recording. Speech capture should
+        // never fire without the user actively initiating it.
+        await MainActor.run { phase = .voicePrompt }
+        await waitForUserStart()
+        if Task.isCancelled { return }
         await MainActor.run { phase = .voice }
         voiceSamples = await capturePhase(seconds: voiceSeconds)
+        if Task.isCancelled { return }
+
+        // Phase 4: Address — also user-gated. Same prompt pattern as
+        // phase 3. Captures direct-address loudness and (on robot
+        // mic) the user's typical DoA from where they sit.
+        await MainActor.run { phase = .addressPrompt }
+        await waitForUserStart()
+        if Task.isCancelled { return }
+        await MainActor.run { phase = .address }
+        let (addressR, addressD) = await captureAddressPhase(seconds: addressSeconds)
+        addressSamples = addressR
+        addressDoASamples = addressD
         if Task.isCancelled { return }
 
         // Compute.
@@ -645,6 +764,37 @@ struct MicCalibrationView: View {
         try? await Task.sleep(nanoseconds: 400_000_000)
         let result = computeThreshold()
         if Task.isCancelled { return }
+
+        // Address-filter values: best-effort, never fails the flow.
+        // Stored to @State, then committed in applyThresholdToServices.
+        let addressResult = computeAddressCalibration()
+        await MainActor.run {
+            recommendedAddressRMSFloor = addressResult.rmsFloor
+            recommendedAddressLoudnessRatio = addressResult.loudnessRatio
+            recommendedAddressDoACenter = addressResult.doaCenter
+            recommendedAddressDoATolerance = addressResult.doaTolerance
+        }
+        // Surface the four computed values to the Logs view so the
+        // user can see exactly what calibration produced. This is
+        // the diagnostic surface that makes "calibration didn't
+        // land" debuggable instead of mysterious.
+        await services.logBus.publish(.sidecarLog(
+            sidecar: "calibration", level: .info,
+            message: "calibration computed",
+            fields: [
+                "room_p99": String(format: "%.4f", percentile(roomSamples, 0.99)),
+                "robot_p99": String(format: "%.4f", percentile(robotSamples, 0.99)),
+                "address_p25": String(format: "%.4f",
+                    addressSamples.isEmpty ? 0 : percentile(addressSamples, 0.25)),
+                "address_p50": String(format: "%.4f",
+                    addressSamples.isEmpty ? 0 : percentile(addressSamples, 0.50)),
+                "address_rms_floor": String(format: "%.4f", addressResult.rmsFloor),
+                "address_loud_ratio": String(format: "%.2f", addressResult.loudnessRatio),
+                "address_doa_centre_rad": String(format: "%.2f", addressResult.doaCenter),
+                "address_doa_tolerance_rad": String(format: "%.2f", addressResult.doaTolerance),
+                "address_doa_sample_count": "\(addressDoASamples.count)"
+            ]
+        ))
 
         switch result {
         case .success(let value):
@@ -655,6 +805,175 @@ struct MicCalibrationView: View {
         case .failure(let reason):
             await failOut(reason: reason)
         }
+    }
+
+    /// Block the orchestration loop until the user presses the
+    /// "Start" button in the footer (which bumps `userStartTicks`).
+    /// Polled at 10 Hz — well below human reaction latency and cheap
+    /// enough to not show up in instruments. Cancellation-aware so
+    /// dismissing the sheet mid-wait exits cleanly.
+    private func waitForUserStart() async {
+        let baseline = userStartTicks
+        while !Task.isCancelled {
+            if userStartTicks > baseline { return }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+    }
+
+    /// Stream a smooth 50 Hz parametric head sweep for `seconds` —
+    /// same cadence and pose-stream shape as the face tracker, so
+    /// Rocky reads as "tracking a moving face" rather than executing
+    /// a chain of discrete poses with pauses between. Continuous
+    /// motion keeps the motors running continuously, which is the
+    /// noise profile we actually want to measure.
+    ///
+    /// The path is a Lissajous figure in (yaw, pitch) space with
+    /// coprime periods so the trace doesn't trivially repeat in the
+    /// 6-second window. Amplitudes are tuned to look like tracking,
+    /// not dancing — peak yaw ~16°, peak pitch ~6°.
+    ///
+    /// The caller is responsible for gating any competing target
+    /// source (face tracker, streamer) before invoking this and
+    /// restoring them afterwards.
+    private func streamLissajousMotion(during seconds: Double) async {
+        // 50 Hz tick. Match the face tracker / streamer cadence so
+        // the daemon sees the same target-update pattern it sees
+        // during normal operation.
+        let tickIntervalNs: UInt64 = 20_000_000
+        let totalTicks = Int(seconds * 50)
+        // Slow sinusoidal sweeps with coprime periods so the path
+        // doesn't repeat in the capture window. Periods chosen so
+        // the bot's never *quite* in the same place twice — keeps
+        // the motors continuously commanded to a fresh target.
+        let yawAmp: Double = 0.28      // ~16°
+        let pitchAmp: Double = 0.10    // ~6°
+        let yawPeriod: Double = 3.7
+        let pitchPeriod: Double = 2.3
+        for tick in 0..<totalTicks {
+            if Task.isCancelled { return }
+            let t = Double(tick) / 50.0
+            let yaw = yawAmp * sin(2 * .pi * t / yawPeriod)
+            let pitch = pitchAmp * sin(2 * .pi * t / pitchPeriod)
+            let pose = RPYPose(roll: 0, pitch: pitch, yaw: yaw)
+            // Post directly to the daemon's set_target endpoint,
+            // bypassing the Mac-side TargetStreamer (which we've
+            // suppressed). Each call is fire-and-forget; daemon
+            // overwrites the active target on receipt and the
+            // motor control loop interpolates smoothly.
+            try? await services.robotLink.setTarget(
+                MotionTarget(headPose: pose, antennas: nil, bodyYaw: 0)
+            )
+            try? await Task.sleep(nanoseconds: tickIntervalNs)
+        }
+    }
+
+    /// Like `capturePhase` but also samples the robot mic's live DoA
+    /// at 10 Hz alongside the RMS samples. DoA capture is a no-op when
+    /// the active mic source is Mac (no array → no DoA data).
+    private func captureAddressPhase(seconds: Double) async -> (rms: [Float], doa: [Double]) {
+        var rmsSamples: [Float] = []
+        var doaSamples: [Double] = []
+        let intervalNs = UInt64(1_000_000_000 / sampleHz)
+        let totalSamples = Int(seconds * sampleHz)
+        // DoA samples land every 3rd RMS tick to keep the rate near
+        // 10 Hz without coordinating two timers.
+        let doaStride = max(1, Int(sampleHz / 10))
+        let started = Date()
+        await MainActor.run { self.elapsed = 0 }
+        for i in 0..<totalSamples {
+            if Task.isCancelled { break }
+            let rms = await readRMS()
+            rmsSamples.append(rms)
+            if services.settings.micSource == "robot", i % doaStride == 0 {
+                if let doa = await services.robotMic.lastDoaRad,
+                   await services.robotMic.lastDoaIsSpeech == true {
+                    doaSamples.append(doa)
+                }
+            }
+            await MainActor.run {
+                self.elapsed = Date().timeIntervalSince(started)
+            }
+            if i < totalSamples - 1 {
+                try? await Task.sleep(nanoseconds: intervalNs)
+            }
+        }
+        return (rmsSamples, doaSamples)
+    }
+
+    /// Derive the AddressFilter calibration values from the captured
+    /// address-phase samples + percentiles. Returns sensible defaults
+    /// for any field where evidence is insufficient.
+    ///
+    /// Important: the noise ceiling here uses **room only**, not
+    /// motors-under-load. The AddressFilter runs at conversational
+    /// dispatch time — i.e., when Rocky is awake but stationary and
+    /// the motors are idle. Idle motor noise is near-ambient, so
+    /// room P99 is the relevant background. Including the
+    /// motion-loaded robot phase here would inflate the ceiling to
+    /// motor-peak levels, making `addressLoudnessRatio` unattainable
+    /// for normal speech.
+    private func computeAddressCalibration() -> (
+        rmsFloor: Double, loudnessRatio: Double,
+        doaCenter: Double, doaTolerance: Double
+    ) {
+        let roomCeiling = Double(percentile(roomSamples, 0.99))
+        let addressP50 = addressSamples.isEmpty ? 0
+            : Double(percentile(addressSamples, 0.50))
+        let addressP25 = addressSamples.isEmpty ? 0
+            : Double(percentile(addressSamples, 0.25))
+        // Floor: the user's quieter half of address speech needs to
+        // pass, so cap at ~80% of P25. Hard minimum 0.005 catches
+        // quantisation / dead air.
+        let floor: Double
+        if addressP25 > 0 {
+            floor = max(0.005, min(addressP25 * 0.8, 0.04))
+        } else {
+            floor = 0.012  // default
+        }
+        // Ratio: room is typically 0.001-0.005 RMS. Address speech is
+        // 0.04-0.12. Ratio of 8-40×. Cap at 6× so the gate is
+        // achievable for slightly-quieter follow-ups. Floor at 2×
+        // so we always have *some* discrimination over background.
+        let ratio: Double
+        if roomCeiling > 1e-6 && addressP50 > roomCeiling {
+            ratio = max(2.0, min(addressP50 / roomCeiling * 0.5, 6.0))
+        } else {
+            ratio = 4.0  // default
+        }
+
+        // DoA: circular mean + 2× circular MAD from the captured
+        // samples. Falls back to "facing the bot" (0 rad) with a wide
+        // default tolerance when there's no usable data.
+        let (centre, tolerance) = circularMeanAndMAD(addressDoASamples)
+        return (
+            rmsFloor: floor,
+            loudnessRatio: ratio,
+            doaCenter: centre,
+            doaTolerance: tolerance
+        )
+    }
+
+    /// Circular mean + 2× MAD of an array of angles in radians.
+    /// Returns (0, 0.45) when the array is empty / too small to be
+    /// meaningful — those are the same defaults `SettingsStore` ships
+    /// with so the AddressFilter remains conservative when DoA is
+    /// missing.
+    private func circularMeanAndMAD(_ angles: [Double]) -> (centre: Double, tolerance: Double) {
+        guard angles.count >= 5 else { return (0, 0.45) }
+        let sumX = angles.reduce(0.0) { $0 + cos($1) }
+        let sumY = angles.reduce(0.0) { $0 + sin($1) }
+        let mean = atan2(sumY / Double(angles.count), sumX / Double(angles.count))
+        let deltas = angles.map { angle -> Double in
+            var d = (angle - mean).truncatingRemainder(dividingBy: 2 * .pi)
+            if d > .pi { d -= 2 * .pi }
+            if d <= -.pi { d += 2 * .pi }
+            return abs(d)
+        }
+        // MAD = median absolute deviation; robust to outliers.
+        let sorted = deltas.sorted()
+        let median = sorted[sorted.count / 2]
+        let tol = min(max(median * 2.0, 0.25), 0.9)
+        return (mean, tol)
     }
 
     private func runVerify() async {
@@ -753,8 +1072,12 @@ struct MicCalibrationView: View {
     /// threshold ends up too low.
     private func speechOnlyVoiceSamples() -> [Float] {
         guard !voiceSamples.isEmpty else { return [] }
-        let noiseCeiling = max(percentile(roomSamples, 0.99),
-                               percentile(robotSamples, 0.99))
+        // Room-only noise ceiling. The robot phase captures motors
+        // UNDER LOAD (deliberate motion) — that audio is way louder
+        // than the noise floor Rocky actually sees while listening
+        // (awake, stationary, motors idle). Including it inflates
+        // the cutoff to motor-peak levels and rejects normal voice.
+        let noiseCeiling = percentile(roomSamples, 0.99)
         let cutoff = max(noiseCeiling * Float(Self.speechFloorMultiplier),
                           0.003)
         return voiceSamples.filter { $0 >= cutoff }
@@ -766,7 +1089,12 @@ struct MicCalibrationView: View {
         }
         let roomP99 = percentile(roomSamples, 0.99)
         let robotP99 = robotSamples.isEmpty ? 0 : percentile(robotSamples, 0.99)
-        let noiseCeiling = max(roomP99, robotP99)
+        // VAD ceiling = ROOM only (see speechOnlyVoiceSamples for the
+        // full reasoning). robotP99 is still computed for the
+        // diagnostic log line so the user can see motor-under-load
+        // levels in calibration telemetry.
+        let noiseCeiling = roomP99
+        _ = robotP99  // keep variable in scope for the log line below
 
         let speechOnly = speechOnlyVoiceSamples()
         // Need a meaningful chunk of voice frames above noise. Less
@@ -839,5 +1167,27 @@ struct MicCalibrationView: View {
         // Live-apply to the running VAD without waiting for the
         // next applySettings cycle.
         Task { await services.voice.setVADThreshold(t) }
+
+        // Push the address-phase results into AppServices so the
+        // AddressFilter starts using them on the very next dispatch.
+        // Each value falls back to the prior persisted setting when
+        // calibration didn't produce one (e.g. capture failed, Mac
+        // mic with no DoA).
+        let rmsFloor = recommendedAddressRMSFloor
+            ?? services.settings.addressRMSFloor
+        let loudnessRatio = recommendedAddressLoudnessRatio
+            ?? services.settings.addressLoudnessRatio
+        let doaCenter = recommendedAddressDoACenter
+            ?? services.settings.addressUserDoaCenterRad
+        let doaTolerance = recommendedAddressDoATolerance
+            ?? services.settings.addressUserDoaToleranceRad
+        Task {
+            await services.applyAddressFilterCalibration(
+                rmsFloor: rmsFloor,
+                loudnessRatio: loudnessRatio,
+                userDoaCenterRad: doaCenter,
+                userDoaToleranceRad: doaTolerance
+            )
+        }
     }
 }

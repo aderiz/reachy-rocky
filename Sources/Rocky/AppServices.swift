@@ -49,6 +49,12 @@ final class AppServices {
     let robotMic: RobotMicService
     let wakeFilter: WakeFilter
     let voice: VoiceCoordinator
+    /// Strict post-STT "is this addressed to Rocky?" filter that
+    /// gates brain dispatch on multiple signals (loudness vs. room
+    /// noise, DoA from the on-bot mic array, face engagement, STT
+    /// confidence, junk-phrase list). See `Sources/Voice/AddressFilter.swift`
+    /// and the plan at `~/.claude/plans/sprightly-forging-zebra.md`.
+    let addressFilter: AddressFilter
     let appleSTT: AppleSpeechSTT
     let mediaClient: MediaClient
     let robotTTS: RobotTTS
@@ -503,7 +509,27 @@ final class AppServices {
         // matches the persona name). Stored lowercase; WakeFilter
         // already lowercases on match.
         self.wakeFilter = WakeFilter(
-            config: WakeFilter.Config(wakeName: settings.wakeWord)
+            config: WakeFilter.Config(
+                wakeName: settings.wakeWord,
+                conversationWindowS: settings.convoWindowS
+            )
+        )
+        // AddressFilter — initialised from the user's persisted
+        // calibration values. `applyAddressFilterCalibration()`
+        // hot-applies updates when the user re-runs the mic
+        // calibration flow or moves a Settings slider.
+        self.addressFilter = AddressFilter(
+            config: AddressFilter.Config(
+                enabled: settings.addressFilterEnabled,
+                minSttConfidence: settings.addressMinSttConfidence,
+                rmsFloor: settings.addressRMSFloor,
+                loudnessRatio: settings.addressLoudnessRatio,
+                userDoaCenterRad: settings.addressUserDoaCenterRad,
+                userDoaToleranceRad: settings.addressUserDoaToleranceRad,
+                faceEngageWindowS: settings.addressFaceEngageWindowS,
+                junkPhrases: settings.addressJunkPhrases,
+                verbPrefixes: settings.addressVerbPrefixes
+            )
         )
         // Wake-word engine — STT-derived by default, Porcupine stub
         // when the user opts in. The factory logs a warning if
@@ -739,6 +765,7 @@ final class AppServices {
         await faceLibrary.setAcceptThreshold(settings.faceMatchThreshold)
         await robotTTS.setVolume(settings.audioVolume)
         await macFaceTracker.setLibrary(faceLibrary)
+        await macFaceTracker.setIdleSearchEnabled(settings.faceTrackerIdleSearchEnabled)
         await refreshEnrolledFaces()
         await macFaceTracker.start()
 
@@ -1336,10 +1363,10 @@ final class AppServices {
         switch output {
         case .partial(let text):
             await MainActor.run { self.lastTranscript = text }
-        case .finalText(let text, let dispatched, let reason):
+        case let .finalText(text, admitted, reason, confidence, peakRMS, _):
             await MainActor.run {
                 self.lastTranscript = text
-                if dispatched { self.lastDispatched = text }
+                if admitted { self.lastDispatched = text }
             }
             // Wake-on-name: a fresh wake match while asleep also wakes
             // the body. Without this, saying "Rocky" only opens the
@@ -1349,36 +1376,58 @@ final class AppServices {
             // forget so the brain can think during the ~3 s wake_up
             // move. Follow-ups inside the open window (`.withinWindow`)
             // intentionally don't trigger this — once awake, stay awake.
-            if dispatched, case .wakeMatch = reason, isAsleep {
+            if admitted, case .wakeMatch = reason, isAsleep {
                 Task { [weak self] in await self?.wakeRobot() }
             }
-            if dispatched {
-                // Echo gate: drop transcripts captured while Rocky is
-                // speaking (or in a small tail after). Without this the
-                // robot speaker bleeds into the mic, STT transcribes
-                // Rocky's own voice, and every reply triggers another —
-                // feedback loop. The tail covers Apple Speech's
-                // post-roll latency: a final transcript from the
-                // last bit of TTS audio takes ~600–1500 ms to emerge
-                // from the recognizer after the audio itself has
-                // stopped. 1.5 s is wide enough to catch that
-                // without unduly blocking a fast user follow-up;
-                // `ttsBusyUntil` itself already includes a 1.5 s
-                // tail past playback end (see say handler), so the
-                // total window from end-of-playback is ~3 s.
-                let now = Date()
-                let inEcho = ttsBusyUntil.map {
-                    now < $0.addingTimeInterval(1.5)
-                } ?? false
-                if inEcho {
-                    await logBus.publish(.sidecarLog(
-                        sidecar: "voice", level: .info,
-                        message: "echo gate dropped \"\(text)\"",
-                        fields: [:]
-                    ))
-                    return
+            guard admitted, let reason else { return }
+
+            // Snapshot the live signals for the AddressFilter. All
+            // reads happen here so the filter actor doesn't reach
+            // back into the rest of the app.
+            let now = Date()
+            let ttsActive = ttsBusyUntil.map { now < $0.addingTimeInterval(1.5) } ?? false
+            let doaRad = await robotMic.lastDoaRad
+            let doaIsSpeech = await robotMic.lastDoaIsSpeech
+            let faceAge: TimeInterval? = lastFaceDetectionAt.map { now.timeIntervalSince($0) }
+            let noiseCeiling = settings.addressRMSFloor / max(settings.addressLoudnessRatio, 1e-6)
+
+            let signals = AddressFilter.Signals(
+                text: text,
+                sttConfidence: confidence,
+                segmentPeakRMS: peakRMS,
+                segmentMeanRMS: 0,  // unused by current rules; reserved
+                roomNoiseCeiling: noiseCeiling,
+                doaRad: doaRad,
+                doaIsSpeech: doaIsSpeech,
+                faceVisibleAgeS: faceAge,
+                wakeReason: reason,
+                ttsActive: ttsActive,
+                micSource: settings.micSource
+            )
+            let decision = await addressFilter.decide(signals)
+
+            switch decision {
+            case .dispatch(let score, let reasons, let engaged):
+                await logBus.publish(.addressFilterAccept(
+                    text: text, score: score, reasons: reasons
+                ))
+                if engaged {
+                    // Real engagement — extend the conversation
+                    // window so the user can keep going without
+                    // saying "Rocky" every turn.
+                    await wakeFilter.extendOnEngaged()
+                    if case .open(let until) = await wakeFilter.state {
+                        await MainActor.run { self.conversationOpenUntil = until }
+                        await logBus.publish(.conversationWindow(
+                            transition: .extended, reason: "engaged"
+                        ))
+                    }
                 }
                 await sendUserText(text)
+            case .drop(let score, let reasons):
+                await logBus.publish(.addressFilterDrop(
+                    text: text, score: score, reasons: reasons
+                ))
             }
         case .windowOpened(let until):
             await MainActor.run { self.conversationOpenUntil = until }
@@ -1395,6 +1444,30 @@ final class AppServices {
                 await sleepRobot()
             }
         }
+    }
+
+    /// Hot-apply a freshly-calibrated AddressFilter config. Used by
+    /// `MicCalibrationView` after the user re-runs the calibration
+    /// flow so the new thresholds take effect without an app relaunch.
+    /// Also writes through to `SettingsStore` so they survive relaunch.
+    func applyAddressFilterCalibration(
+        rmsFloor: Double,
+        loudnessRatio: Double,
+        userDoaCenterRad: Double,
+        userDoaToleranceRad: Double
+    ) async {
+        await MainActor.run {
+            self.settings.addressRMSFloor = rmsFloor
+            self.settings.addressLoudnessRatio = loudnessRatio
+            self.settings.addressUserDoaCenterRad = userDoaCenterRad
+            self.settings.addressUserDoaToleranceRad = userDoaToleranceRad
+        }
+        var cfg = await addressFilter.currentConfig()
+        cfg.rmsFloor = rmsFloor
+        cfg.loudnessRatio = loudnessRatio
+        cfg.userDoaCenterRad = userDoaCenterRad
+        cfg.userDoaToleranceRad = userDoaToleranceRad
+        await addressFilter.setConfig(cfg)
     }
 
     // MARK: - Brain
@@ -1876,6 +1949,9 @@ final class AppServices {
         await MainActor.run {
             self.transitioningUntil = Date().addingTimeInterval(3.2)
         }
+        // Tell the face tracker we're awake so it resumes frame
+        // ingestion + (optional) idle search.
+        await macFaceTracker.setSleeping(false)
         // Bring the camera feed back up *before* the wake motion so
         // the first frames arrive while Rocky is opening his eyes.
         // Mic stays on while sleeping (wake-on-name), so no mic call.
@@ -1916,6 +1992,10 @@ final class AppServices {
             self.conversationOpenUntil = nil
         }
         await voice.closeConversationWindow()
+        // Tell the face tracker we're asleep so it stops processing
+        // camera frames (no point — motors are off). This also
+        // disables the idle look-around if it was enabled.
+        await macFaceTracker.setSleeping(true)
         do { try await robotLink.goToSleep() }
         catch {
             await MainActor.run { self.transitioningUntil = nil }

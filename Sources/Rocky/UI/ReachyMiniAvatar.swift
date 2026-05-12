@@ -63,20 +63,37 @@ struct ReachyMiniAvatar: View {
     }
 
     /// Shared gradient used by callsites that want the cockpit's
-    /// "presence" backdrop behind the avatar — slate at the crown so
-    /// antenna silhouettes read against a lighter region, fading to
-    /// near-black at the base. Exposed here so PortraitView and any
-    /// future hero surface use the same stops.
-    static var backdrop: LinearGradient {
-        LinearGradient(
-            colors: [
-                Color(red: 0.20, green: 0.23, blue: 0.28),
-                Color(red: 0.10, green: 0.12, blue: 0.15),
-                Color(red: 0.04, green: 0.05, blue: 0.07)
-            ],
-            startPoint: .top,
-            endPoint: .bottom
-        )
+    /// "presence" backdrop behind the avatar. Adapts to the system
+    /// colour scheme — slate-to-near-black in dark mode, soft
+    /// slate-to-mid-grey in light mode. Antennas silhouette against
+    /// the lighter top stop in either case; the name plate + toggle
+    /// always sit on the bottom (darker) stop. Single source of
+    /// truth so the portrait + any future hero surface stay aligned.
+    static func backdrop(for scheme: ColorScheme) -> LinearGradient {
+        switch scheme {
+        case .dark:
+            return LinearGradient(
+                colors: [
+                    Color(red: 0.20, green: 0.23, blue: 0.28),
+                    Color(red: 0.10, green: 0.12, blue: 0.15),
+                    Color(red: 0.04, green: 0.05, blue: 0.07)
+                ],
+                startPoint: .top, endPoint: .bottom
+            )
+        default:
+            // Light mode: soft slate that still has enough tonal
+            // range for antenna silhouettes at the top, and is
+            // light enough for the namePlate's .primary text to
+            // read as dark slate against it.
+            return LinearGradient(
+                colors: [
+                    Color(red: 0.94, green: 0.95, blue: 0.97),
+                    Color(red: 0.86, green: 0.88, blue: 0.92),
+                    Color(red: 0.74, green: 0.78, blue: 0.84)
+                ],
+                startPoint: .top, endPoint: .bottom
+            )
+        }
     }
 }
 

@@ -186,6 +186,78 @@ final class SettingsStore {
     /// to revert to.
     var micVADThresholdPrevious: Double { didSet { save() } }
 
+    // MARK: - AddressFilter (respond only when spoken to)
+
+    /// Master switch for the strict address filter that sits between
+    /// STT and the brain. When false, the v0.x VAD→wake→dispatch path
+    /// is used as-is and the only hallucination defences are in the
+    /// STT sidecar. Default true.
+    var addressFilterEnabled: Bool { didSet { save() } }
+
+    /// Minimum STT confidence for a transcript to even reach the
+    /// scoring stage. Apple Speech reports per-word confidence in
+    /// [0, 1]; MLX-Whisper / WhisperKit currently always report 1.0
+    /// so this gate is effectively Apple-only. A small bypass set
+    /// (`yes`, `no`, `stop`, `wait`) skips the confidence check so
+    /// short corrections still land.
+    var addressMinSttConfidence: Double { didSet { save() } }
+
+    /// Minimum *segment peak* RMS for a transcript to count as "direct
+    /// address". Audio quieter than this is treated as background even
+    /// if the VAD let it through. Set by calibration's new phase 4.
+    var addressRMSFloor: Double { didSet { save() } }
+
+    /// Required loudness ratio between the speech segment and the
+    /// measured room-noise ceiling. 4× is a comfortable conversational
+    /// margin — direct address is several times louder than HVAC /
+    /// TV / next-room chatter.
+    var addressLoudnessRatio: Double { didSet { save() } }
+
+    /// User's typical Direction-of-Arrival from the bot's perspective
+    /// (radians). 0 = directly in front. Captured by calibration's new
+    /// phase 4 as the circular mean of speech-flagged DoA samples.
+    /// Only consulted when `micSource == "robot"` (the on-bot mic
+    /// array provides DoA; the Mac mic does not).
+    var addressUserDoaCenterRad: Double { didSet { save() } }
+
+    /// Half-width of the accept cone around `addressUserDoaCenterRad`.
+    /// Default ±0.45 rad ≈ ±26°. Calibration sets it to 2× the
+    /// circular MAD of the captured samples, clamped to [0.25, 0.9].
+    var addressUserDoaToleranceRad: Double { didSet { save() } }
+
+    /// How recently a face must have been visible to count as an
+    /// engagement signal. 3 s matches the natural "I just looked at
+    /// you" window in human conversation. Empty / nil face state
+    /// reads as "no recent engagement" without erroring.
+    var addressFaceEngageWindowS: Double { didSet { save() } }
+
+    /// Conversation-window duration in seconds. Opened by a wake-name
+    /// hit; only extended by *engaged* subsequent turns (face visible
+    /// OR DoA on-axis OR loud direct address). Default 20 s — short
+    /// enough that a stray hallucination can't perpetuate it, long
+    /// enough for natural back-and-forth.
+    var convoWindowS: Double { didSet { save() } }
+
+    /// Phrases that always drop, regardless of confidence or other
+    /// signals. Apple Speech reports these with full confidence on
+    /// silence / TTS bleed. Lower-cased; punctuation stripped before
+    /// comparison.
+    var addressJunkPhrases: [String] { didSet { save() } }
+
+    /// Question / command verb prefixes that count as evidence of
+    /// engagement when no face / DoA signal is available. Catches
+    /// "what time is it", "tell me a joke", etc. — natural addressed
+    /// speech that wouldn't otherwise pass the strict gate.
+    var addressVerbPrefixes: [String] { didSet { save() } }
+
+    /// When true, the face tracker drives a slow Lissajous pan when
+    /// no face has been seen for a few seconds — "Rocky looks around
+    /// on his own." When false (default), the head decays to neutral
+    /// and stays there until a face returns. Off by default because
+    /// the autonomous pan reads as uncanny / attention-stealing for
+    /// most users.
+    var faceTrackerIdleSearchEnabled: Bool { didSet { save() } }
+
     init() {
         let d = UserDefaults.standard
         self.robotHost = d.string(forKey: Keys.robotHost) ?? "reachy-mini.local"
@@ -237,6 +309,37 @@ final class SettingsStore {
         self.brainBackend = d.string(forKey: Keys.brainBackend) ?? "auto"
         self.brainModel = d.string(forKey: Keys.brainModel)
             ?? "mlx-community/Qwen3-VL-4B-Instruct-4bit"
+
+        // AddressFilter — defaults sized for a typical desk setup
+        // (Rocky on the desk, user facing it within ~50 cm). The
+        // calibration flow re-stamps RMS / DoA values to match the
+        // user's actual room and seating position.
+        self.addressFilterEnabled =
+            (d.object(forKey: Keys.addressFilterEnabled) as? Bool) ?? true
+        self.addressMinSttConfidence =
+            (d.object(forKey: Keys.addressMinSttConfidence) as? Double) ?? 0.35
+        self.addressRMSFloor =
+            (d.object(forKey: Keys.addressRMSFloor) as? Double) ?? 0.012
+        self.addressLoudnessRatio =
+            (d.object(forKey: Keys.addressLoudnessRatio) as? Double) ?? 4.0
+        self.addressUserDoaCenterRad =
+            (d.object(forKey: Keys.addressUserDoaCenterRad) as? Double) ?? 0.0
+        self.addressUserDoaToleranceRad =
+            (d.object(forKey: Keys.addressUserDoaToleranceRad) as? Double) ?? 0.45
+        self.addressFaceEngageWindowS =
+            (d.object(forKey: Keys.addressFaceEngageWindowS) as? Double) ?? 3.0
+        self.convoWindowS =
+            (d.object(forKey: Keys.convoWindowS) as? Double) ?? 20.0
+        self.addressJunkPhrases =
+            (d.stringArray(forKey: Keys.addressJunkPhrases))
+            ?? ["thank you", "thanks", "you", "bye", "okay", ".", "..."]
+        self.addressVerbPrefixes =
+            (d.stringArray(forKey: Keys.addressVerbPrefixes))
+            ?? ["what", "where", "when", "why", "how", "tell",
+                "show", "do", "does", "can", "could", "is", "are",
+                "play", "stop", "set", "turn"]
+        self.faceTrackerIdleSearchEnabled =
+            (d.object(forKey: Keys.faceTrackerIdleSearchEnabled) as? Bool) ?? false
     }
 
     /// Stamp `micVADThreshold` from a calibration / slider commit, and
@@ -301,6 +404,17 @@ final class SettingsStore {
         d.set(visionChipHeight, forKey: Keys.visionChipHeight)
         d.set(brainBackend, forKey: Keys.brainBackend)
         d.set(brainModel, forKey: Keys.brainModel)
+        d.set(addressFilterEnabled, forKey: Keys.addressFilterEnabled)
+        d.set(addressMinSttConfidence, forKey: Keys.addressMinSttConfidence)
+        d.set(addressRMSFloor, forKey: Keys.addressRMSFloor)
+        d.set(addressLoudnessRatio, forKey: Keys.addressLoudnessRatio)
+        d.set(addressUserDoaCenterRad, forKey: Keys.addressUserDoaCenterRad)
+        d.set(addressUserDoaToleranceRad, forKey: Keys.addressUserDoaToleranceRad)
+        d.set(addressFaceEngageWindowS, forKey: Keys.addressFaceEngageWindowS)
+        d.set(convoWindowS, forKey: Keys.convoWindowS)
+        d.set(addressJunkPhrases, forKey: Keys.addressJunkPhrases)
+        d.set(addressVerbPrefixes, forKey: Keys.addressVerbPrefixes)
+        d.set(faceTrackerIdleSearchEnabled, forKey: Keys.faceTrackerIdleSearchEnabled)
     }
 
     func robotEndpoint() -> RobotEndpoint {
@@ -476,5 +590,16 @@ final class SettingsStore {
         static let visionChipHeight = "rocky.portrait.vision.h"
         static let brainBackend = "rocky.brain.backend"
         static let brainModel = "rocky.brain.model"
+        static let addressFilterEnabled = "rocky.address.enabled"
+        static let addressMinSttConfidence = "rocky.address.min.stt.confidence"
+        static let addressRMSFloor = "rocky.address.rms.floor"
+        static let addressLoudnessRatio = "rocky.address.loudness.ratio"
+        static let addressUserDoaCenterRad = "rocky.address.doa.center"
+        static let addressUserDoaToleranceRad = "rocky.address.doa.tolerance"
+        static let addressFaceEngageWindowS = "rocky.address.face.window"
+        static let convoWindowS = "rocky.convo.window"
+        static let addressJunkPhrases = "rocky.address.junk.phrases"
+        static let addressVerbPrefixes = "rocky.address.verb.prefixes"
+        static let faceTrackerIdleSearchEnabled = "rocky.face.idle.search.enabled"
     }
 }

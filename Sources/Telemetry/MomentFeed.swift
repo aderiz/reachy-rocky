@@ -170,11 +170,14 @@ public actor MomentFeed {
                          kind: .errorOccurred(scope: scope, message: message)))
 
         // Things we DON'T turn into moments — too noisy at firehose
-        // cadence. They live in the Raw tab.
+        // cadence. They live in the Raw tab. AddressFilter events are
+        // intentionally ignored here too: a drop isn't a moment in the
+        // user's narrative, and an accept is already represented by
+        // the downstream wakeMatch / sttFinal pair.
         case .motorCommand, .motorState, .stateStream, .daemonStatus,
              .robotLink, .faceTarget, .vadSegment, .sttPartial,
              .conversationWindow, .ttsRequest, .ttsChunk,
-             .sidecarLog:
+             .sidecarLog, .addressFilterAccept, .addressFilterDrop:
             return
         }
     }

@@ -19,7 +19,7 @@ Three independent loops, each with its own cadence and ownership. They never cal
 
 1. **Robot state loop** (~10 Hz). `StateSubscriber` reads the daemon's `WS /api/state/ws/full` → mirrors into `AppServices.lastRobotState` → `MotionCard` redraws.
 2. **Face-tracker target loop** (50 Hz). Active path: `robot-camera` JPEG stream → `MacFaceTracker` (`Sources/Perception/`) running Apple Vision's `VNDetectFaceRectanglesRequest` on every frame → EMA + critically-damped controller → `TargetStreamer` → `POST /api/move/set_target`. The Python `face-tracker` sidecar is a **synthetic-target test scaffold** (Lissajous pattern) used for development without a robot or camera; its targets enter Rocky via `FaceTrackerService` → `FaceTargetBridge` but are normally dormant in shipped use. SAM 3.1 was the original M3b plan but never implemented — the sidecar's runner falls through to the synthetic detector if you set `ROCKY_FT_MODE=sam`.
-3. **Voice / brain / TTS loop** (event-driven). Mic → VAD → STT → `WakeFilter` → `CognitionEngine` → `ToolRegistry` (which may invoke `RobotTTS.speak` → `mlx-tts` sidecar → `MediaClient` upload + `play_sound`).
+3. **Voice / brain / TTS loop** (event-driven). Mic → VAD → STT → `WakeFilter` (admit) → `AddressFilter` (strict multi-signal dispatch gate) → `CognitionEngine` → `ToolRegistry` (which may invoke `RobotTTS.speak` → `mlx-tts` sidecar → `MediaClient` upload + `play_sound`). The `AddressFilter` fuses segment loudness, DoA (robot mic), face engagement, STT confidence, and a junk-phrase deny-list — wake-name still wins but only if the segment has real audio energy. See `docs/concepts/voice-pipeline.md` + `docs/concepts/address-filter.md`.
 
 ### The Sidecar contract — *the* invariant
 
@@ -49,12 +49,13 @@ For models with strong native tool calling (e.g., `qwen3.6-27b@4bit`), the fence
 # Headless build (libraries + executable)
 swift build
 
-# Full test suite (53 tests across 17 suites; integration tests spawn echo + face-tracker sidecars)
+# Full test suite (76 tests across 18 suites; integration tests spawn echo + face-tracker sidecars)
 swift test
 
 # Filter to one suite
 swift test --filter "Sidecar host"
 swift test --filter "WakeFilter"
+swift test --filter "AddressFilter"
 
 # Build a proper macOS .app bundle (with Info.plist + ad-hoc codesign).
 # Use this — NOT `swift run` — because TCC permission prompts (mic,

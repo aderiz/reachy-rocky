@@ -230,6 +230,20 @@ public actor MacFaceTracker {
     /// move (wake_up / goto_sleep / emotion). Caller toggles this.
     private var streamerSuppressed: Bool = false
     private var userEnabled: Bool = true
+    /// Mirrors `services.rockyState == .sleeping`. When true the tracker
+    /// stops ingesting camera frames AND skips the idle-look-around in
+    /// `commandLoop`. Set by AppServices on wake/sleep transitions.
+    /// Independent of `userEnabled` (which is the user toggle) so a
+    /// sleeping bot doesn't burn camera CPU + can't be moved by the
+    /// idle searcher, but the user's "face tracking on" preference is
+    /// preserved across wake cycles.
+    private var sleeping: Bool = false
+    /// When false, the idle look-around (slow Lissajous pan over 30s
+    /// yaw period) is skipped — head simply decays to neutral when a
+    /// face leaves frame. Drives by `SettingsStore.faceTrackerIdleSearchEnabled`
+    /// (default false; user-opt-in). Was effectively always-on in v0.x
+    /// which made the bot pan autonomously and felt uncanny.
+    private var idleSearchEnabled: Bool = false
 
     private var detectorTask: Task<Void, Never>?
     private var commandTask: Task<Void, Never>?
@@ -279,6 +293,25 @@ public actor MacFaceTracker {
         self.userEnabled = enabled
     }
 
+    /// Mirror Rocky's sleep state into the tracker. When asleep:
+    ///   - frame ingestion is skipped (saves Vision CPU, prevents the
+    ///     tracker from generating targets that would be ignored
+    ///     anyway since motors are disabled)
+    ///   - idle look-around is skipped (no autonomous pan while
+    ///     asleep)
+    /// AppServices calls this from sleepRobot / wakeRobot.
+    public func setSleeping(_ asleep: Bool) {
+        self.sleeping = asleep
+    }
+
+    /// Toggle the slow Lissajous idle pan. Off by default — the bot
+    /// holds neutral when a face leaves frame instead of autonomously
+    /// looking around. Was always-on in v0.x and read as uncanny;
+    /// user can opt back in via SettingsStore.
+    public func setIdleSearchEnabled(_ enabled: Bool) {
+        self.idleSearchEnabled = enabled
+    }
+
     /// Start the 50 Hz command tick. Caller pushes frames in via `ingest(_:)`.
     public func start() {
         commandTask?.cancel()
@@ -295,6 +328,13 @@ public actor MacFaceTracker {
     /// stream and forwards each frame here so we don't fight the UI mirror
     /// for the single-consumer AsyncStream.
     public func ingestFrame(_ frame: RobotCameraService.Frame) async {
+        // Skip detection work when Rocky is asleep. Motors are off
+        // (daemon ignores set_target while sleeping), so any target
+        // we generate would be useless — and skipping saves the
+        // Vision detection pass (~10 ms on Apple Silicon). Also
+        // prevents the EMA / damper state drifting overnight from
+        // stray detections that go nowhere.
+        if sleeping { return }
         await ingest(frame)
     }
 
@@ -584,6 +624,11 @@ public actor MacFaceTracker {
     /// gently and pitches up/down at a different period so the motion
     /// never repeats exactly. The damper still smooths everything.
     private func decayIfIdle(dt: Double) async -> Bool {
+        // Settings-gated. Off by default — the bot stays neutral when
+        // no face is in frame, instead of autonomously panning. Also
+        // skipped while asleep so a brief mid-night detection can't
+        // start it scanning.
+        guard idleSearchEnabled, !sleeping else { return false }
         guard let last = lastDetectionTs else { return false }
         let elapsed = Date().timeIntervalSince(last)
         if elapsed < config.idleTimeoutS { return false }

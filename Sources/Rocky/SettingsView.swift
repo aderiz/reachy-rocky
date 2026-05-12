@@ -760,94 +760,126 @@ private struct EnrollFaceForm: View {
     @State private var photos: [Data] = []
     @State private var error: String?
     @State private var submitting: Bool = false
+    @State private var pronouncing: Bool = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            row("Name", placeholder: "Alice", text: $name)
-            row("Says",
-                placeholder: "phonetic spelling (optional, e.g. shi-vawn)",
-                text: $pronunciation, width: 360)
-
-            HStack(spacing: 8) {
-                Button {
-                    choosePhotos()
-                } label: {
-                    Label("Choose photos\u{2026}",
-                          systemImage: "photo.on.rectangle.angled")
-                }
-                Button {
-                    useCameraFrame()
-                } label: {
-                    Label("Use current frame", systemImage: "camera")
-                }
-                Spacer()
+        // A two-column grid (label / control) instead of a nested
+        // `Form { .formStyle(.grouped) }`. Nesting a grouped Form
+        // inside the parent grouped Form was the bug: LabeledContent
+        // inside a nested grouped form collapses the trailing control
+        // to right-aligned static text, which is why "Alice" rendered
+        // as a label and "phonetic spelling…" wrapped centred.
+        //
+        // Grid with leading/firstTextBaseline alignment gives the
+        // same trailing-control feel as System Settings without the
+        // nested-Form glitches, and lets the hint + photo strip
+        // attach naturally below the row they belong to.
+        Grid(alignment: .leadingFirstTextBaseline,
+             horizontalSpacing: 12,
+             verticalSpacing: 10) {
+            GridRow {
+                Text("Name")
+                    .gridColumnAlignment(.trailing)
+                    .foregroundStyle(.secondary)
+                TextField("Alice", text: $name)
+                    .textFieldStyle(.roundedBorder)
             }
 
-            if !photos.isEmpty { photoStrip }
-
-            if let err = error {
-                Text(err).font(.caption).foregroundStyle(.red)
-            }
-
-            HStack {
-                Spacer()
-                Button {
-                    Task { await submit() }
-                } label: {
-                    if submitting {
-                        HStack(spacing: 6) {
-                            ProgressView().controlSize(.small)
-                            Text("Adding\u{2026}")
+            GridRow {
+                Text("Says")
+                    .gridColumnAlignment(.trailing)
+                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        TextField("phonetic spelling (optional)",
+                                  text: $pronunciation)
+                            .textFieldStyle(.roundedBorder)
+                        Button {
+                            speakPronunciationTest()
+                        } label: {
+                            Image(systemName: pronouncing
+                                  ? "speaker.wave.2.fill"
+                                  : "play.circle.fill")
+                                .symbolRenderingMode(.hierarchical)
+                                .font(.title3)
+                                .symbolEffect(.pulse, isActive: pronouncing)
                         }
-                    } else {
-                        Label("Add face", systemImage: "person.fill.badge.plus")
+                        .buttonStyle(.borderless)
+                        .disabled(pronunciationTestDisabled)
+                        .help(pronunciationHelp)
+                        .accessibilityLabel("Test pronunciation")
+                    }
+                    Text("e.g. \u{201C}shi-vawn\u{201D} for Siobhán")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            GridRow(alignment: .firstTextBaseline) {
+                Text("Photos")
+                    .gridColumnAlignment(.trailing)
+                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        Button {
+                            choosePhotos()
+                        } label: {
+                            Label("Choose photos\u{2026}",
+                                  systemImage: "photo.on.rectangle.angled")
+                        }
+                        Button {
+                            useCameraFrame()
+                        } label: {
+                            Label("Use current frame", systemImage: "camera")
+                        }
+                    }
+                    if !photos.isEmpty {
+                        photoStrip
                     }
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(
-                    submitting
-                    || name.trimmingCharacters(in: .whitespaces).isEmpty
-                    || photos.isEmpty
-                )
+            }
+
+            if let err = error {
+                GridRow {
+                    Color.clear.frame(width: 0, height: 0)
+                    Text(err)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            GridRow {
+                Color.clear.frame(width: 0, height: 0)
+                HStack {
+                    Spacer()
+                    Button {
+                        Task { await submit() }
+                    } label: {
+                        if submitting {
+                            HStack(spacing: 6) {
+                                ProgressView().controlSize(.small)
+                                Text("Adding\u{2026}")
+                            }
+                        } else {
+                            Label("Add face",
+                                  systemImage: "person.fill.badge.plus")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(
+                        submitting
+                        || name.trimmingCharacters(in: .whitespaces).isEmpty
+                        || photos.isEmpty
+                    )
+                }
             }
         }
-        .padding(12)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(.gray.opacity(0.05))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(.gray.opacity(0.18), lineWidth: 1)
-        )
+        .padding(.vertical, 2)
     }
 
     // MARK: - Subviews
-
-    @ViewBuilder
-    private func row(_ label: String,
-                     placeholder: String,
-                     text: Binding<String>,
-                     width: CGFloat = 280) -> some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text(label)
-                .font(.callout.weight(.medium))
-                .frame(width: 80, alignment: .leading)
-                .foregroundStyle(.secondary)
-            TextField(placeholder, text: text)
-                .textFieldStyle(.plain)
-                .padding(.horizontal, 12).padding(.vertical, 8)
-                .frame(width: width)
-                .background(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(.gray.opacity(0.08))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .strokeBorder(.gray.opacity(0.20), lineWidth: 1)
-                )
-        }
-    }
 
     private var photoStrip: some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -907,6 +939,48 @@ private struct EnrollFaceForm: View {
         }
         photos.append(frame.jpeg)
         error = nil
+    }
+
+    // MARK: - Pronunciation test
+
+    /// Text to send through TTS for the pronunciation test. Uses the
+    /// pronunciation field if non-empty, falls back to the name —
+    /// that mirrors how the rest of the app treats the pronunciation:
+    /// it overrides the displayed name when speaking, otherwise the
+    /// name itself is spoken.
+    private var pronunciationTestText: String {
+        let pron = pronunciation.trimmingCharacters(in: .whitespaces)
+        if !pron.isEmpty { return pron }
+        return name.trimmingCharacters(in: .whitespaces)
+    }
+
+    private var pronunciationTestDisabled: Bool {
+        pronouncing || pronunciationTestText.isEmpty
+    }
+
+    private var pronunciationHelp: String {
+        if !pronunciationTestText.isEmpty {
+            return "Hear how Rocky says \u{201C}\(pronunciationTestText)\u{201D}."
+        }
+        return "Enter a name (or phonetic spelling) to hear how Rocky says it."
+    }
+
+    /// Send the pronunciation through Rocky's TTS so the user can hear
+    /// whether the phonetic spelling produces the right sound before
+    /// committing the enrollment. Plays through the robot speaker
+    /// (same path as any other TTS).
+    private func speakPronunciationTest() {
+        let text = pronunciationTestText
+        guard !text.isEmpty, !pronouncing else { return }
+        pronouncing = true
+        Task {
+            do {
+                _ = try await services.robotTTS.speak(text)
+            } catch {
+                await MainActor.run { self.error = "TTS test failed: \(error)" }
+            }
+            await MainActor.run { self.pronouncing = false }
+        }
     }
 
     private func submit() async {

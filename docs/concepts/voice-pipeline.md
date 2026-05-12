@@ -2,25 +2,32 @@
 title: Voice / listen pipeline
 type: concept
 status: current
-last_updated: 2026-05-08
+last_updated: 2026-05-12
 sources:
   - Sources/Voice/
   - Sources/Rocky/MicCalibrationView.swift
-tags: [voice, audio, vad, stt, wake]
+  - Sidecars/mlx-stt/rocky_mlx_stt/runner.py
+tags: [voice, audio, vad, stt, wake, address-filter]
 ---
 
 # Voice / listen pipeline
 
-The path from "the user opens their mouth" to "the LLM gets a turn." Five
-stages, each with its own type, all linked by `VoiceCoordinator` so they
-can be tested independently.
+The path from "the user opens their mouth" to "the brain gets a turn."
+Six stages now, after the [AddressFilter](address-filter.md) rework.
 
 ```
-mic source ──▶ AudioRingBuffer ──▶ EnergyVAD ──▶ AppleSpeechSTT ──▶ WakeFilter ──▶ CognitionEngine
-   (Mac /         (drop-newest        (live-       (per-call           (state           (LLM turn)
-    robot)         under              tunable      retry, locale       machine,
-                   saturation)        threshold)   robust)             60 s window)
+mic ──▶ AudioRingBuffer ──▶ VAD ──▶ STT ──▶ WakeFilter ──▶ AddressFilter ──▶ Brain
+(Mac /   (drop-newest        (energy   (Apple Speech /     (admit on wake-     (strict
+ robot)   under saturation)   or       MLX-Whisper /       name or while       multi-signal
+                              Silero)   WhisperKit)        window open)        dispatch gate)
 ```
+
+The single-signal "did the VAD think there was speech?" path of v0.x
+dispatched too many transcripts — Whisper hallucinations, TV in the
+background, other people's conversations. The new architecture pairs
+a **permissive VAD** with a **strict address filter** so spurious
+input gets caught at the gate that has the full picture (segment
+loudness, DoA, face presence, STT confidence).
 
 ## Stages
 
@@ -30,216 +37,205 @@ Two implementations behind the same shape:
 
 - `MicService` — `AVAudioEngine` reading the Mac's default input. Used
   when `settings.micSource == "mac"`.
-- `RobotMicService` — wraps the `robot-mic` sidecar (Python +
-  `reachy_mini` SDK over WebRTC) and feeds frames into the same buffer.
-  Default when the sidecar venv exists at
-  `~/Library/Application Support/Rocky/sidecars/robot-mic/.venv/`.
+- `RobotMicService` — wraps the `robot-mic` sidecar (now a WebSocket
+  subscriber to the on-bot relay, see
+  [on-bot-media-relay](on-bot-media-relay.md)). When the source is
+  `"robot"`, also exposes `lastDoaRad` + `lastDoaIsSpeech` from the
+  on-bot mic array.
 
 Both write 16 kHz mono `Float32` into one shared `AudioRingBuffer`.
-Switching source mid-session requires toggling Listen off and on — the
-audio chain is bound at start time.
+Switching source mid-session requires toggling Listen off and on.
 
 ### 2. Ring buffer — `AudioRingBuffer`
 
-Single-producer / single-consumer lock-free buffer. **Drop-newest** when
-full, not drop-oldest: the oldest samples in a saturated buffer typically
-contain the *start* of the user's utterance — including the wake word
-"Rocky" — so dropping them would gut wake matching. The cost is a
-truncated tail of an over-long utterance, which is far less destructive.
+Single-producer / single-consumer lock-free buffer. **Drop-newest**
+when full, not drop-oldest: the oldest samples in a saturated buffer
+typically contain the *start* of the user's utterance — including the
+wake word — so dropping them would gut wake matching.
 
-`droppedSamples` is exposed; the dashboard can surface the drop rate.
+### 3. VAD — `EnergyVAD` (or `SileroVAD`)
 
-### 3. VAD — `EnergyVAD`
+Pragmatic energy detector. RMS over a sliding 30 ms frame; above
+threshold for `minSpeechFrames` consecutive frames → `speechStart`;
+below for `minSilenceFrames` → `speechEnd`.
 
-Pragmatic energy-based detector. RMS over a sliding 30 ms frame; above
-`config.rmsThreshold` for `minSpeechFrames` consecutive frames →
-`speechStart`. Below for `minSilenceFrames` → `speechEnd`.
+VAD is intentionally **permissive** — its job is to find boundaries,
+not to decide whether the speech was addressed to Rocky. False
+positives (background TV passes VAD) are caught downstream by the
+AddressFilter. The threshold is set by the calibration flow against
+the user's **room noise only**, not motor-under-load, so it stays low
+enough to catch normal speech.
 
-Defaults (tuned across sessions):
+### 4. STT — Apple Speech / MLX-Whisper / WhisperKit
 
-| Field              | Default | Notes |
-|--------------------|---------|-------|
-| `rmsThreshold`     | 0.008   | Lower than the original 0.015 (was missing quiet/distant speech). User-calibrated via the Settings sheet — see below. |
-| `minSpeechFrames`  | 3       | ~90 ms of confirmed speech. |
-| `minSilenceFrames` | 22      | ~660 ms — enough to span natural mid-sentence pauses without ending the segment. The previous 14 (~420 ms) was clipping turns. |
+Three engines behind a single protocol; `settings.sttEngine`
+selects. MLX-Whisper is default when its sidecar venv is present.
 
-Threshold is **publicly mutable**: `EnergyVAD.config.rmsThreshold` can
-be reassigned without resetting the frame counters, so a re-tune
-mid-utterance just shifts the cutoff for subsequent frames. This is
-how live calibration applies without restarting the listen pipeline.
+**Whisper hallucination mitigation** (Sidecars/mlx-stt):
 
-The `VAD` protocol exists so a `SileroVAD` (CoreML) drop-in can replace
-the energy detector behind the same interface. Currently energy-only.
+- `initial_prompt="A short conversation between a person and a robot
+  named Rocky."` biases the language prior away from YouTube-credit
+  hallucinations ("thank you for watching", "subscribe").
+- Temperature fallback ladder `(0.0, 0.2, …, 1.0)` retries when
+  `compression_ratio_threshold=1.8` flags a degenerate output.
+- `no_speech_threshold=0.7` (tighter than upstream 0.6) drops
+  low-confidence silence segments before transcription.
+- Confidence-gated phrase deny-list — only drops boilerplate
+  hallucinations ("thank you", "thanks for watching", "subtitles by
+  the Amara.org community") when segment `no_speech_prob ≥ 0.4` *or*
+  `avg_logprob ≤ -0.8`. A real "thank you" said clearly passes.
+- N-gram repetition collapse for the "X. X. X. X." trap.
 
-### 4. STT — `AppleSpeechSTT`
+The transcript surface (`Transcript`) carries:
 
-`SFSpeechRecognizer` actor with two pieces of robustness baked in:
-
-- **Recogniser is `var`, not `let`.** `SFSpeechRecognizer(locale:)` may
-  return `nil` on a fresh install if Speech is still downloading the
-  locale's offline model in the background. Each `transcribe` call
-  retries `ensureRecognizer()` so a first-launch user with `en-GB`
-  (or any on-demand locale) gets STT as soon as the assets land.
-- **`requiresOnDeviceRecognition` evaluated per-call.** The flag flips
-  when the offline model finishes downloading; setting it true with
-  the model not yet available silently fails.
-
-The "No speech detected" `kAFAssistantErrorDomain code 1110` error is
-treated as a benign empty transcript, not a thrown error.
+- `text`
+- `confidence` (Apple Speech only — MLX paths report 1.0)
+- `language`
 
 ### 5. Wake filter — `WakeFilter`
 
-State machine: `sleeping` → `open(until: Date)` → back to `sleeping`.
+State machine: `sleeping` → `open(until:)` → back to `sleeping`.
 
-- **Sleeping**: STT runs, but final transcripts only dispatch if they
-  contain the wake word ("Rocky" / "Rockey" / "Rocki"). The match is
-  tolerant of punctuation and uses a 5-token lookahead so embedded
-  wake-words ("Rocky, what time is it") still dispatch the whole
-  transcript. Article-prefixed hits ("the rocky road") are skipped via
-  a `continue`.
-- **Open**: any final transcript dispatches; the deadline auto-extends
-  (60 s default) on each turn. Stop phrases ("stop listening", "go to
-  sleep") close the window early; `manual` close also fires from the
-  Settings toggle.
+- **Sleeping**: STT runs, but final transcripts only **admit** if they
+  contain the wake word. Match is tolerant ("Rocky" / "Rockey" /
+  "Rocki") with a 5-token lookahead; article-prefixed hits ("the
+  rocky road") are skipped.
+- **Open**: any final transcript admits. **Crucially, the window no
+  longer auto-extends on `.withinWindow` hits** — only the
+  AddressFilter's engagement decision extends it (see step 6). Default
+  duration is **20 s**, down from 60 s — short enough that a stray
+  hallucination can't perpetuate it indefinitely.
+- Stop phrases ("stop listening", "go to sleep", "good night") close
+  the window early.
 
-Wake-state changes surface as `Output.windowOpened(until:)` /
-`.windowClosed(reason:)` events on the coordinator's `outputs` stream;
-`AppServices` mirrors them into `conversationOpenUntil` for the UI.
+A new `extendOnEngaged()` is called by `AppServices.handleVoice` after
+the AddressFilter accepts a transcript *with* real engagement
+evidence (loud + DoA on-axis + face / verb prefix). Without this gate,
+hallucinations could re-extend the window every time they slipped
+through.
 
-### 6. Coordinator — `VoiceCoordinator`
+### 6. Address filter — `AddressFilter`
+
+The **strict** gate. Sees the transcript plus all the signals that
+would let a human decide "was this addressed to me?":
+
+- Segment peak / mean RMS (loudness over room noise)
+- DoA from the on-bot mic array (robot mic only)
+- Face age (was the user looking at the camera recently?)
+- STT confidence
+- TTS state (Rocky is speaking → echo gate)
+- WakeFilter reason (wake-match vs. within-window)
+
+Full ruleset in [address-filter](address-filter.md). The short
+version: wake-name still wins (over all other gates) but only if the
+segment has real audio energy; otherwise the strict ruleset requires
+loudness *and* DoA on-axis (robot mic) *and* face or verb-prefix
+engagement. Strict mode means "when in doubt, drop."
+
+### 7. Coordinator — `VoiceCoordinator`
 
 The actor that wires it all up. Three behaviours worth knowing:
 
-- **Pre-roll buffer (180 ms / 6 frames).** While the VAD is in `silence`,
-  every incoming chunk is also kept in a rolling pre-roll. On
-  `speechStart`, the pre-roll is prepended to `pendingSegment` *before*
-  the chunk that triggered the transition. Without this, the first
-  90–180 ms of speech is clipped (the VAD needs `minSpeechFrames` of
-  loud audio to confirm speech, and that audio was being thrown away).
-  Symptom this fixed: "Rocky" → "ocky" → STT hears "okay" / "hockey",
-  wake filter misses.
-- **Single-slot queued segment.** STT is single-in-flight (Apple
-  Speech doesn't pipeline a second request well). Old behaviour: drop
-  the new segment if STT is busy. New: keep one queued segment;
-  replace it if a third arrives. So a fast back-and-forth ("Rocky" →
-  "what time is it" 400 ms later) still gets both segments
-  transcribed and dispatched in order.
-- **Force-end ≠ VAD reset.** When `pendingSegment` exceeds the
-  `maxSegmentS` cap (12 s default), the segment is flushed but the
-  VAD's `inSpeech` latch is **kept true** — the user is still talking,
-  the cap is an artificial slice, and resetting the VAD would drop the
-  next ~90 ms of speech to re-confirm.
+- **Pre-roll buffer (180 ms / 6 frames).** Prepended to the segment
+  on `speechStart` so the VAD doesn't clip the leading phoneme of
+  the wake word.
+- **Single-slot queued segment.** STT is single-in-flight; if a
+  second segment arrives while STT is busy, it queues; a third
+  replaces the queued one.
+- **Force-end ≠ VAD reset.** Hitting the `maxSegmentS` cap (12 s)
+  flushes but keeps `inSpeech` true — the user is still talking.
+
+`Output.finalText` now carries `confidence`, `peakRMS`, `meanRMS`
+alongside `text`/`dispatched`/`reason` so the AddressFilter has the
+metadata to score without re-reading the audio.
 
 ## Calibration
 
-Settings → Voice → "Sensitivity" exposes:
+`MicCalibrationView` is a four-phase capture (was three) with the
+first two and last two user-gated:
 
-- A live RMS readout (mirrors `services.lastMicRMS`).
-- A manual threshold slider (range 0.001…0.05, step 0.001).
-- A **Calibrate…** button that opens `MicCalibrationView`.
+1. **Room** (8 s, robot asleep, auto). HVAC + fan + computer hum.
+   Used as the noise ceiling for VAD and AddressFilter.
+2. **Rocky** (6 s, motors-under-load, auto). The Mac drives a 50 Hz
+   parametric Lissajous head sweep (yaw amplitude ~16°, pitch
+   amplitude ~6°, coprime periods 3.7 s / 2.3 s) while recording.
+   Face tracking is **triple-suppressed** (`transitioningUntil` +
+   `targetStreamer.setPrimaryMoveActive(true)` +
+   `setFaceTrackingEnabled(false)`) so nothing fights the motion.
+   Logged for diagnostic purposes but does **not** drive the VAD
+   threshold — Rocky listens to the user while stationary, so the
+   motor-under-load samples don't represent the floor he sees.
+3. **Your voice** (12 s, user-gated). Press Start, then speak
+   naturally with pauses. Used for the VAD threshold math.
+4. **Address Rocky** (8 s, user-gated). Press Start, then address
+   Rocky directly from where you normally sit, with "Rocky, …"
+   prompts. Captures direct-address RMS *and* (on robot mic) the
+   user's DoA centre + spread. Produces the four AddressFilter
+   values: `addressRMSFloor`, `addressLoudnessRatio`,
+   `addressUserDoaCenterRad`, `addressUserDoaToleranceRad`.
 
-Calibration is a two-phase capture:
+A diagnostic LogBus event fires at the end of computing so the user
+can see exactly what calibration produced in the Logs view
+(`room_p99`, `address_p25`, `address_p50`, computed thresholds, DoA
+centre / tolerance, DoA sample count).
 
-1. **Quiet (2 s).** "Don't speak. Rocky is sampling room noise." Polls
-   `lastMicRMS` at 20 Hz; collects `noiseSamples`.
-2. **Speak (3 s).** "Speak normally." Same poll; collects
-   `speechSamples`.
-
-Threshold formula: midpoint between `noise_max × 1.5` (headroom over
-peak room noise) and `speech_p25 × 0.5` (half the 25th-percentile
-speech RMS, well below any normal word), clamped to `[0.001, 0.05]`.
-The full math is in `MicCalibrationView.computeThreshold`.
-
-The result is persisted as `settings.micVADThreshold` and applied
-**live** via `voice.setVADThreshold(_)` — no Listen-toggle required.
-Subsequent launches seed the VAD from the persisted value (see
-`AppServices.init` where the initial `EnergyVAD.Config` is built).
-
-The sheet auto-enables Listen on entry (so RMS samples flow) and
-restores the prior state on dismiss, so calibration is non-disruptive
-to the user's mic-on/mic-off preference.
+The flow runs `services.sleepRobot()` / `services.wakeRobot()` (not
+the raw daemon endpoints) so the streamer is suppressed during the
+sleep / wake transitions and Rocky reaches his home pose before
+phase 2 starts.
 
 ## Telemetry
 
-Every stage publishes to `LogBus`:
+Every stage publishes to `LogBus`. New events for the listening
+rework:
 
-- `vad_segment` — start/end of a detected speech burst.
-- `stt_final` — final transcript text + total latency (ms).
-- `wake_match` — wake-word hit with the matched name and the full
-  transcript.
-- `conv_window` — `opened` / `extended` / `closed(reason)` transitions.
-- `error(scope: "stt", ...)` — transcription failures (recoverable).
+- `addressFilterAccept(text, score, reasons)` — dispatch decision
+  with the positive gates that fired.
+- `addressFilterDrop(text, score, reasons)` — drop decision with the
+  negative gates. Surfaces in LogsView as
+  `ignored (0.45) [low_loudness, no_face]`.
 
-The Activity tab of the inspector renders these rows in time order; the
-Hero card surfaces the latest.
+Existing events (`vadSegment`, `sttPartial`, `sttFinal`, `wakeMatch`,
+`conversationWindow`) unchanged.
 
 ## Echo gate
 
-When Rocky speaks, his TTS bleeds into his own mic and the STT pipeline
-will dutifully transcribe it. Two gates running side by side:
-
-- **Streaming path (default since v0.2 with Qwen3-TTS).**
-  `StreamingTTS.playToRobot` flips `isSpeaking = true` on the **first
-  PCM chunk** emitted by the sidecar (echo gate engages as soon as
-  synthesis starts, not when the robot begins playing), and flips back
-  off after `durationS + sttPostRollS` (default 0.5 s) has elapsed.
-  This is the ground-truth signal the persona's M6 plan asked for —
-  `ttsBusyUntil` is updated from `isSpeakingStream` rather than guessed.
-- **Legacy non-streaming path (Chatterbox or any backend reporting
-  `streams: false`).** `AppServices.say` stamps `ttsBusyUntil` to
-  `Date() + estimated_speech_duration + 1.5s_tail` before the
-  `robotTTS.speak` await begins, then refines after `speak` returns
-  with the real `durationS + 1.5s`. The voice-output handler discards
-  finals whose timestamp falls inside the window.
-
-In both cases the 0.5–1.5 s tail covers the fall-off of the speaker
-after the audio frame itself ends. Without this, Rocky frequently
-dispatched fragments of his own last reply as the user's next input.
+`AppServices.handleVoice` checks `ttsBusyUntil` (+ 1.5 s tail) and
+the AddressFilter explicitly drops with reason `echo_tail` when
+Rocky is speaking. `StreamingTTS.playToRobot` flips
+`isSpeaking = true` on the first PCM chunk; legacy non-streaming
+backends stamp `ttsBusyUntil = Date() + estimatedDuration + 1.5 s`.
 
 ## TTS playback target — robot speaker only
 
 Synthesised audio always plays through the **robot speaker**, never
-the Mac. Both the legacy `RobotTTS.speak` (full-WAV → upload →
-`play_sound`) and the streaming `speakStreaming` (PCM chunks
-accumulated by `StreamingTTS.playToRobot` → single WAV → upload →
-`play_sound`) terminate at the daemon's `/api/media/play_sound`
-endpoint. The `AVAudioEngine`-backed Mac-local path in
-`StreamingTTS.play(chunks:)` still exists for testing but has no
-production caller.
-
-The trade-off is that chunked streaming through the robot is not
-incremental — we wait for synthesis to finish before sending the
-WAV — because the daemon's `play_sound` is not a streaming endpoint.
-First-chunk-on-Mac (97 ms target) becomes first-audio-on-robot
-(synthesis time + upload, currently ~3 s with ICL cloning on a 6 s
-reference). Trueing this up requires either chunked play_sound on
-the daemon side or a parallel WebRTC audio stream, neither of which
-exists yet.
+the Mac. Both legacy `RobotTTS.speak` and streaming
+`StreamingTTS.playToRobot` terminate at the daemon's
+`/api/media/play_sound`.
 
 ## Vision integration with the brain
 
-When the brain backend is MLX-VLM (the v0.2 default), the latest
-JPEG from `lastCameraFrame` is passed to the model at the start of
-every chat turn via the `imageProvider` closure in `CognitionEngine`.
-Rocky can answer questions about visible content ("what am I
-holding?", "how do I look?") because the model gets the pixels with
-the user's text in the same prompt. The persona (v6+) carries a
-VISION section with worked examples so the model actually uses the
-frame instead of falling back to "Rocky not know".
+When the brain backend is MLX-VLM (default), the latest JPEG from
+`lastCameraFrame` is passed to the model via the `imageProvider`
+closure in `CognitionEngine`. Two toolbar toggles control the
+camera-to-brain feed:
 
-Two toolbar toggles control the camera-to-brain feed:
+- **Vision** — gates the imageProvider.
+- **Face tracking** — pauses / resumes `MacFaceTracker.setEnabled`
+  so the head stops following faces but the camera keeps streaming.
+  The tracker also auto-pauses when Rocky is asleep
+  (`setSleeping(true)`) to save CPU and prevent state drift.
 
-- **Vision** (`eye.fill` / `eye.slash.fill`) — gates the
-  `imageProvider`. Off = text-only conversation, camera sidecar
-  keeps running for the Vision card and face tracker.
-- **Face tracking** (`face.smiling.inverse` / `face.dashed`) — pauses
-  / resumes `MacFaceTracker.setEnabled` so the head stops following
-  faces but the camera keeps streaming.
+The face tracker's idle look-around (slow Lissajous pan when no
+face is in frame) is now **opt-in** via
+`SettingsStore.faceTrackerIdleSearchEnabled`, default `false`. The
+previous always-on behaviour read as uncanny / attention-stealing.
 
 ## See also
 
+- [address-filter](address-filter.md) — the strict dispatch gate.
 - ADR `0003-sidecar-convention.md` — why the robot mic comes through
   a sidecar.
-- `concepts/cockpit-design.md` — where voice surfaces in the UI.
-- `concepts/permissions-authority.md` — mic + speech recognition
-  permission gating.
+- [cockpit-design](cockpit-design.md) — where voice surfaces in the UI.
+- [permissions-authority](permissions-authority.md) — mic + speech
+  recognition permission gating.

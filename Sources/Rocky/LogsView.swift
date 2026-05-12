@@ -330,6 +330,16 @@ struct LogsView: View {
                 return (.voice, "wake matched '\(name)'", transcript)
             case .conversationWindow(let transition, let reason):
                 return (.voice, "conv window \(transition.rawValue) (\(reason))", "")
+            case .addressFilterAccept(let text, let score, let reasons):
+                return (.voice,
+                        String(format: "addressed (%.2f) [%@]", score,
+                               reasons.joined(separator: ", ")),
+                        text)
+            case .addressFilterDrop(let text, let score, let reasons):
+                return (.voice,
+                        String(format: "ignored (%.2f) [%@]", score,
+                               reasons.joined(separator: ", ")),
+                        text)
             case .ttsRequest(let text, let voiceRefId, let firstChunkMs):
                 let ms = firstChunkMs.map { String(format: "%.0fms ", $0) } ?? ""
                 return (.voice, "tts \(ms)voice=\(voiceRefId)", text)
