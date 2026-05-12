@@ -327,24 +327,24 @@ struct StatusView: View {
                 subtitle = "relay unreachable"
             } else if !snap.present {
                 state = .unknown
-                subtitle = "BMS not exposed by bot image"
+                subtitle = "no signal — daemon raw-packet WS unreachable"
             } else {
-                let pct = snap.percent ?? 100
-                if snap.charging == true {
+                if snap.powerSource == "dc" {
                     state = .ok
-                } else if pct < 15 {
-                    state = .bad
-                } else if pct < 30 {
-                    state = .warn
                 } else {
-                    state = .ok
+                    let pct = snap.percent ?? 100
+                    if pct < 15 { state = .bad }
+                    else if pct < 30 { state = .warn }
+                    else { state = .ok }
                 }
                 var parts: [String] = []
-                if let p = snap.percent { parts.append("\(p)%") }
                 if let st = snap.status { parts.append(st.lowercased()) }
                 if let v = snap.voltageV { parts.append(String(format: "%.2fV", v)) }
-                if let a = snap.currentA { parts.append(String(format: "%.2fA", a)) }
+                if let p = snap.percent { parts.append("≈\(p)%") }
                 if let t = snap.temperatureC { parts.append(String(format: "%.0f°C", t)) }
+                if snap.source == "dynamixel:reg144" {
+                    parts.append("via motor reg 144")
+                }
                 subtitle = parts.joined(separator: " · ")
             }
         } else {
@@ -353,7 +353,7 @@ struct StatusView: View {
         }
         return HealthRow(
             id: "battery",
-            title: "Battery",
+            title: "Power",
             subtitle: subtitle,
             icon: batteryIconName(services.latestBattery),
             state: state,
@@ -365,15 +365,13 @@ struct StatusView: View {
         guard let snap, snap.reachable, snap.present else {
             return "battery.0percent"
         }
+        if snap.powerSource == "dc" { return "powerplug.fill" }
         let pct = snap.percent ?? 0
-        let bolt = (snap.charging == true) ? ".bolt" : ""
-        let base: String
-        if pct >= 88 { base = "battery.100" }
-        else if pct >= 63 { base = "battery.75" }
-        else if pct >= 38 { base = "battery.50" }
-        else if pct >= 13 { base = "battery.25" }
-        else { base = "battery.0" }
-        return "\(base)percent\(bolt)"
+        if pct >= 88 { return "battery.100percent" }
+        if pct >= 63 { return "battery.75percent" }
+        if pct >= 38 { return "battery.50percent" }
+        if pct >= 13 { return "battery.25percent" }
+        return "battery.0percent"
     }
 
     private var robotRow: HealthRow {

@@ -110,17 +110,9 @@ struct RootView: View {
 
         ToolbarItem(placement: .principal) { Spacer() }
 
-        ToolbarItem(placement: .primaryAction) {
-            // Clicking the chip opens Inspector → Status, where the
-            // detailed Body row shows voltage, current, temperature,
-            // and source. The chip itself just shows percent + state.
-            Button {
-                inspectorPresented = true
-            } label: {
-                BatteryChip(snapshot: services.latestBattery)
-            }
-            .buttonStyle(.plain)
-        }
+        // Power chip lives on the portrait (top-right of the avatar)
+        // rather than the toolbar, so the toolbar stays focused on
+        // controls and the chip is visible next to Rocky himself.
 
         ToolbarItem(placement: .primaryAction) {
             Button {

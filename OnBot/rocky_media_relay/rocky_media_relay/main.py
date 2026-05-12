@@ -12,7 +12,14 @@ Endpoints (mounted under `self.settings_app`, which the daemon exposes
 at the app's `custom_app_url`, default `http://0.0.0.0:8042`):
 
   GET  /health              — JSON liveness + counters (includes battery)
-  GET  /battery             — battery snapshot (see `read_battery`)
+  GET  /battery             — battery snapshot. Combines sysfs (always
+                              empty on the Wireless image — no BMS
+                              kernel driver) with the *real* signal:
+                              the Dynamixel motor supply voltage from
+                              register 144, read through the daemon's
+                              `WS /api/move/ws/raw/write`. Returns
+                              power_source ("dc" / "battery"), voltage,
+                              and a coarse LiFePO4 percent estimate.
   POST /control/start_recording   — begin audio capture (idempotent)
   POST /control/stop_recording    — stop audio capture (idempotent)
   WebSocket /ws/audio       — base64-encoded int16-LE mono PCM at 16 kHz +
@@ -208,6 +215,136 @@ _PSU_BASE = "/sys/class/power_supply"
 _BATTERY_CACHE_TTL_S = 2.0
 _battery_cache: tuple[float, dict] = (0.0, {})
 
+# Motor IDs the Reachy Mini Wireless ships with (1 base + 6 stewart + 2
+# antennas, all on a single Dynamixel TTL bus). We probe 10-18 because
+# that's the live ID range as of daemon 1.7.x. If Pollen renumbers in a
+# future build, expand the range.
+_DXL_MOTOR_IDS = tuple(range(10, 19))
+_DXL_VOLTAGE_REG = 144           # PRESENT_INPUT_VOLTAGE, 2 bytes (signed)
+_DXL_RAW_WS_URL = "ws://localhost:8000/api/move/ws/raw/write"
+_VOLTAGE_CACHE_TTL_S = 5.0
+_voltage_cache: dict = {"value": None, "fetched_at": 0.0, "samples": []}
+# DC charger regulates to ~7.2 V; LiFePO4 2S sits at 6.4 V flat through
+# most of discharge. A 6.9 V threshold cleanly separates them.
+_DC_THRESHOLD_V = 6.9
+
+
+def _dxl_crc16(data: bytes) -> int:
+    """Robotis Dynamixel Protocol 2.0 CRC-16/BUYPASS.
+    Polynomial 0x8005, initial 0x0000, no reflection."""
+    crc = 0
+    for b in data:
+        crc ^= b << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x8005) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc
+
+
+def _dxl_read_packet(mid: int, addr: int, n: int) -> bytes:
+    """Construct a Dynamixel Protocol 2.0 READ packet."""
+    body = bytes([
+        0xFF, 0xFF, 0xFD, 0x00,
+        mid,
+        0x07, 0x00,
+        0x02,
+        addr & 0xFF, (addr >> 8) & 0xFF,
+        n & 0xFF, (n >> 8) & 0xFF,
+    ])
+    crc = _dxl_crc16(body)
+    return body + bytes([crc & 0xFF, (crc >> 8) & 0xFF])
+
+
+def _parse_voltage_status(resp: bytes) -> Optional[float]:
+    """Parse a Dynamixel status packet returning 2-byte voltage data
+    (deci-volts → volts)."""
+    if len(resp) < 11 or resp[7] != 0x55:
+        return None
+    import struct
+    try:
+        raw = struct.unpack("<h", resp[9:11])[0]
+    except Exception:  # noqa: BLE001
+        return None
+    return raw / 10.0
+
+
+async def _read_supply_voltage() -> Optional[tuple[float, list[float]]]:
+    """Open the daemon's raw-packet WS, send READ packets to every
+    motor, and return (median, [individual samples]).
+
+    Returns None if no motor responds or the WS is unreachable.
+    Cached `_VOLTAGE_CACHE_TTL_S` seconds to avoid hammering the daemon."""
+    now = time.time()
+    cached = _voltage_cache
+    if cached["value"] is not None and (now - cached["fetched_at"]) < _VOLTAGE_CACHE_TTL_S:
+        return cached["value"], list(cached["samples"])
+
+    try:
+        import websockets
+    except ImportError:
+        return None
+
+    samples: list[float] = []
+    try:
+        async with websockets.connect(_DXL_RAW_WS_URL, open_timeout=1.0) as ws:
+            for mid in _DXL_MOTOR_IDS:
+                await ws.send(_dxl_read_packet(mid, _DXL_VOLTAGE_REG, 2))
+                try:
+                    resp = await asyncio.wait_for(ws.recv(), timeout=0.3)
+                except asyncio.TimeoutError:
+                    continue
+                v = _parse_voltage_status(resp)
+                if v is not None and 4.0 < v < 9.0:  # sanity range
+                    samples.append(v)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("supply voltage read failed: %s", exc)
+        return None
+
+    if not samples:
+        return None
+
+    import statistics
+    median_v = round(statistics.median(samples), 2)
+    _voltage_cache["value"] = median_v
+    _voltage_cache["samples"] = samples
+    _voltage_cache["fetched_at"] = now
+    return median_v, samples
+
+
+def _estimate_lifepo4_percent(v: float) -> Optional[int]:
+    """Map measured 2S-LiFePO4 pack voltage to a coarse state-of-charge
+    percent. The discharge curve is very flat across the middle range
+    (sits at ~6.4 V from ~80% down to ~20%), so this is necessarily a
+    rough estimate — fine for a chip, useless for billing or rest-time
+    projections.
+
+    Anchors (measured / spec):
+      7.00 V → 100%   (rested or charger-disconnected freshly full)
+      6.70 V →  90%   (top of plateau)
+      6.50 V →  60%   (mid plateau, observed when discharging)
+      6.40 V →  35%   (bottom of plateau, BMS still happy)
+      6.20 V →  15%   (knee of curve)
+      6.00 V →   5%   (close to BMS cutoff)
+      5.80 V →   0%   (BMS will trip very shortly)
+    """
+    if v >= 7.00:
+        return 100
+    if v >= 6.70:
+        return int(round(90 + (v - 6.70) / 0.30 * 10))
+    if v >= 6.50:
+        return int(round(60 + (v - 6.50) / 0.20 * 30))
+    if v >= 6.40:
+        return int(round(35 + (v - 6.40) / 0.10 * 25))
+    if v >= 6.20:
+        return int(round(15 + (v - 6.20) / 0.20 * 20))
+    if v >= 6.00:
+        return int(round(5 + (v - 6.00) / 0.20 * 10))
+    if v >= 5.80:
+        return int(round((v - 5.80) / 0.20 * 5))
+    return 0
+
 
 def _psu_read_str(node: str, key: str) -> Optional[str]:
     try:
@@ -382,8 +519,44 @@ class RockyMediaRelay(ReachyMiniApp):
         # FastAPI control + websocket endpoints. Registered inside
         # run() per the SDK convention (settings_app routes added
         # here are picked up when the daemon serves the app).
+        async def battery_snapshot() -> dict:
+            """Fuse sysfs (always empty on Reachy Mini Wireless — no
+            BMS driver in the stock image) with the actual signal:
+            supply voltage read from the Dynamixel motors via the
+            daemon's raw-packet WS. The motors continuously sample
+            their power input and expose it on register 144.
+
+            On DC the rail sits at ~7.2 V (charger regulation); on
+            battery at 6.4–6.7 V (LiFePO4 2S). A 6.9 V threshold
+            cleanly separates them.
+            """
+            snap = read_battery()  # sysfs base — `present` may be false
+            v_result = await _read_supply_voltage()
+            if v_result is None:
+                return snap
+            v_med, samples = v_result
+            snap["present"] = True
+            snap["voltage_v"] = v_med
+            snap["source"] = "dynamixel:reg144"
+            snap["motor_samples_v"] = samples
+            if v_med > _DC_THRESHOLD_V:
+                snap["power_source"] = "dc"
+                snap["plugged_in"] = True
+                snap["charging"] = True  # charger present → BMS is topping up
+                snap["status"] = "On DC"
+                # Percent isn't meaningful while charging — the rail is
+                # the charger voltage, not the cell voltage.
+                snap["percent"] = None
+            else:
+                snap["power_source"] = "battery"
+                snap["plugged_in"] = False
+                snap["charging"] = False
+                snap["status"] = "On battery"
+                snap["percent"] = _estimate_lifepo4_percent(v_med)
+            return snap
+
         @self.settings_app.get("/health")
-        def health():
+        async def health():
             with state.lock:
                 ac = len(state.audio_clients)
                 vc = len(state.video_clients)
@@ -399,12 +572,12 @@ class RockyMediaRelay(ReachyMiniApp):
                 "video_dropped_total": state.video_dropped_total,
                 "video_fps_cap": VIDEO_FPS_CAP,
                 "build": "rocky-media-relay/0.1",
-                "battery": read_battery(),
+                "battery": await battery_snapshot(),
             }
 
         @self.settings_app.get("/battery")
-        def battery():
-            return read_battery()
+        async def battery():
+            return await battery_snapshot()
 
         @self.settings_app.post("/control/start_recording")
         def start_recording():

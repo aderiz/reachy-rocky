@@ -23,6 +23,11 @@ public actor BatteryService {
         public let currentA: Double?
         public let temperatureC: Double?
         public let source: String?
+        /// "dc" when the bot is on external power, "battery" when on
+        /// the LiFePO4 pack, nil when the relay couldn't determine it.
+        /// Derived bot-side from the Dynamixel supply-voltage read —
+        /// see `project_supply_voltage_via_motors`.
+        public let powerSource: String?
         /// `true` when the most recent fetch reached the relay; false
         /// when the HTTP call failed. Decoupled from `present` so the
         /// UI can distinguish "bot says no BMS" from "relay
@@ -34,7 +39,8 @@ public actor BatteryService {
             present: false, percent: nil, status: nil,
             charging: nil, pluggedIn: nil,
             voltageV: nil, currentA: nil, temperatureC: nil,
-            source: nil, reachable: false, fetchedAt: .distantPast
+            source: nil, powerSource: nil,
+            reachable: false, fetchedAt: .distantPast
         )
     }
 
@@ -104,7 +110,8 @@ public actor BatteryService {
                 present: false, percent: nil, status: nil,
                 charging: nil, pluggedIn: nil,
                 voltageV: nil, currentA: nil, temperatureC: nil,
-                source: nil, reachable: false, fetchedAt: Date()
+                source: nil, powerSource: nil,
+                reachable: false, fetchedAt: Date()
             )
         }
     }
@@ -122,6 +129,7 @@ public actor BatteryService {
             currentA: obj["current_a"] as? Double,
             temperatureC: obj["temperature_c"] as? Double,
             source: obj["source"] as? String,
+            powerSource: obj["power_source"] as? String,
             reachable: true,
             fetchedAt: Date()
         )
