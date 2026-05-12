@@ -100,6 +100,17 @@ public actor MacFaceTracker {
         // of the twitch.
         public var antennaQuantizeStepRad: Double = 0.02
 
+        // Antenna rest position — must NOT be 0 rad. The bot's
+        // antenna motors mechanically resonate / shake when held at
+        // vertical; Pollen's own daemon documents this with
+        // INIT_ANTENNAS_JOINT_POSITIONS = [-0.1745, 0.1745] "~10°
+        // offset to reduce shaking at vertical". Twitches deviate
+        // from this rest position and return to it (not to zero).
+        // Sign convention matches the daemon: left negative, right
+        // positive (both tilt outward from the bot's centreline).
+        public var antennaLeftRestRad: Double = -0.1745
+        public var antennaRightRestRad: Double =  0.1745
+
         public init() {}
     }
 
@@ -197,18 +208,22 @@ public actor MacFaceTracker {
     // of firing. Exponentially-distributed gaps mean the rhythm has
     // no perceptible period: bursts, lulls, asymmetric movement —
     // looks and feels random instead of clockwork.
-    private var antennaLeftCmd: Double = 0
-    private var antennaRightCmd: Double = 0
+    //
+    // Rest position is ±0.1745 rad (~10°), not 0, because the motors
+    // physically vibrate when held at vertical. Cmd/target are
+    // absolute angles in the daemon's coordinate frame; both are
+    // initialised to the rest position so the very first emitted
+    // setpoint already lands at the safe offset.
+    private lazy var antennaLeftCmd: Double = config.antennaLeftRestRad
+    private lazy var antennaRightCmd: Double = config.antennaRightRestRad
     private var leftTwitchReleaseAt: Date?
     private var rightTwitchReleaseAt: Date?
-    /// Target value each antenna eases toward. Set to a random
-    /// amplitude on trigger; reset to 0 on release. The actual
-    /// commanded value (`antenna{Left,Right}Cmd`) follows toward
-    /// this target via a critically-damped ramp instead of
-    /// stepping — eliminates the high-frequency motor "flick" that
-    /// the previous step-change implementation produced.
-    private var antennaLeftTarget: Double = 0
-    private var antennaRightTarget: Double = 0
+    /// Target value each antenna eases toward. Set to (rest + random
+    /// amplitude) on trigger; reset to the rest position on release.
+    /// The actual commanded value (`antenna{Left,Right}Cmd`) follows
+    /// via a critically-damped ramp.
+    private lazy var antennaLeftTarget: Double = config.antennaLeftRestRad
+    private lazy var antennaRightTarget: Double = config.antennaRightRestRad
 
     private var lastDetectionTs: Date?
     /// Suspends pushing to `streamer` while the daemon plays a primary
@@ -602,12 +617,14 @@ public actor MacFaceTracker {
             cmd: antennaLeftCmd,
             target: &antennaLeftTarget,
             releaseAt: &leftTwitchReleaseAt,
+            rest: config.antennaLeftRestRad,
             now: now, dt: dt
         )
         antennaRightCmd = updateOneAntenna(
             cmd: antennaRightCmd,
             target: &antennaRightTarget,
             releaseAt: &rightTwitchReleaseAt,
+            rest: config.antennaRightRestRad,
             now: now, dt: dt
         )
         let step = config.antennaQuantizeStepRad
@@ -635,16 +652,20 @@ public actor MacFaceTracker {
         cmd: Double,
         target: inout Double,
         releaseAt: inout Date?,
+        rest: Double,
         now: Date, dt: Double
     ) -> Double {
-        // 1. Maybe fire a new twitch.
+        // 1. Maybe fire a new twitch. Target is `rest + delta`
+        //    where delta is uniform in [-amplitude, +amplitude];
+        //    cmd eases toward that absolute target.
         if releaseAt == nil {
             let triggerProb = dt * config.antennaTwitchRatePerS
             if Double.random(in: 0...1) < triggerProb {
-                target = Double.random(
+                let delta = Double.random(
                     in: -config.antennaTwitchAmplitude
                        ... config.antennaTwitchAmplitude
                 )
+                target = rest + delta
                 let hold = Double.random(
                     in: config.antennaTwitchMinHold
                       ... config.antennaTwitchMaxHold
@@ -652,23 +673,25 @@ public actor MacFaceTracker {
                 releaseAt = now.addingTimeInterval(hold)
             }
         }
-        // 2. Release: drop the target back to zero once the hold
-        //    expires. The ramp below carries cmd home.
-        if let release = releaseAt, now >= release, target != 0 {
-            target = 0
+        // 2. Release: return target to rest once the hold expires.
+        //    The ramp below carries cmd home. CRITICAL: rest must
+        //    NOT be 0 — the motors mechanically vibrate at 0 rad.
+        if let release = releaseAt, now >= release, target != rest {
+            target = rest
         }
-        // 3. Ease cmd toward target. Different tau for in vs out so
-        //    the bot reads as "alert flick" rather than "wobble".
-        let movingTowardZero = abs(target) < abs(cmd)
-        let tau = movingTowardZero
+        // 3. Ease cmd toward target. Different tau for in (departure
+        //    from rest) vs out (return to rest), keyed on whether
+        //    we're moving toward or away from the rest position.
+        let movingTowardRest = abs(target - rest) < abs(cmd - rest)
+        let tau = movingTowardRest
             ? config.antennaEaseOutTau
             : config.antennaEaseInTau
         let alpha = min(1.0, max(0.0, dt / max(tau, 0.001)))
         var c = cmd + alpha * (target - cmd)
-        // Tidy up when fully decayed: clear releaseAt so the
-        // antenna is eligible to twitch again.
-        if releaseAt != nil, target == 0, abs(c) < 1e-3 {
-            c = 0
+        // Tidy up when fully decayed back to rest: clear releaseAt so
+        // the antenna is eligible to twitch again.
+        if releaseAt != nil, target == rest, abs(c - rest) < 1e-3 {
+            c = rest
             releaseAt = nil
         }
         return c
