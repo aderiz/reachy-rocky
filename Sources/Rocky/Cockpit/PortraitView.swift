@@ -95,28 +95,47 @@ struct PortraitView: View {
         }
     }
 
-    // MARK: - Wake / sleep toggle (replaces the full-width button)
+    // MARK: - Wake / sleep toggle (circular icon button)
 
-    /// Inline switch — awake when on, asleep when off. Disabled while
-    /// the bot is mid-transition. Mid-TTS "Stop talking" lives in the
-    /// toolbar's mute-voice button now; collapsing it into a binary
-    /// toggle here is the tradeoff for the cleaner inline layout.
+    /// Circular wake/sleep toggle following the universal sun/moon
+    /// convention. When awake: sun icon, amber tint. When asleep:
+    /// moon icon, indigo tint. The tinted ring + icon makes the
+    /// current state readable at a glance and the convention is
+    /// already familiar from Apple's Focus / Bedtime / Dark Mode
+    /// controls. ⏎ toggles.
     private var wakeToggle: some View {
-        Toggle("Rocky awake", isOn: Binding(
-            get: { isAwake },
-            set: { newValue in
-                Task {
-                    if newValue { await services.wakeRobot() }
-                    else { await services.sleepRobot() }
-                }
+        Button {
+            Task {
+                if isAwake { await services.sleepRobot() }
+                else { await services.wakeRobot() }
             }
-        ))
-        .toggleStyle(.switch)
-        .labelsHidden()
-        .controlSize(.large)
+        } label: {
+            ZStack {
+                Circle()
+                    .fill(toggleTint.opacity(0.18))
+                Circle()
+                    .strokeBorder(toggleTint.opacity(0.55), lineWidth: 1)
+                Image(systemName: isAwake ? "sun.max.fill" : "moon.fill")
+                    .font(.system(size: 19, weight: .semibold))
+                    .foregroundStyle(toggleTint)
+                    .symbolEffect(.pulse, isActive: services.rockyState == .waking)
+            }
+            .frame(width: 44, height: 44)
+            .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
         .disabled(services.rockyState == .waking)
-        .help(isAwake ? "Send Rocky to sleep." : "Wake Rocky up.")
+        .help(isAwake
+              ? "Send Rocky to sleep. ⏎"
+              : "Wake Rocky up. ⏎")
         .keyboardShortcut(.return, modifiers: [])
+        .animation(.easeInOut(duration: 0.22), value: isAwake)
+        .accessibilityLabel(isAwake ? "Awake — tap to sleep" : "Asleep — tap to wake")
+    }
+
+    private var toggleTint: Color {
+        if services.rockyState == .waking { return .secondary }
+        return isAwake ? .yellow : .indigo
     }
 
     /// Mirror the state-machine into a binary awake/asleep view of
