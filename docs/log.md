@@ -2,6 +2,18 @@
 
 Append-only chronological record. Each entry: `## [YYYY-MM-DD] <op> | <subject>`. Run `grep "^## \[" log.md | tail -20` for the recent timeline.
 
+## [2026-05-12] docs | Batch 2 of code-review backfill — Python sidecars
+
+Three new concept pages covering the three substantive Python sidecars that were either undocumented or only briefly mentioned in cross-refs.
+
+**`docs/concepts/tts-engines.md`** (new) — the `mlx-tts` sidecar in full. Backend inventory with per-engine RTF numbers (Chatterbox 8-bit 0.15× = default, Qwen3-TTS 0.36× non-streaming, Fish 1.08–1.59×, Higgs / Sesame), RPC surface (synthesize / synthesize_stream / set_voice_ref / health / warm_up), voice-clone reference-clip layout + parameters, the Qwen3 streaming→non-streaming switch (with the A/B finding: same length, 97.8% different samples, 0.78 cross-correlation — audible clone drift), and the pronunciation-test path through `EnrollFaceForm`.
+
+**`docs/concepts/memory.md`** (new) — the `mempalace` sidecar. Five RPC methods (`init_palace`, `add`, `recall`, `count`, `forget_all`, `health`), storage path (`~/Library/Application Support/Rocky/Memory`), wing/room env vars, the **stdout-protection gotcha** (mempalace does `os.dup2(2, 1)` at import-time; the sidecar saves the original stdout fd via `os.dup(1)` before importing and writes envelopes via `os.write` directly to that saved fd), `RecallMemoryTool` brain-callable surface, CognitionEngine integration, the soft auto-recall envelope tightening from commit `2876fc3`, failure modes, settings (`memoryRecallEnabled`, `memoryTopK`).
+
+**`docs/concepts/brain-sidecar.md`** (new) — the MLX-VLM brain sidecar runner. Model curation (Qwen3-VL-4B-Instruct-4bit default, larger variants), RPC surface (`health`, `set_model`, `chat_stream`), the **two tool-extraction paths** (Gemma `<|tool_call> ... <tool_call|>` markers consumed by `mlx_vlm.tool_parsers.gemma4.parse_tool_call`, plus a fenced-JSON regex fallback for Qwen / OpenAI-style outputs), the StreamFilter that prevents marker leakage into the visible delta stream, image provider wiring (`data:image/jpeg;base64,...` URIs gated on `visionEnabled`), KV + vision caches (`ROCKY_BRAIN_VISION_CACHE_SIZE=8`, KV reuse across turns with unchanged system prompts), the empty-stream-without-image retry from commit `91a9172`, mlx-vlm 0.5.0 version dependence.
+
+Index entries added. Batch 3 (supporting infrastructure — face tracker, telemetry pipeline, state subscriber, sidecar supervisor, fast-path, first-run workflow) to follow.
+
 ## [2026-05-12] docs | Batch 1 of code-review backfill — orchestration core
 
 Three new pages + an expansion, all grounded in `file:line` citations against the current source.

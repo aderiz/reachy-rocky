@@ -24,6 +24,9 @@ The catalog of every page in the wiki.
 - [AddressFilter](concepts/address-filter.md) — strict post-STT pre-brain dispatch gate fusing loudness, DoA, face, confidence; wake-name now requires real audio energy so Whisper hallucinations can't wake the bot.
 - [Portrait composition](concepts/portrait.md) — avatar + senses chip + power chip + name plate + wake toggle; light/dark backdrop, iOS-style switch + battery chip, single-source-of-truth bindings.
 - [Hermes Agent](concepts/hermes-agent.md) — NousResearch's MIT-licensed agent loop as an optional advanced cognition backend for Rocky (proposed; see ADR 0004).
+- [TTS engines + voice cloning](concepts/tts-engines.md) — Chatterbox (default 8-bit), Qwen3-TTS-12Hz (non-streaming after ICL drift A/B), Fish / Higgs / Sesame; per-backend RTF; reference-clip layout; streaming vs. non-streaming.
+- [Memory — mempalace + recall_memory](concepts/memory.md) — ChromaDB-backed semantic memory: auto-recall before every turn + the `recall_memory` brain tool; storage path; stdout protection gotcha; failure modes.
+- [Brain sidecar (MLX-VLM)](concepts/brain-sidecar.md) — mlx-vlm 0.5.0 wrapper; Gemma `<|tool_call>` markers vs. fenced JSON extraction paths; image provider + KV/vision caches; model selection.
 - [Tools registry](concepts/tools-registry.md) — schema/handler shape, dispatch path, fenced-JSON fallback for Gemma, inventory of the shipped tools.
 - [Permissions authority](concepts/permissions-authority.md) — single source of truth, 5-state enum, TCC + signing pitfalls, debug-binary trap.
 - [On-bot media relay](concepts/on-bot-media-relay.md) — `rocky_media_relay` Reachy Mini App + Mac-side WS subscribers; replaces WebRTC.

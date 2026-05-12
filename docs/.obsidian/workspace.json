@@ -185,6 +185,9 @@
   },
   "active": "9376ad150d16ea19",
   "lastOpenFiles": [
+    "concepts/brain-sidecar.md",
+    "concepts/memory.md",
+    "concepts/tts-engines.md",
     "reference/application-support-layout.md",
     "reference/settings-store.md",
     "concepts/app-services.md",
