@@ -1,4 +1,5 @@
 import Foundation
+import CoreLocation
 import Cognition
 
 /// Current weather + short-term forecast via Open-Meteo (free, no
@@ -41,9 +42,12 @@ enum WeatherTool {
         )
     }
 
-    /// One-shot CoreLocation fix → forecast. Used when the LLM omits
-    /// the `location` argument. Falls back to a clear "permission
-    /// denied" error if the user hasn't granted Location yet.
+    /// One-shot CoreLocation fix → reverse-geocode → forecast. Used
+    /// when the LLM omits the `location` argument. Falls back to a
+    /// clear "permission denied" error if the user hasn't granted
+    /// Location yet. Reverse-geocoding turns the raw lat/lon into a
+    /// readable place name so the narrative reads "10 degrees and
+    /// clear in London. Wind 11 kph." instead of "in 51.596".
     private static func fetchHere(session: URLSession) async -> JSONValue {
         do {
             // `LocationProvider` is `@MainActor`, so the call hops
@@ -51,13 +55,34 @@ enum WeatherTool {
             let loc = try await LocationProvider.shared.currentLocation()
             let lat = loc.coordinate.latitude
             let lon = loc.coordinate.longitude
+            let placeName = await reverseGeocode(latitude: lat, longitude: lon)
+                ?? String(format: "%.3f,%.3f", lat, lon)
             return try await forecast(
                 lat: lat, lon: lon,
-                name: String(format: "%.3f,%.3f", lat, lon),
+                name: placeName,
                 session: session
             )
         } catch {
             return .object(["error": .string("\(error)")])
+        }
+    }
+
+    /// Reverse-geocode a lat/lon to a city name via CoreLocation's
+    /// CLGeocoder. Returns nil on failure so callers can fall back to
+    /// the coordinate string. Prefers locality (city), then
+    /// subAdministrativeArea (county), then administrativeArea
+    /// (state/region) — whichever populates first.
+    private static func reverseGeocode(latitude: Double, longitude: Double) async -> String? {
+        let geocoder = CLGeocoder()
+        let location = CLLocation(latitude: latitude, longitude: longitude)
+        do {
+            let placemarks = try await geocoder.reverseGeocodeLocation(location)
+            guard let first = placemarks.first else { return nil }
+            return first.locality
+                ?? first.subAdministrativeArea
+                ?? first.administrativeArea
+        } catch {
+            return nil
         }
     }
 

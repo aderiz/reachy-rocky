@@ -57,6 +57,93 @@ def _stderr(msg: str) -> None:
 _WORD_RE_PATTERN = r"\S+"
 
 
+# Whisper's training corpus is heavy on YouTube subtitles, which end
+# with credit / sign-off boilerplate. Fed silence or low-energy audio,
+# the model loves to spit these out with confident-looking probs.
+# We don't drop a phrase that simply *matches* the list (a real user
+# can absolutely say "thank you") — we drop only when Whisper's own
+# segment metadata flags low confidence too (see _is_hallucinated).
+_HALLUCINATION_PHRASES: frozenset[str] = frozenset({
+    "thank you",
+    "thanks",
+    "thanks for watching",
+    "thanks for watching!",
+    "thank you for watching",
+    "thanks for watching everyone",
+    "thanks for watching, see you next time",
+    "please subscribe",
+    "subscribe to my channel",
+    "subtitles by the amara.org community",
+    "transcription by espresso media",
+    "bye",
+    "goodbye",
+    "i love you",
+    "you",
+    "thank",
+    "okay",
+    "thanks!",
+    "see you next time",
+    ".",
+})
+
+
+def _normalise_for_match(text: str) -> str:
+    """Lower-case, strip punctuation, collapse whitespace — used to
+    compare a transcript against the hallucination phrase set."""
+    import re
+    t = text.lower().strip()
+    t = re.sub(r"[^\w\s]", "", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _is_hallucinated(result: dict) -> bool:
+    """Heuristic: drop the transcript only when *both* hold:
+      a) the normalised text matches a known Whisper hallucination
+      b) the segment metadata says the model wasn't confident.
+
+    Confidence gates:
+      - `no_speech_prob >= 0.4` → model itself thinks the segment is
+        probably silence; high values + a known-hallucination string
+        are textbook silence-driven boilerplate output.
+      - `avg_logprob <= -0.8` → the chosen tokens were low-likelihood
+        even by greedy/sampled decoding. A real "thank you" said
+        clearly into the mic logs around -0.2 to -0.4.
+
+    Either gate alone is enough — we want to be permissive about
+    real speech and aggressive about silence boilerplate.
+    """
+    text = (result.get("text") or "").strip()
+    if not text:
+        return False
+    if _normalise_for_match(text) not in _HALLUCINATION_PHRASES:
+        return False
+    segments = result.get("segments") or []
+    if not segments:
+        # No segment metadata to consult — accept the transcript.
+        return False
+    # Pick the worst (most suspicious) segment in the response and
+    # gate on that. Hallucinations on short utterances usually have
+    # exactly one segment, so this is equivalent to the obvious
+    # per-segment check; on multi-segment outputs we'd rather not
+    # drop a real "thanks" mid-sentence.
+    worst_no_speech = max(
+        (float(seg.get("no_speech_prob") or 0.0) for seg in segments),
+        default=0.0,
+    )
+    worst_avg_logprob = min(
+        (float(seg.get("avg_logprob") or 0.0) for seg in segments),
+        default=0.0,
+    )
+    suspicious = (worst_no_speech >= 0.4) or (worst_avg_logprob <= -0.8)
+    if suspicious:
+        _stderr(
+            f"dropping hallucination: text={text!r} "
+            f"no_speech={worst_no_speech:.3f} avg_lp={worst_avg_logprob:.3f}"
+        )
+    return suspicious
+
+
 def _collapse_repetition(text: str, min_repeats: int = 3) -> str:
     """Detect and collapse runs of any repeating n-gram in the
     transcript. Whisper hallucinations come in three shapes:
@@ -211,9 +298,34 @@ class Runner:
             # the next call — compounds repetition errors across
             # consecutive utterances in a conversation.
             condition_on_previous_text=False,
+            # Bias the language prior toward a conversation register.
+            # Whisper was trained heavily on YouTube subtitles which
+            # end with "thanks for watching" / "please subscribe" /
+            # "subtitles by the Amara.org community" boilerplate. On
+            # silent or low-energy audio it loves to spit these out.
+            # The initial_prompt sets a conversation context so the
+            # model leans away from video-credit hallucinations.
+            initial_prompt="A short conversation between a person and a robot named Rocky.",
             verbose=False,
         )
         duration_ms = (time.perf_counter() - t0) * 1000
+
+        # Confidence-gated drop for known silence hallucinations
+        # ("thank you", "thanks for watching", etc.). We check the
+        # whole `result` (text + segment metadata) and return empty
+        # only when the model's own confidence flags the segment as
+        # probably-silence. A real "thank you" said clearly passes
+        # through.
+        if _is_hallucinated(result):
+            return {
+                "text": "",
+                "duration_ms": duration_ms,
+                "confidence": 0.0,
+                "sample_rate": sample_rate,
+                "model": self.model_id,
+                "language": result.get("language") or language,
+                "dropped": "hallucination",
+            }
 
         text = (result.get("text") or "").strip()
         # Belt-and-braces: even with the upstream fallback, every
