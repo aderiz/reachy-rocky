@@ -95,47 +95,33 @@ struct PortraitView: View {
         }
     }
 
-    // MARK: - Wake / sleep toggle (circular icon button)
+    // MARK: - Wake / sleep slider switch
 
-    /// Circular wake/sleep toggle following the universal sun/moon
-    /// convention. When awake: sun icon, amber tint. When asleep:
-    /// moon icon, indigo tint. The tinted ring + icon makes the
-    /// current state readable at a glance and the convention is
-    /// already familiar from Apple's Focus / Bedtime / Dark Mode
-    /// controls. ⏎ toggles.
+    /// Sliding switch styled after iOS-system day/night toggles. The
+    /// track tint, end-cap icons (sun ⇄ moon), and the circular thumb
+    /// all flow together to express the current state. ⏎ flips it;
+    /// the thumb slides between ends with a spring.
+    ///
+    /// Conventions:
+    ///   - Awake → thumb on the LEFT, sun glyph highlighted, amber track.
+    ///   - Asleep → thumb on the RIGHT, moon glyph highlighted, indigo track.
+    ///   - Waking → muted track + ghosted thumb; switch is disabled
+    ///     so it can't be slammed during the wake animation.
     private var wakeToggle: some View {
-        Button {
+        WakeSleepSwitch(
+            isAwake: isAwake,
+            isTransitioning: services.rockyState == .waking
+        ) {
             Task {
                 if isAwake { await services.sleepRobot() }
                 else { await services.wakeRobot() }
             }
-        } label: {
-            ZStack {
-                Circle()
-                    .fill(toggleTint.opacity(0.18))
-                Circle()
-                    .strokeBorder(toggleTint.opacity(0.55), lineWidth: 1)
-                Image(systemName: isAwake ? "sun.max.fill" : "moon.fill")
-                    .font(.system(size: 19, weight: .semibold))
-                    .foregroundStyle(toggleTint)
-                    .symbolEffect(.pulse, isActive: services.rockyState == .waking)
-            }
-            .frame(width: 44, height: 44)
-            .contentShape(Circle())
         }
-        .buttonStyle(.plain)
-        .disabled(services.rockyState == .waking)
+        .keyboardShortcut(.return, modifiers: [])
         .help(isAwake
               ? "Send Rocky to sleep. ⏎"
               : "Wake Rocky up. ⏎")
-        .keyboardShortcut(.return, modifiers: [])
-        .animation(.easeInOut(duration: 0.22), value: isAwake)
         .accessibilityLabel(isAwake ? "Awake — tap to sleep" : "Asleep — tap to wake")
-    }
-
-    private var toggleTint: Color {
-        if services.rockyState == .waking { return .secondary }
-        return isAwake ? .yellow : .indigo
     }
 
     /// Mirror the state-machine into a binary awake/asleep view of
@@ -182,6 +168,80 @@ struct PortraitView: View {
         "Rocky's head, animated. \(presenceLine)"
     }
 
+}
+
+// MARK: - Wake / sleep switch
+
+/// Slider-style awake/sleep switch with sun/moon visual cues. Built
+/// as a custom view (rather than `Toggle(.switch)`) so the track
+/// can carry day/night iconography that animates with the thumb.
+private struct WakeSleepSwitch: View {
+    let isAwake: Bool
+    let isTransitioning: Bool
+    let onTap: () -> Void
+
+    private let trackW: CGFloat = 64
+    private let trackH: CGFloat = 32
+    private let thumbSize: CGFloat = 26
+    private let inset: CGFloat = 3
+
+    var body: some View {
+        Button(action: onTap) {
+            ZStack(alignment: .leading) {
+                track
+                endCaps
+                thumb
+            }
+            .frame(width: trackW, height: trackH)
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .disabled(isTransitioning)
+        .animation(.spring(response: 0.28, dampingFraction: 0.78),
+                   value: isAwake)
+        .opacity(isTransitioning ? 0.55 : 1.0)
+    }
+
+    private var tint: Color { isAwake ? .yellow : .indigo }
+
+    private var track: some View {
+        Capsule()
+            .fill(tint.opacity(0.30))
+            .overlay(
+                Capsule().strokeBorder(tint.opacity(0.45), lineWidth: 0.8)
+            )
+    }
+
+    /// Day / night markers fixed at each end of the track. The
+    /// side opposite the current state dims, so the active glyph
+    /// reads as "we're here" without losing the visual context of
+    /// what the other side means.
+    private var endCaps: some View {
+        HStack {
+            Image(systemName: "sun.max.fill")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.yellow.opacity(isAwake ? 0.0 : 0.55))
+            Spacer()
+            Image(systemName: "moon.fill")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.indigo.opacity(isAwake ? 0.55 : 0.0))
+        }
+        .padding(.horizontal, 9)
+        .frame(width: trackW, height: trackH)
+    }
+
+    private var thumb: some View {
+        ZStack {
+            Circle()
+                .fill(.white)
+                .shadow(color: .black.opacity(0.30), radius: 1.5, y: 0.5)
+            Image(systemName: isAwake ? "sun.max.fill" : "moon.fill")
+                .font(.system(size: 13, weight: .bold))
+                .foregroundStyle(tint)
+        }
+        .frame(width: thumbSize, height: thumbSize)
+        .offset(x: isAwake ? inset : (trackW - thumbSize - inset))
+    }
 }
 
 // MARK: - Senses overlays
