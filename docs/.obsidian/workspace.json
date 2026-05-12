@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "concepts/tools-registry.md",
+                "file": "decisions/0006-on-bot-media-relay.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "tools-registry"
+              "title": "0006-on-bot-media-relay"
             }
           }
         ]
@@ -183,15 +183,25 @@
       "bases:Create new base": false
     }
   },
-  "active": "b88e92f19fc0e6be",
+  "active": "9376ad150d16ea19",
   "lastOpenFiles": [
-    "concepts/portrait.md",
+    "reference/application-support-layout.md",
+    "reference/settings-store.md",
+    "concepts/app-services.md",
+    "concepts/app-lifecycle.md",
+    "decisions/0006-on-bot-media-relay.md",
+    "concepts/rocky-architecture.md",
+    "workflows/integrate-hermes-agent.md",
+    "concepts/hermes-agent.md",
+    "decisions/0004-hermes-agent-integration.md",
     "reference/power-monitoring.md",
+    "concepts/portrait.md",
+    "concepts/address-filter.md",
+    "concepts/sidecar-convention.md",
+    "concepts/tools-registry.md",
     "README.md",
     "decisions/0003-sidecar-convention.md",
     "decisions/0002-rocky-app.md",
-    "concepts/sidecar-convention.md",
-    "concepts/rocky-architecture.md",
     "sources/daemon-openapi-1.7.1.md"
   ]
 }

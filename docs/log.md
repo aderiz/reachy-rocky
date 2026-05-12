@@ -2,6 +2,20 @@
 
 Append-only chronological record. Each entry: `## [YYYY-MM-DD] <op> | <subject>`. Run `grep "^## \[" log.md | tail -20` for the recent timeline.
 
+## [2026-05-12] docs | Batch 1 of code-review backfill — orchestration core
+
+Three new pages + an expansion, all grounded in `file:line` citations against the current source.
+
+**`docs/concepts/app-services.md`** (new) — documents the central `@Observable @MainActor` class `AppServices` (`Sources/Rocky/AppServices.swift:18`): the full service inventory with creation lines for every long-lived component (33 `let` properties), the observable state surface SwiftUI binds to, the 12-step `start()` lifecycle (memory → brain → log pumps → sidecars → relay autostart → battery → tools → FastPath → LM Studio probe → voice → state subscriber → first-run), and the mutation discipline (always-on-MainActor, no `services.*` writes from view bodies — the EnrollFaceForm-focus-stealing gotcha).
+
+**`docs/reference/settings-store.md`** (new) — every UserDefaults-persisted setting grouped by concern (Robot endpoint, Brain/LLM, Memory, Voice mic+VAD, Voice STT+wake, AddressFilter, TTS, Face tracking, UI state). Defaults, types, where each is referenced, and the `currentPersonaVersion = 6` migration mechanic that auto-overwrites the persona on schema bump.
+
+**`docs/reference/application-support-layout.md`** (new) — the on-disk tree at `~/Library/Application Support/Rocky/`: `Memory/` (mempalace ChromaDB), `Models/` (CoreML), `sidecars/<name>/.venv/`, `voice/reference.{wav,txt}` voice-clone material, `face-library.json` enrolled-face store. Reset recipes table.
+
+**`docs/concepts/voice-pipeline.md`** (expanded) — the AudioRingBuffer section now explains the **drop-newest under saturation** policy (preserve wake word, not the over-long tail). The coordinator section now covers the pre-roll buffer, single-slot queued segment, force-end-without-VAD-reset, segment-level RMS computation, and the dedup gate — all the non-obvious behaviours an agent modifying the voice loop would otherwise have to source-read to discover.
+
+This is batch 1 of 3. Batches 2 and 3 will cover the Python sidecars (TTS engines + voice cloning + memory + brain runner) and the supporting infrastructure (face tracker, telemetry pipeline, state subscriber, sidecar supervisor, fast-path).
+
 ## [2026-05-12] docs | ADR 0006 — on-bot media relay (backfill)
 
 The biggest architectural decision on the project — replace WebRTC with a bot-side Reachy Mini App that serves audio + video over plain WebSocket — was implemented on 2026-05-11 (commit `3649b93`) but never written up as an ADR. Captured retroactively as `decisions/0006-on-bot-media-relay.md` with the full context (WebRTC failure modes seen on WiFi, alternatives considered, trade-offs, consequences, implementation references) so future readers don't need to reconstruct the reasoning from commit messages.

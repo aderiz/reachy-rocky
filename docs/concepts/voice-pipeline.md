@@ -48,10 +48,75 @@ Switching source mid-session requires toggling Listen off and on.
 
 ### 2. Ring buffer — `AudioRingBuffer`
 
-Single-producer / single-consumer lock-free buffer. **Drop-newest**
-when full, not drop-oldest: the oldest samples in a saturated buffer
-typically contain the *start* of the user's utterance — including the
-wake word — so dropping them would gut wake matching.
+Single-producer / single-consumer lock-free buffer in
+`Sources/Voice/AudioRingBuffer.swift`. Two non-obvious design
+choices worth knowing:
+
+**Drop-newest under saturation, not drop-oldest.** The intuition
+says "if the buffer's full, throw away old stuff." Wrong direction
+here. The oldest samples in a saturated buffer are the *start* of
+the user's utterance — including the wake word "Rocky" — so
+dropping them gutted wake matching. Drop-newest preserves the wake
+window at the cost of truncating an over-long utterance's tail,
+which is far less destructive (the brain can always ask the user
+to repeat).
+
+**`droppedSamples` counter exposed.** Lets the dashboard surface
+the drop rate so a deteriorating buffer condition is visible
+before it starts losing words.
+
+Capacity is allocated at init (6 × 16,000 = 96,000 samples =
+~6 s) — large enough that drop-newest essentially never fires
+under normal load.
+
+### 6. Coordinator internals — `VoiceCoordinator`
+
+Three non-obvious behaviours in `Sources/Voice/VoiceCoordinator.swift`:
+
+**Pre-roll buffer (180 ms / 6 frames).** While the VAD is in
+`silence`, every incoming chunk is also kept in a rolling pre-roll.
+On `speechStart`, the pre-roll is prepended to `pendingSegment`
+*before* the chunk that triggered the transition. Without this, the
+first 90–180 ms of speech is clipped — the VAD needs
+`minSpeechFrames` of loud audio to confirm speech, and that audio
+was being thrown away. Symptom this fixed: "Rocky" → "ocky" → STT
+hears "okay" / "hockey", wake filter misses.
+
+**Single-slot queued segment.** STT is single-in-flight (Apple
+Speech doesn't pipeline a second request well; MLX paths are
+GPU-serialised). Old behaviour: drop the new segment if STT is
+busy. New: keep one queued segment; if a third arrives while STT
+is busy, the queued one is replaced (the newest user audio matters
+more than buffered history). When the in-flight STT finishes, the
+queued segment is dispatched immediately. Net effect: a fast
+back-and-forth ("Rocky" → "what time is it" 400 ms later) gets
+both segments transcribed in order rather than silently losing the
+second one.
+
+**Force-end ≠ VAD reset.** When `pendingSegment` exceeds the
+`maxSegmentS` cap (12 s default), the segment is flushed but the
+VAD's `inSpeech` latch is **kept true** — the user is still
+talking, the cap is an artificial slice, and resetting the VAD
+would drop the next ~90 ms of speech while it re-confirms speech.
+
+**Segment-level RMS computation.** `computeRMS(samples:)` in
+`VoiceCoordinator` (single pass over the segment, ~480-sample
+rolling window) produces peak + mean RMS at flush time. These feed
+the `AddressFilter` so it can score loudness without re-reading
+the audio. See [address-filter](address-filter.md).
+
+**Dedup gate.** `lastDispatchedNormalized` / `lastDispatchedAt` +
+a 3-second window suppress duplicate dispatches when VAD
+over-segments one utterance into two segments because of brief
+silent gaps in the audio stream. Each segment is STT'd separately
+and produces a near-identical transcript a fraction of a second
+apart; the dedup gate drops the second one. Normalisation strips
+case and non-alphanumeric chars so "Rocky what's this" and
+"Rocky, what's this?" collapse to the same key.
+
+`Output.finalText` now carries `text`, `dispatched`, `reason`,
+`confidence`, `peakRMS`, `meanRMS` — the full signal bundle the
+AddressFilter needs.
 
 ### 3. VAD — `EnergyVAD` (or `SileroVAD`)
 

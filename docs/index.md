@@ -11,6 +11,7 @@ The catalog of every page in the wiki.
 ## Concepts
 
 - [Rocky — architecture](concepts/rocky-architecture.md) — block diagram, threads of control, layer dependencies.
+- [App Services](concepts/app-services.md) — the orchestration core; service inventory, `start()` lifecycle, observable surface, mutation discipline.
 - [Sidecar convention](concepts/sidecar-convention.md) — wire protocol, manifest, lifecycle.
 - [Architecture](concepts/architecture.md) — daemon/SDK split, where code runs, REST + WebRTC transports.
 - [Motion philosophy](concepts/motion-philosophy.md) — `goto_target` for gestures, `set_target` in a control loop.
@@ -33,6 +34,8 @@ The catalog of every page in the wiki.
 - [Python SDK](reference/sdk-python.md) — `ReachyMini` class API surface.
 - [Motors](reference/motors.md) — IDs, names, ranges, common faults; antenna anti-vibration constraint; supply-voltage register pointer.
 - [Power monitoring](reference/power-monitoring.md) — the bot has no fuel gauge; supply voltage is read via Dynamixel reg 144 through the daemon's raw-packet WS and surfaced via the on-bot relay's `/battery` endpoint. LiFePO4 SOC mapping.
+- [Settings store](reference/settings-store.md) — every persisted setting, defaults, key namespace, persona migration, reset recipes.
+- [Application Support layout](reference/application-support-layout.md) — on-disk state outside UserDefaults: sidecar venvs, voice clones, face library, mempalace memory. Reset recipes.
 - [Glossary](reference/glossary.md) — terms.
 
 ## Workflows
