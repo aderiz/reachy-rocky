@@ -687,32 +687,53 @@ struct MicCalibrationView: View {
             if Task.isCancelled { return }
 
             await MainActor.run { phase = .robot }
-            // Suppress the face-tracker streamer for the whole
-            // robot-capture window so our deliberate motion sequence
-            // can run unfought. We extend `transitioningUntil` to
-            // cover the capture + a small tail; it expires
-            // naturally afterward.
+            // Take exclusive control of the motors for the motor
+            // phase so nothing else can steal attention. Three
+            // layers of suppression:
+            //   1. transitioningUntil — gates the AppServices
+            //      streamer-control watcher loop.
+            //   2. targetStreamer.setPrimaryMoveActive(true) —
+            //      direct streamer suppression with no watcher lag.
+            //   3. setFaceTrackingEnabled(false) — stops the
+            //      MacFaceTracker from generating new targets at all
+            //      (so even if the streamer un-suppresses, there's
+            //      nothing to stream).
+            // All three are restored at the end of the phase.
+            let wasFaceTracking = services.faceTrackingEnabled
             await MainActor.run {
                 services.transitioningUntil =
-                    Date().addingTimeInterval(robotSeconds + 1.0)
+                    Date().addingTimeInterval(robotSeconds + 1.5)
             }
-            // Run head motion concurrently with audio capture so we
-            // record the motors *while they're actually moving* —
-            // that's when the calibration data is realistic. Idle
-            // motors are nearly silent; under-load motors are where
-            // hum and gear chatter come from.
-            async let motion: Void = runRobotMotionSequence(during: robotSeconds)
+            await services.targetStreamer.setPrimaryMoveActive(true)
+            await services.setFaceTrackingEnabled(false)
+
+            // Smooth 50 Hz parametric sweep — same cadence the face
+            // tracker uses, so Rocky reads as "tracking something"
+            // rather than executing a series of discrete poses with
+            // pauses between them. Continuous motion is what makes
+            // the motors run continuously, which is what we need to
+            // measure their realistic operational noise floor.
+            async let motion: Void = streamLissajousMotion(during: robotSeconds)
             robotSamples = await capturePhase(seconds: robotSeconds)
             _ = await motion
+
+            // Return to neutral and restore the suppressed signals.
+            // Goto blocks until the move completes so we don't hand
+            // control back to face tracking mid-arc.
+            try? await services.robotLink.goto(
+                headPose: RPYPose(roll: 0, pitch: 0, yaw: 0),
+                antennas: nil, bodyYaw: 0, durationS: 1.0
+            )
+            await services.targetStreamer.setPrimaryMoveActive(false)
+            await services.setFaceTrackingEnabled(wasFaceTracking)
             await MainActor.run { services.transitioningUntil = nil }
             if Task.isCancelled { return }
 
             // No "user spoke during Rocky" sanity check here. The
-            // motion sequence drives the motors deliberately, and at
-            // 1.4 s minjerk gotos peak motor RMS routinely exceeds
-            // 0.02 — which is precisely what we want to MEASURE, not
-            // a failure condition. The previous check tripped almost
-            // every run because the loud samples ARE the motor noise.
+            // motion sequence drives the motors deliberately, and
+            // peak motor RMS routinely exceeds 0.02 — which is
+            // precisely what we want to MEASURE, not a failure
+            // condition.
         }
 
         // Phase 3: Voice — user-gated. Show the prompt and wait for
@@ -798,60 +819,51 @@ struct MicCalibrationView: View {
         }
     }
 
-    /// Drive the head and body through a short motion sequence so
-    /// the motor-noise capture phase records the motors *under load*.
-    /// Idle motors are nearly silent; the noise we need to measure is
-    /// the hum + gear chatter that only fires while servos are
-    /// actively tracking a target.
+    /// Stream a smooth 50 Hz parametric head sweep for `seconds` —
+    /// same cadence and pose-stream shape as the face tracker, so
+    /// Rocky reads as "tracking a moving face" rather than executing
+    /// a chain of discrete poses with pauses between. Continuous
+    /// motion keeps the motors running continuously, which is the
+    /// noise profile we actually want to measure.
     ///
-    /// Issued as a chain of minjerk `goto` calls (~1.2 s each) that
-    /// sweep yaw left-right, pitch up-down, and add a body twist on
-    /// the last beat. Total wall time ≈ `during` seconds; the loop
-    /// caps mid-sequence if the captured time runs out so we never
-    /// overrun. The face-tracker streamer is already gated by the
-    /// caller setting `transitioningUntil`.
-    private func runRobotMotionSequence(during seconds: Double) async {
-        // Each entry: (roll, pitch, yaw, body, duration).
-        // Angles in radians. Tuned tighter than v1 so the full
-        // sequence + a return-to-neutral fits inside the 6 s capture
-        // window comfortably (3 legs × ~1.0 s + neutral ~1.0 s ≈ 4 s
-        // wall, leaving 2 s of motors-settling tail at the end of
-        // the recording).
-        let leg: [(Double, Double, Double, Double, Double)] = [
-            (0,  0.12, -0.25, -0.15, 1.0),   // look down-left
-            (0, -0.08,  0.25,  0.15, 1.0),   // look up-right
-            (0,  0.15,  0.00,  0.00, 1.0),   // chin down
-        ]
-        let start = Date()
-        let neutralReserve: Double = 1.0  // always leave time to return home
-        for (roll, pitch, yaw, body, dur) in leg {
+    /// The path is a Lissajous figure in (yaw, pitch) space with
+    /// coprime periods so the trace doesn't trivially repeat in the
+    /// 6-second window. Amplitudes are tuned to look like tracking,
+    /// not dancing — peak yaw ~16°, peak pitch ~6°.
+    ///
+    /// The caller is responsible for gating any competing target
+    /// source (face tracker, streamer) before invoking this and
+    /// restoring them afterwards.
+    private func streamLissajousMotion(during seconds: Double) async {
+        // 50 Hz tick. Match the face tracker / streamer cadence so
+        // the daemon sees the same target-update pattern it sees
+        // during normal operation.
+        let tickIntervalNs: UInt64 = 20_000_000
+        let totalTicks = Int(seconds * 50)
+        // Slow sinusoidal sweeps with coprime periods so the path
+        // doesn't repeat in the capture window. Periods chosen so
+        // the bot's never *quite* in the same place twice — keeps
+        // the motors continuously commanded to a fresh target.
+        let yawAmp: Double = 0.28      // ~16°
+        let pitchAmp: Double = 0.10    // ~6°
+        let yawPeriod: Double = 3.7
+        let pitchPeriod: Double = 2.3
+        for tick in 0..<totalTicks {
             if Task.isCancelled { return }
-            let elapsed = Date().timeIntervalSince(start)
-            // Bail out of the loop if running this leg would push us
-            // past the capture window minus the reserve. Skipping
-            // legs is preferable to ending the sequence with Rocky
-            // tilted off neutral.
-            if elapsed + dur > seconds - neutralReserve { break }
-            let pose = RPYPose(roll: roll, pitch: pitch, yaw: yaw)
-            do {
-                try await services.robotLink.goto(
-                    headPose: pose, antennas: nil,
-                    bodyYaw: body, durationS: dur
-                )
-            } catch {
-                // Non-fatal — fall through to the return-to-neutral
-                // below. Better to capture fewer motion-laden samples
-                // than to leave Rocky tilted at the end of calibration.
-                break
-            }
+            let t = Double(tick) / 50.0
+            let yaw = yawAmp * sin(2 * .pi * t / yawPeriod)
+            let pitch = pitchAmp * sin(2 * .pi * t / pitchPeriod)
+            let pose = RPYPose(roll: 0, pitch: pitch, yaw: yaw)
+            // Post directly to the daemon's set_target endpoint,
+            // bypassing the Mac-side TargetStreamer (which we've
+            // suppressed). Each call is fire-and-forget; daemon
+            // overwrites the active target on receipt and the
+            // motor control loop interpolates smoothly.
+            try? await services.robotLink.setTarget(
+                MotionTarget(headPose: pose, antennas: nil, bodyYaw: 0)
+            )
+            try? await Task.sleep(nanoseconds: tickIntervalNs)
         }
-        // Return to neutral so the post-phase state is predictable.
-        // Always attempted, even after a cancelled / failed leg.
-        let neutral = RPYPose(roll: 0, pitch: 0, yaw: 0)
-        try? await services.robotLink.goto(
-            headPose: neutral, antennas: nil,
-            bodyYaw: 0, durationS: neutralReserve
-        )
     }
 
     /// Like `capturePhase` but also samples the robot mic's live DoA
