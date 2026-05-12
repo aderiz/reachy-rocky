@@ -354,8 +354,9 @@ struct MicCalibrationView: View {
 
         // Cutoff at noise_ceiling × multiplier (matches the cutoff
         // used by `speechOnlyVoiceSamples` and `computeThreshold`).
-        let noiseCeiling = max(percentile(roomSamples, 0.99),
-                                percentile(robotSamples, 0.99))
+        // Room-only — robot motion samples don't represent the noise
+        // floor Rocky sees while listening.
+        let noiseCeiling = percentile(roomSamples, 0.99)
         let cutoff = Double(max(noiseCeiling * Float(Self.speechFloorMultiplier),
                                  0.003))
         let cutoffNorm = min(cutoff / Self.vuFullScaleRMS, 1.0)
@@ -1071,8 +1072,12 @@ struct MicCalibrationView: View {
     /// threshold ends up too low.
     private func speechOnlyVoiceSamples() -> [Float] {
         guard !voiceSamples.isEmpty else { return [] }
-        let noiseCeiling = max(percentile(roomSamples, 0.99),
-                               percentile(robotSamples, 0.99))
+        // Room-only noise ceiling. The robot phase captures motors
+        // UNDER LOAD (deliberate motion) — that audio is way louder
+        // than the noise floor Rocky actually sees while listening
+        // (awake, stationary, motors idle). Including it inflates
+        // the cutoff to motor-peak levels and rejects normal voice.
+        let noiseCeiling = percentile(roomSamples, 0.99)
         let cutoff = max(noiseCeiling * Float(Self.speechFloorMultiplier),
                           0.003)
         return voiceSamples.filter { $0 >= cutoff }
@@ -1084,7 +1089,12 @@ struct MicCalibrationView: View {
         }
         let roomP99 = percentile(roomSamples, 0.99)
         let robotP99 = robotSamples.isEmpty ? 0 : percentile(robotSamples, 0.99)
-        let noiseCeiling = max(roomP99, robotP99)
+        // VAD ceiling = ROOM only (see speechOnlyVoiceSamples for the
+        // full reasoning). robotP99 is still computed for the
+        // diagnostic log line so the user can see motor-under-load
+        // levels in calibration telemetry.
+        let noiseCeiling = roomP99
+        _ = robotP99  // keep variable in scope for the log line below
 
         let speechOnly = speechOnlyVoiceSamples()
         // Need a meaningful chunk of voice frames above noise. Less
