@@ -707,12 +707,12 @@ struct MicCalibrationView: View {
             await MainActor.run { services.transitioningUntil = nil }
             if Task.isCancelled { return }
 
-            let robotLoud = robotSamples.filter { $0 > 0.02 }.count
-            if !robotSamples.isEmpty,
-               Double(robotLoud) / Double(robotSamples.count) > 0.2 {
-                await failOut(reason: "We picked up speech during the Rocky phase. Stay quiet while Rocky's motors settle.")
-                return
-            }
+            // No "user spoke during Rocky" sanity check here. The
+            // motion sequence drives the motors deliberately, and at
+            // 1.4 s minjerk gotos peak motor RMS routinely exceeds
+            // 0.02 — which is precisely what we want to MEASURE, not
+            // a failure condition. The previous check tripped almost
+            // every run because the loud samples ARE the motor noise.
         }
 
         // Phase 3: Voice — user-gated. Show the prompt and wait for
@@ -752,6 +752,27 @@ struct MicCalibrationView: View {
             recommendedAddressDoACenter = addressResult.doaCenter
             recommendedAddressDoATolerance = addressResult.doaTolerance
         }
+        // Surface the four computed values to the Logs view so the
+        // user can see exactly what calibration produced. This is
+        // the diagnostic surface that makes "calibration didn't
+        // land" debuggable instead of mysterious.
+        await services.logBus.publish(.sidecarLog(
+            sidecar: "calibration", level: .info,
+            message: "calibration computed",
+            fields: [
+                "room_p99": String(format: "%.4f", percentile(roomSamples, 0.99)),
+                "robot_p99": String(format: "%.4f", percentile(robotSamples, 0.99)),
+                "address_p25": String(format: "%.4f",
+                    addressSamples.isEmpty ? 0 : percentile(addressSamples, 0.25)),
+                "address_p50": String(format: "%.4f",
+                    addressSamples.isEmpty ? 0 : percentile(addressSamples, 0.50)),
+                "address_rms_floor": String(format: "%.4f", addressResult.rmsFloor),
+                "address_loud_ratio": String(format: "%.2f", addressResult.loudnessRatio),
+                "address_doa_centre_rad": String(format: "%.2f", addressResult.doaCenter),
+                "address_doa_tolerance_rad": String(format: "%.2f", addressResult.doaTolerance),
+                "address_doa_sample_count": "\(addressDoASamples.count)"
+            ]
+        ))
 
         switch result {
         case .success(let value):
@@ -791,19 +812,26 @@ struct MicCalibrationView: View {
     /// caller setting `transitioningUntil`.
     private func runRobotMotionSequence(during seconds: Double) async {
         // Each entry: (roll, pitch, yaw, body, duration).
-        // Angles in radians. Tuned to be visibly active but small
-        // enough to look like a calibration motion rather than a
-        // dance — Rocky shouldn't startle the user.
+        // Angles in radians. Tuned tighter than v1 so the full
+        // sequence + a return-to-neutral fits inside the 6 s capture
+        // window comfortably (3 legs × ~1.0 s + neutral ~1.0 s ≈ 4 s
+        // wall, leaving 2 s of motors-settling tail at the end of
+        // the recording).
         let leg: [(Double, Double, Double, Double, Double)] = [
-            (0,  0.15, -0.30, -0.20, 1.4),   // look down-left
-            (0, -0.10,  0.30,  0.20, 1.4),   // look up-right
-            (0,  0.20,  0.00,  0.00, 1.2),   // chin down
-            (0,  0.00,  0.00,  0.00, 1.2),   // back to neutral
+            (0,  0.12, -0.25, -0.15, 1.0),   // look down-left
+            (0, -0.08,  0.25,  0.15, 1.0),   // look up-right
+            (0,  0.15,  0.00,  0.00, 1.0),   // chin down
         ]
         let start = Date()
+        let neutralReserve: Double = 1.0  // always leave time to return home
         for (roll, pitch, yaw, body, dur) in leg {
             if Task.isCancelled { return }
-            if Date().timeIntervalSince(start) >= seconds { return }
+            let elapsed = Date().timeIntervalSince(start)
+            // Bail out of the loop if running this leg would push us
+            // past the capture window minus the reserve. Skipping
+            // legs is preferable to ending the sequence with Rocky
+            // tilted off neutral.
+            if elapsed + dur > seconds - neutralReserve { break }
             let pose = RPYPose(roll: roll, pitch: pitch, yaw: yaw)
             do {
                 try await services.robotLink.goto(
@@ -811,12 +839,19 @@ struct MicCalibrationView: View {
                     bodyYaw: body, durationS: dur
                 )
             } catch {
-                // Non-fatal — move on. Better to capture fewer
-                // motion-laden samples than to fail the whole
-                // calibration on a transient goto error.
-                return
+                // Non-fatal — fall through to the return-to-neutral
+                // below. Better to capture fewer motion-laden samples
+                // than to leave Rocky tilted at the end of calibration.
+                break
             }
         }
+        // Return to neutral so the post-phase state is predictable.
+        // Always attempted, even after a cancelled / failed leg.
+        let neutral = RPYPose(roll: 0, pitch: 0, yaw: 0)
+        try? await services.robotLink.goto(
+            headPose: neutral, antennas: nil,
+            bodyYaw: 0, durationS: neutralReserve
+        )
     }
 
     /// Like `capturePhase` but also samples the robot mic's live DoA
@@ -853,36 +888,42 @@ struct MicCalibrationView: View {
     }
 
     /// Derive the AddressFilter calibration values from the captured
-    /// address-phase samples + room/robot percentiles. Returns
-    /// sensible defaults for any field where evidence is insufficient.
+    /// address-phase samples + percentiles. Returns sensible defaults
+    /// for any field where evidence is insufficient.
+    ///
+    /// Important: the noise ceiling here uses **room only**, not
+    /// motors-under-load. The AddressFilter runs at conversational
+    /// dispatch time — i.e., when Rocky is awake but stationary and
+    /// the motors are idle. Idle motor noise is near-ambient, so
+    /// room P99 is the relevant background. Including the
+    /// motion-loaded robot phase here would inflate the ceiling to
+    /// motor-peak levels, making `addressLoudnessRatio` unattainable
+    /// for normal speech.
     private func computeAddressCalibration() -> (
         rmsFloor: Double, loudnessRatio: Double,
         doaCenter: Double, doaTolerance: Double
     ) {
-        // Loudness floor: a fraction above the noise ceiling, plus a
-        // safety margin keyed to the address phase's P25 (we don't
-        // want the floor sitting above any actual addressed speech).
-        let noiseCeiling = Double(max(percentile(roomSamples, 0.99),
-                                       percentile(robotSamples, 0.99)))
+        let roomCeiling = Double(percentile(roomSamples, 0.99))
         let addressP50 = addressSamples.isEmpty ? 0
             : Double(percentile(addressSamples, 0.50))
         let addressP25 = addressSamples.isEmpty ? 0
             : Double(percentile(addressSamples, 0.25))
+        // Floor: the user's quieter half of address speech needs to
+        // pass, so cap at ~80% of P25. Hard minimum 0.005 catches
+        // quantisation / dead air.
         let floor: Double
         if addressP25 > 0 {
-            // Stay safely below the user's typical addressed-speech
-            // amplitude — 70% of P25. Floor is "definitely too quiet
-            // to be direct address".
-            floor = max(0.005, min(addressP25 * 0.7, 0.04))
+            floor = max(0.005, min(addressP25 * 0.8, 0.04))
         } else {
             floor = 0.012  // default
         }
+        // Ratio: room is typically 0.001-0.005 RMS. Address speech is
+        // 0.04-0.12. Ratio of 8-40×. Cap at 6× so the gate is
+        // achievable for slightly-quieter follow-ups. Floor at 2×
+        // so we always have *some* discrimination over background.
         let ratio: Double
-        if noiseCeiling > 1e-6 && addressP50 > noiseCeiling {
-            // Address speech is `addressP50 / noise` louder than the
-            // background floor. Use a fraction of that ratio so the
-            // gate is achievable for slightly-quieter follow-ups.
-            ratio = max(2.0, min(addressP50 / noiseCeiling * 0.65, 8.0))
+        if roomCeiling > 1e-6 && addressP50 > roomCeiling {
+            ratio = max(2.0, min(addressP50 / roomCeiling * 0.5, 6.0))
         } else {
             ratio = 4.0  // default
         }
