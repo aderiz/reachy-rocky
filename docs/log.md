@@ -2,6 +2,14 @@
 
 Append-only chronological record. Each entry: `## [YYYY-MM-DD] <op> | <subject>`. Run `grep "^## \[" log.md | tail -20` for the recent timeline.
 
+## [2026-05-12] docs | ADR 0006 — on-bot media relay (backfill)
+
+The biggest architectural decision on the project — replace WebRTC with a bot-side Reachy Mini App that serves audio + video over plain WebSocket — was implemented on 2026-05-11 (commit `3649b93`) but never written up as an ADR. Captured retroactively as `decisions/0006-on-bot-media-relay.md` with the full context (WebRTC failure modes seen on WiFi, alternatives considered, trade-offs, consequences, implementation references) so future readers don't need to reconstruct the reasoning from commit messages.
+
+Also documents the relay's role as the catch-all conduit for state the daemon doesn't expose — first the `/battery` endpoint (per the Dynamixel reg-144 workaround), but generalisable.
+
+`docs/index.md` updated with the 0006 entry.
+
 ## [2026-05-12] docs | Backfill ADR 0004 (Hermes Agent) + flesh out OnBot relay README
 
 The wiki catalog had a hole between ADRs 0003 and 0005 because ADR 0004 (Hermes Agent integration) was authored on the `hermes-agent` branch and never merged. Cherry-picked the three artifacts onto `main`:

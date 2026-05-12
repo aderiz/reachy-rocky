@@ -62,6 +62,7 @@ The catalog of every page in the wiki.
 - [0003 — Sidecar convention for external processes](decisions/0003-sidecar-convention.md) — JSON manifests, line-delimited JSON wire format, supervisor with restart policy + circuit breaker.
 - [0004 — Hermes Agent integration](decisions/0004-hermes-agent-integration.md) — Rocky-as-MCP-server approach for the NousResearch Hermes Agent as Rocky's optional advanced cognition backend. Implementation lives on the `hermes-agent` branch.
 - [0005 — Brain backend as a protocol, MLX-VLM as the default](decisions/0005-brain-backend-protocol.md) — `BrainBackend` seam, vision-aware default, Status panel resolves rows by active backend.
+- [0006 — On-bot media relay replaces WebRTC](decisions/0006-on-bot-media-relay.md) — replace Mac-side WebRTC with a bot-side Reachy Mini App that fans out audio + video over plain WebSocket + carries `/battery` and other state the daemon doesn't expose.
 
 ## Rocky implementation
 
