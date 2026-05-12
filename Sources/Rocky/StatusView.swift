@@ -299,7 +299,7 @@ struct StatusView: View {
         // to the Listen section and see whether it's the mic or
         // speech recognition that failed.
         [
-            ("Body",   [robotRow]),
+            ("Body",   [robotRow, batteryRow]),
             ("Listen", [micRow, sttRow]),
             ("See",    [cameraRow, faceSidecarRow]),
             ("Think",  [brainRow]),
@@ -310,6 +310,70 @@ struct StatusView: View {
 
     fileprivate var allRows: [HealthRow] {
         rowsByCategory.flatMap(\.1)
+    }
+
+    /// Battery row — polls the on-bot media relay's /battery endpoint
+    /// via BatteryService. Distinguishes four states:
+    ///   - no poll yet → unknown
+    ///   - relay unreachable → warn
+    ///   - present: false → unknown (bot doesn't expose the BMS)
+    ///   - charge known → ok / warn / bad by tier
+    private var batteryRow: HealthRow {
+        let state: HealthState
+        let subtitle: String
+        if let snap = services.latestBattery {
+            if !snap.reachable {
+                state = .warn
+                subtitle = "relay unreachable"
+            } else if !snap.present {
+                state = .unknown
+                subtitle = "BMS not exposed by bot image"
+            } else {
+                let pct = snap.percent ?? 100
+                if snap.charging == true {
+                    state = .ok
+                } else if pct < 15 {
+                    state = .bad
+                } else if pct < 30 {
+                    state = .warn
+                } else {
+                    state = .ok
+                }
+                var parts: [String] = []
+                if let p = snap.percent { parts.append("\(p)%") }
+                if let st = snap.status { parts.append(st.lowercased()) }
+                if let v = snap.voltageV { parts.append(String(format: "%.2fV", v)) }
+                if let a = snap.currentA { parts.append(String(format: "%.2fA", a)) }
+                if let t = snap.temperatureC { parts.append(String(format: "%.0f°C", t)) }
+                subtitle = parts.joined(separator: " · ")
+            }
+        } else {
+            state = .unknown
+            subtitle = "waiting for relay…"
+        }
+        return HealthRow(
+            id: "battery",
+            title: "Battery",
+            subtitle: subtitle,
+            icon: batteryIconName(services.latestBattery),
+            state: state,
+            action: nil
+        )
+    }
+
+    private func batteryIconName(_ snap: BatteryService.Snapshot?) -> String {
+        guard let snap, snap.reachable, snap.present else {
+            return "battery.0percent"
+        }
+        let pct = snap.percent ?? 0
+        let bolt = (snap.charging == true) ? ".bolt" : ""
+        let base: String
+        if pct >= 88 { base = "battery.100" }
+        else if pct >= 63 { base = "battery.75" }
+        else if pct >= 38 { base = "battery.50" }
+        else if pct >= 13 { base = "battery.25" }
+        else { base = "battery.0" }
+        return "\(base)percent\(bolt)"
     }
 
     private var robotRow: HealthRow {

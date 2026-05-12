@@ -27,6 +27,10 @@ final class AppServices {
     let faceLibrary: FaceLibrary
     let stateSubscriber: StateSubscriber
     let wakeEngine: any WakeWordEngine
+    /// Polls the on-bot media relay's `/battery` endpoint. Independent
+    /// of daemon reachability so a paused camera or dead daemon
+    /// doesn't blank the chip.
+    let battery: BatteryService
     /// Native-MLX brain sidecar runtime, or nil when the venv hasn't
     /// been installed (`Sidecars/brain/setup.sh`). When nil,
     /// CognitionEngine uses the LMStudioBrain (HTTP) fallback.
@@ -70,6 +74,13 @@ final class AppServices {
     var lastDaemonStatus: RobotLinkClient.DaemonStatus?
     var lastRobotState: RobotState?
     var stateUpdateCount: Int = 0
+
+    /// Latest battery snapshot from the on-bot media relay. `nil` until
+    /// the first poll lands. The relay returns `present: false` on bots
+    /// whose image doesn't expose the BMS to userspace — distinct from
+    /// `nil` (haven't asked yet) and from `reachable: false` (relay
+    /// unreachable).
+    var latestBattery: BatteryService.Snapshot?
 
     /// Live mirror of the latest face-tracker target so the Vision card can render it.
     var lastFaceTarget: FaceTargetSnapshot?
@@ -451,6 +462,13 @@ final class AppServices {
         self.robotLink = RobotLinkClient(endpoint: endpoint, logBus: bus)
         self.supervisor = SidecarSupervisor(logBus: bus)
         self.stateSubscriber = StateSubscriber(endpoint: endpoint, logBus: bus)
+        // Battery polls the on-bot media relay on port 8042, not the
+        // daemon — see OnBot/rocky_media_relay for the `/battery`
+        // endpoint contract. Reusing robotHost is correct (the relay
+        // and daemon share the bot's hostname).
+        self.battery = BatteryService(
+            host: endpoint.host, port: 8042, logBus: bus
+        )
 
         // 50 Hz set_target streamer. Targets come from `MacFaceTracker`
         // (Apple Vision face detection on `robot-camera` JPEG frames);
@@ -1014,6 +1032,20 @@ final class AppServices {
         // `rocky_media_relay` is the active app. Fire-and-forget so
         // it doesn't gate the rest of startup.
         Task { [weak self] in await self?.ensureRelayAppRunning() }
+
+        // Start the battery poller (relay endpoint at port 8042) and
+        // mirror its snapshots onto the @Observable surface. Mirroring
+        // happens on the main actor because @Observable property
+        // mutations must publish on the actor that owns the @Observable.
+        await battery.start()
+        let batteryStream = self.battery.snapshots
+        Task { [weak self] in
+            for await snap in batteryStream {
+                await MainActor.run {
+                    self?.latestBattery = snap
+                }
+            }
+        }
 
         // Tool registry + LM Studio probe. Auto-retries every 8 s while
         // status is offline so users don't have to click "Probe" after

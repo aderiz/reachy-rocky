@@ -111,6 +111,18 @@ struct RootView: View {
         ToolbarItem(placement: .principal) { Spacer() }
 
         ToolbarItem(placement: .primaryAction) {
+            // Clicking the chip opens Inspector → Status, where the
+            // detailed Body row shows voltage, current, temperature,
+            // and source. The chip itself just shows percent + state.
+            Button {
+                inspectorPresented = true
+            } label: {
+                BatteryChip(snapshot: services.latestBattery)
+            }
+            .buttonStyle(.plain)
+        }
+
+        ToolbarItem(placement: .primaryAction) {
             Button {
                 if let until = services.healthGlance.tooltip {
                     inspectorPresented = true
