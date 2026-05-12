@@ -43,16 +43,16 @@ struct AddressFilterTests {
 
     // MARK: - Hard accepts / rejects
 
-    @Test("wake-name match dispatches regardless of all other signals")
+    @Test("wake-name match dispatches when loud enough, even off-axis")
     func wakeOverride() async {
         let f = makeFilter()
-        // Deliberately failing every other gate. The wake match
-        // should still produce dispatch.
+        // Failing the engagement + DoA + confidence gates, but the
+        // segment is genuinely loud — wake should still win.
         let s = AddressFilter.Signals(
             text: "rocky",
             sttConfidence: 0.10,
-            segmentPeakRMS: 0.001,
-            segmentMeanRMS: 0.0005,
+            segmentPeakRMS: 0.06,   // loud, not a hallucination
+            segmentMeanRMS: 0.03,
             roomNoiseCeiling: 0.005,
             doaRad: 3.0,       // way off-axis
             doaIsSpeech: false,
@@ -67,6 +67,32 @@ struct AddressFilterTests {
         }
         #expect(reasons.contains("wake"))
         #expect(engaged == true)
+    }
+
+    @Test("wake-name on near-silence is dropped as hallucination")
+    func wakeHallucinationDropped() async {
+        let f = makeFilter()
+        // Whisper hallucinates "rocky" on a very quiet segment —
+        // wake gate should refuse because there's no real speech
+        // to back the match.
+        let s = AddressFilter.Signals(
+            text: "rocky",
+            sttConfidence: 1.0,
+            segmentPeakRMS: 0.003,  // below default rmsFloor of 0.012
+            segmentMeanRMS: 0.001,
+            roomNoiseCeiling: 0.005,
+            doaRad: 0.0,
+            doaIsSpeech: true,
+            faceVisibleAgeS: 1.0,
+            wakeReason: .wakeMatch(name: "rocky"),
+            ttsActive: false,
+            micSource: "robot"
+        )
+        let d = await f.decide(s)
+        guard case let .drop(_, reasons) = d else {
+            Issue.record("expected drop; got \(d)"); return
+        }
+        #expect(reasons.contains("wake_hallucination"))
     }
 
     @Test("echo-tail drops everything while Rocky is speaking")

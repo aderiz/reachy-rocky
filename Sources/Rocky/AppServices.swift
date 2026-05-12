@@ -765,6 +765,7 @@ final class AppServices {
         await faceLibrary.setAcceptThreshold(settings.faceMatchThreshold)
         await robotTTS.setVolume(settings.audioVolume)
         await macFaceTracker.setLibrary(faceLibrary)
+        await macFaceTracker.setIdleSearchEnabled(settings.faceTrackerIdleSearchEnabled)
         await refreshEnrolledFaces()
         await macFaceTracker.start()
 
@@ -1948,6 +1949,9 @@ final class AppServices {
         await MainActor.run {
             self.transitioningUntil = Date().addingTimeInterval(3.2)
         }
+        // Tell the face tracker we're awake so it resumes frame
+        // ingestion + (optional) idle search.
+        await macFaceTracker.setSleeping(false)
         // Bring the camera feed back up *before* the wake motion so
         // the first frames arrive while Rocky is opening his eyes.
         // Mic stays on while sleeping (wake-on-name), so no mic call.
@@ -1988,6 +1992,10 @@ final class AppServices {
             self.conversationOpenUntil = nil
         }
         await voice.closeConversationWindow()
+        // Tell the face tracker we're asleep so it stops processing
+        // camera frames (no point — motors are off). This also
+        // disables the idle look-around if it was enabled.
+        await macFaceTracker.setSleeping(true)
         do { try await robotLink.goToSleep() }
         catch {
             await MainActor.run { self.transitioningUntil = nil }

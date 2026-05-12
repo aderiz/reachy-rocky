@@ -250,6 +250,14 @@ final class SettingsStore {
     /// speech that wouldn't otherwise pass the strict gate.
     var addressVerbPrefixes: [String] { didSet { save() } }
 
+    /// When true, the face tracker drives a slow Lissajous pan when
+    /// no face has been seen for a few seconds — "Rocky looks around
+    /// on his own." When false (default), the head decays to neutral
+    /// and stays there until a face returns. Off by default because
+    /// the autonomous pan reads as uncanny / attention-stealing for
+    /// most users.
+    var faceTrackerIdleSearchEnabled: Bool { didSet { save() } }
+
     init() {
         let d = UserDefaults.standard
         self.robotHost = d.string(forKey: Keys.robotHost) ?? "reachy-mini.local"
@@ -330,6 +338,8 @@ final class SettingsStore {
             ?? ["what", "where", "when", "why", "how", "tell",
                 "show", "do", "does", "can", "could", "is", "are",
                 "play", "stop", "set", "turn"]
+        self.faceTrackerIdleSearchEnabled =
+            (d.object(forKey: Keys.faceTrackerIdleSearchEnabled) as? Bool) ?? false
     }
 
     /// Stamp `micVADThreshold` from a calibration / slider commit, and
@@ -404,6 +414,7 @@ final class SettingsStore {
         d.set(convoWindowS, forKey: Keys.convoWindowS)
         d.set(addressJunkPhrases, forKey: Keys.addressJunkPhrases)
         d.set(addressVerbPrefixes, forKey: Keys.addressVerbPrefixes)
+        d.set(faceTrackerIdleSearchEnabled, forKey: Keys.faceTrackerIdleSearchEnabled)
     }
 
     func robotEndpoint() -> RobotEndpoint {
@@ -589,5 +600,6 @@ final class SettingsStore {
         static let convoWindowS = "rocky.convo.window"
         static let addressJunkPhrases = "rocky.address.junk.phrases"
         static let addressVerbPrefixes = "rocky.address.verb.prefixes"
+        static let faceTrackerIdleSearchEnabled = "rocky.face.idle.search.enabled"
     }
 }

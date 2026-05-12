@@ -195,9 +195,20 @@ public actor AddressFilter {
             return .drop(score: 0, reasons: ["echo_tail"])
         }
 
-        // 2. Wake-name match wins outright. The user explicitly
-        //    addressed Rocky; we don't need other evidence.
+        // 2. Wake-name match wins — *if* the audio that produced it
+        //    actually had enough energy to be real speech. STT can
+        //    hallucinate "rocky" on near-silent segments, and the
+        //    wake path is the one path nothing else gates, so a
+        //    hallucinated wake can wake Rocky unexpectedly. Require
+        //    segment peak RMS ≥ the calibrated floor so silence-
+        //    driven hallucinations can't sneak through. A real user
+        //    shouting "Rocky!" easily clears this; a Whisper
+        //    confabulation on an empty room won't.
         if case .wakeMatch = signals.wakeReason {
+            if signals.segmentPeakRMS < config.rmsFloor {
+                return .drop(score: 0,
+                             reasons: ["wake_hallucination", "low_loudness"])
+            }
             return .dispatch(score: 1.0, reasons: ["wake"], engaged: true)
         }
 
