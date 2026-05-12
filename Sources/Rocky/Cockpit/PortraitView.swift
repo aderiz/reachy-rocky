@@ -173,12 +173,14 @@ struct PortraitView: View {
 
 // MARK: - Wake / sleep switch
 
-/// iOS-style sliding switch with sun/moon visual cues for the wake
-/// state. Track colour follows the platform's on/off convention:
-/// system green when the bot is awake (the "on" state) and near-
-/// black when asleep. A white thumb slides between two ends; the
-/// thumb carries a sun/moon glyph in slate so it reads from a
-/// distance against the white fill.
+/// iOS-style sliding switch for Rocky's wake state.
+///
+/// Awake = "on": GREEN track, thumb on the RIGHT (iOS standard).
+/// Asleep = "off": near-black track, thumb on the LEFT.
+///
+/// End-cap glyphs: moon on the LEFT (asleep position), sun on the
+/// RIGHT (awake position) so the thumb always sits over the icon
+/// representing the *current* state.
 private struct WakeSleepSwitch: View {
     let isAwake: Bool
     let isTransitioning: Bool
@@ -189,9 +191,8 @@ private struct WakeSleepSwitch: View {
     private let thumbSize: CGFloat = 26
     private let inset: CGFloat = 3
 
-    // iOS Settings.app green for "on" (control-center / system
-    // toggle hue). Asleep colour is a very dark gray instead of pure
-    // black so the moon-glyph end-cap stays visible.
+    // iOS Settings.app green for "on" (awake); near-black for "off"
+    // (asleep). Same hue family as Focus / system toggles.
     private static let onTint = Color(red: 0.20, green: 0.78, blue: 0.35)
     private static let offTint = Color(red: 0.11, green: 0.11, blue: 0.13)
 
@@ -222,19 +223,19 @@ private struct WakeSleepSwitch: View {
             )
     }
 
-    /// Sun on the awake (left) end, moon on the sleep (right) end.
-    /// White glyphs with low opacity so they read as track decoration
-    /// rather than competing with the thumb for attention. The
-    /// opposite end fades further when its state is inactive.
+    /// Moon on the asleep (left) end, sun on the awake (right) end.
+    /// The thumb sits over the icon of the current state — moon when
+    /// asleep, sun when awake. The opposite end's glyph fades to 0
+    /// so only one icon is visible at a time, behind the thumb.
     private var endCaps: some View {
         HStack {
-            Image(systemName: "sun.max.fill")
-                .font(.system(size: 11, weight: .bold))
-                .foregroundStyle(.white.opacity(isAwake ? 0.0 : 0.50))
-            Spacer()
             Image(systemName: "moon.fill")
                 .font(.system(size: 11, weight: .bold))
                 .foregroundStyle(.white.opacity(isAwake ? 0.50 : 0.0))
+            Spacer()
+            Image(systemName: "sun.max.fill")
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(.white.opacity(isAwake ? 0.0 : 0.50))
         }
         .padding(.horizontal, 9)
         .frame(width: trackW, height: trackH)
@@ -247,13 +248,15 @@ private struct WakeSleepSwitch: View {
                 .shadow(color: .black.opacity(0.35), radius: 1.5, y: 0.5)
             Image(systemName: isAwake ? "sun.max.fill" : "moon.fill")
                 .font(.system(size: 13, weight: .bold))
-                // Sun: dark slate so the yellow association comes
-                // from the green track around it, not from the icon.
-                // Moon: dark slate against white reads cleanly.
+                // Dark slate — high contrast on the white thumb in
+                // either state. Track colour around it carries the
+                // semantic (green = awake).
                 .foregroundStyle(Color(red: 0.18, green: 0.20, blue: 0.24))
         }
         .frame(width: thumbSize, height: thumbSize)
-        .offset(x: isAwake ? inset : (trackW - thumbSize - inset))
+        // Awake = thumb on RIGHT (iOS "on" position).
+        // Asleep = thumb on LEFT.
+        .offset(x: isAwake ? (trackW - thumbSize - inset) : inset)
     }
 }
 
