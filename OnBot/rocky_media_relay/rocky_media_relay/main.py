@@ -11,7 +11,8 @@ the canonical case.
 Endpoints (mounted under `self.settings_app`, which the daemon exposes
 at the app's `custom_app_url`, default `http://0.0.0.0:8042`):
 
-  GET  /health              — JSON liveness + counters
+  GET  /health              — JSON liveness + counters (includes battery)
+  GET  /battery             — battery snapshot (see `read_battery`)
   POST /control/start_recording   — begin audio capture (idempotent)
   POST /control/stop_recording    — stop audio capture (idempotent)
   WebSocket /ws/audio       — base64-encoded int16-LE mono PCM at 16 kHz +
@@ -43,6 +44,7 @@ import base64
 import io
 import json
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -202,6 +204,131 @@ def _doa_msg(angle_rad: float, is_speech: bool) -> bytes:
     return (json.dumps(payload) + "\n").encode("utf-8")
 
 
+_PSU_BASE = "/sys/class/power_supply"
+_BATTERY_CACHE_TTL_S = 2.0
+_battery_cache: tuple[float, dict] = (0.0, {})
+
+
+def _psu_read_str(node: str, key: str) -> Optional[str]:
+    try:
+        with open(os.path.join(_PSU_BASE, node, key), "r") as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _psu_read_int(node: str, key: str) -> Optional[int]:
+    s = _psu_read_str(node, key)
+    if s is None:
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        return None
+
+
+def _read_battery_uncached() -> dict:
+    """Read battery state from /sys/class/power_supply/* on the CM4.
+
+    Reachy Mini Wireless has a LiFePO4 pack + BMS. Whether the BMS is
+    surfaced to the kernel depends on the bot's image — there's no
+    daemon API for it (verified via /openapi.json and /api/state/full).
+    This walks sysfs and reports whatever the kernel exposes. If no
+    Battery node is present, returns present=False so callers know
+    the bot can't tell them, rather than guessing from voltage.
+
+    Result fields (any may be null if the kernel doesn't expose them):
+      present       — whether a Battery PSU node was found
+      percent       — 0–100, from `capacity`
+      status        — Linux PSU status string ("Charging", "Discharging",
+                       "Full", "Not charging", "Unknown")
+      charging      — derived: status == "Charging"
+      plugged_in    — true if any Mains/USB/ACAD PSU reports online=1,
+                       or (when no AC node exists) derived from the
+                       battery status. Reachy Mini's USB-C is DATA only
+                       and doesn't charge, so this is informational
+                       only on the stock image.
+      voltage_v     — pack voltage, from `voltage_now` (µV → V)
+      current_a     — pack current, from `current_now` (µA → A; sign
+                       indicates direction per kernel convention)
+      temperature_c — pack temperature, from `temp` (dC → C)
+      source        — sysfs node name (e.g. "bq27441-0")
+    Never raises.
+    """
+    result: dict = {
+        "present": False,
+        "percent": None,
+        "status": None,
+        "charging": None,
+        "plugged_in": None,
+        "voltage_v": None,
+        "current_a": None,
+        "temperature_c": None,
+        "source": None,
+    }
+    try:
+        entries = os.listdir(_PSU_BASE)
+    except OSError:
+        return result
+
+    battery_node: Optional[str] = None
+    have_ac = False
+    online_any = False
+    for name in sorted(entries):
+        psu_type = _psu_read_str(name, "type")
+        if psu_type == "Battery" and battery_node is None:
+            battery_node = name
+        elif psu_type in ("Mains", "USB", "USB_PD", "ACAD", "Wireless"):
+            have_ac = True
+            if _psu_read_int(name, "online") == 1:
+                online_any = True
+
+    if battery_node is None:
+        result["plugged_in"] = online_any if have_ac else None
+        return result
+
+    result["present"] = True
+    result["source"] = battery_node
+    pct = _psu_read_int(battery_node, "capacity")
+    if pct is not None:
+        result["percent"] = max(0, min(100, pct))
+    status = _psu_read_str(battery_node, "status")
+    if status:
+        result["status"] = status
+        lc = status.lower()
+        result["charging"] = (lc == "charging")
+        if have_ac:
+            result["plugged_in"] = online_any
+        else:
+            # No separate AC node — derive plugged_in from the
+            # battery's own status. "Discharging" is the only state
+            # where we're definitely on battery alone.
+            result["plugged_in"] = lc in ("charging", "full", "not charging")
+    voltage_uv = _psu_read_int(battery_node, "voltage_now")
+    if voltage_uv is not None:
+        result["voltage_v"] = round(voltage_uv / 1e6, 3)
+    current_ua = _psu_read_int(battery_node, "current_now")
+    if current_ua is not None:
+        result["current_a"] = round(current_ua / 1e6, 3)
+    temp_dc = _psu_read_int(battery_node, "temp")  # deci-Celsius
+    if temp_dc is not None:
+        result["temperature_c"] = round(temp_dc / 10.0, 1)
+    return result
+
+
+def read_battery() -> dict:
+    """Cached wrapper around `_read_battery_uncached` — sysfs reads
+    are cheap but we still don't want to hit them on every WS message."""
+    global _battery_cache
+    now = time.time()
+    ts, snap = _battery_cache
+    if snap and (now - ts) < _BATTERY_CACHE_TTL_S:
+        return snap
+    snap = _read_battery_uncached()
+    _battery_cache = (now, snap)
+    return snap
+
+
 def _frame_msg(frame_bgr: np.ndarray) -> Optional[bytes]:
     """Downscale + JPEG-encode. Uses Pillow because mlx-audio /
     reachy_mini already pull it in; avoids forcing OpenCV onto the
@@ -272,7 +399,12 @@ class RockyMediaRelay(ReachyMiniApp):
                 "video_dropped_total": state.video_dropped_total,
                 "video_fps_cap": VIDEO_FPS_CAP,
                 "build": "rocky-media-relay/0.1",
+                "battery": read_battery(),
             }
+
+        @self.settings_app.get("/battery")
+        def battery():
+            return read_battery()
 
         @self.settings_app.post("/control/start_recording")
         def start_recording():
