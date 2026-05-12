@@ -2,6 +2,28 @@
 
 Append-only chronological record. Each entry: `## [YYYY-MM-DD] <op> | <subject>`. Run `grep "^## \[" log.md | tail -20` for the recent timeline.
 
+## [2026-05-12] code | Listening rework — `listening-rework` branch
+
+The single-signal "did VAD see speech?" dispatch gate was producing constant unwanted turns: Whisper hallucinations ("thank you", "subtitles by Amara"), background TV, other people's conversations. Auto-extending conversation window meant one bad hallucination locked Rocky in "engaged" mode for an hour. Face tracker autonomous idle pan made the head wander whenever nobody was directly in frame. Wake-on-name had no gate at all — a Whisper hallucination of "rocky" on silence woke the bot from sleep.
+
+**New `AddressFilter` actor** (`Sources/Voice/AddressFilter.swift`) sits between STT and the brain, fusing all available signals: segment peak / mean RMS, DoA + `is_speech` from the on-bot mic array, face age, STT confidence, junk-phrase deny-list, wake-reason, TTS state, mic source. Strict ruleset: wake-name still wins, **but only if `segmentPeakRMS ≥ rmsFloor`** so silence-driven hallucinations can't sneak through. For non-wake transcripts, all of `loud + on-axis + engaged` must hold. `engaged` = face visible ≤ 3 s OR DoA on-axis with `is_speech: true` OR transcript begins with a verb prefix. Strict mode means "drop on ambiguity." 13 table-driven unit tests.
+
+**WakeFilter rework.** Window default 60 s → 20 s. `.withinWindow` no longer auto-extends; new `extendOnEngaged()` is called by `AppServices.handleVoice` only when AddressFilter accepts with real engagement evidence. So hallucinations can't perpetually re-extend.
+
+**Calibration adds a 4th phase + motors-under-load.** `MicCalibrationView` was three auto-flowing phases; now it's four with the speech phases user-gated. The Rocky phase drives a smooth 50 Hz parametric Lissajous head sweep (yaw ~16°, pitch ~6°, coprime periods 3.7 s / 2.3 s) via direct `setTarget` POSTs while audio captures. Face tracking is **triple-suppressed** for the duration (`transitioningUntil` + `targetStreamer.setPrimaryMoveActive(true)` + `setFaceTrackingEnabled(false)`) so nothing else can steal motor attention. The new "Address Rocky" phase captures direct-address RMS + DoA (robot mic) and computes the four AddressFilter values. **Critical math fix**: VAD threshold and AddressFilter noise ceiling both use **room P99 only**, not motors-under-load. Motors are idle when Rocky is actually listening to the user; including motion-loaded samples in the ceiling made normal speech unattainable. Diagnostic LogBus event fires at end-of-compute so the user can see exactly what calibration produced. The flow uses Mac-side `services.wakeRobot()` / `sleepRobot()` (not raw daemon endpoints) so transitions land at home pose.
+
+**Whisper hallucination mitigation** (Sidecars/mlx-stt): `initial_prompt="A short conversation between a person and a robot named Rocky."` biases the language prior away from YouTube-credit hallucinations. Temperature fallback ladder `(0.0, 0.2, …, 1.0)` retries on `compression_ratio_threshold=1.8`. `no_speech_threshold=0.7`. Confidence-gated phrase deny-list drops boilerplate only when segment `no_speech_prob ≥ 0.4` or `avg_logprob ≤ -0.8` — real "thank you" said clearly passes. Plus the existing n-gram repetition collapse.
+
+**Face tracker behavioural fixes.** `decayIfIdle` (autonomous Lissajous pan when face out of frame) is now opt-in via `SettingsStore.faceTrackerIdleSearchEnabled`, default `false`. `MacFaceTracker.setSleeping(_:)` called from `sleepRobot` / `wakeRobot` — frame ingestion is skipped while asleep (saves ~10 ms Vision pass per frame, prevents EMA drift).
+
+**Antenna anti-vibration**. Antenna motors mechanically vibrate at exactly 0 rad (vertical), per a comment in Pollen's `reachy_mini.py` (`INIT_ANTENNAS_JOINT_POSITIONS = [-0.1745, 0.1745]  # ~10° offset to reduce shaking at vertical`). Two prior fixes (amplitude/rate, quantisation) failed because the noise is downstream of the setpoint. Now both antennas rest at the same ±0.1745 rad offset; twitches are deltas relative to rest.
+
+**Other small fixes shipped on this branch.** Camera feed pauses on sleep (no JPEG encoding on the bot when no `/ws/video` subscriber). On-bot relay exposes `/battery` reading supply voltage via Dynamixel motor register 144 through the daemon's raw-packet WS (no fuel gauge IC on the hardware — voltage is the discriminator). Power chip on the portrait with iOS-style pill glyph. Portrait backdrop adapts to system colour scheme. Wake/sleep toggle restyled to iOS green-when-awake convention (thumb-right = on).
+
+Wiki: `docs/concepts/voice-pipeline.md` rewritten; new `docs/concepts/address-filter.md`; CLAUDE.md updated. 76 tests pass.
+
+Branch: `listening-rework`. Will land into main when stable.
+
 ## [2026-05-11] code | On-bot media relay — rearchitect on `on-bot-media-relay` branch
 
 Replaced the Mac-side WebRTC media path with a bot-side Reachy Mini App + plain WebSocket. The motivation came from days of WebRTC instability on WiFi: signalling drops, DTLS errors, sidecar respawn loops, silent / zero PCM, VAD over-segmentation. The official remote-media path is WebRTC; the v0.3 path uses the Apps system instead.
