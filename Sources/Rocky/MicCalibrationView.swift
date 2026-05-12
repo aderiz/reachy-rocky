@@ -1,5 +1,6 @@
 import SwiftUI
 import RobotLink
+import RockyKit  // RPYPose
 
 /// Guided microphone calibration. Three-phase capture plus an optional
 /// verify pass. Each phase has a distinct noise / signal model, so the
@@ -89,8 +90,10 @@ struct MicCalibrationView: View {
         case preRoomSleeping     // sending goToSleep, waiting for completion
         case room
         case waking              // wakeUp in flight
-        case robot
+        case robot               // head + body motion + capture
+        case voicePrompt         // waiting for user to press Start
         case voice
+        case addressPrompt       // waiting for user to press Start
         case address             // direct-address capture for AddressFilter
         case computing
         case results
@@ -98,6 +101,12 @@ struct MicCalibrationView: View {
         case applied
         case failed
     }
+
+    /// Bumped by the footer's "Start speaking" button. The async
+    /// orchestration loop polls this counter so it can yield back to
+    /// SwiftUI while waiting — simpler than continuation plumbing
+    /// across @State + actors.
+    @State private var userStartTicks: Int = 0
 
     var body: some View {
         VStack(spacing: 18) {
@@ -154,15 +163,18 @@ struct MicCalibrationView: View {
     private func stepDoneAt(_ index: Int) -> Bool {
         switch (index, phase) {
         case (1, .robot), (1, .waking),
-             (1, .voice), (1, .address), (1, .computing),
-             (1, .results), (1, .verify),
-             (1, .applied):
+             (1, .voicePrompt), (1, .voice),
+             (1, .addressPrompt), (1, .address),
+             (1, .computing), (1, .results),
+             (1, .verify), (1, .applied):
             return true
-        case (2, .voice), (2, .address), (2, .computing),
-             (2, .results), (2, .verify),
-             (2, .applied):
+        case (2, .voicePrompt), (2, .voice),
+             (2, .addressPrompt), (2, .address),
+             (2, .computing), (2, .results),
+             (2, .verify), (2, .applied):
             return true
-        case (3, .address), (3, .computing), (3, .results),
+        case (3, .addressPrompt), (3, .address),
+             (3, .computing), (3, .results),
              (3, .verify), (3, .applied):
             return true
         case (4, .computing), (4, .results),
@@ -235,17 +247,27 @@ struct MicCalibrationView: View {
                 subtitle: "Don't speak. We're capturing motor and fan noise.",
                 duration: robotSeconds
             )
+        case .voicePrompt:
+            phaseInstruction(
+                title: "Ready to speak?",
+                subtitle: "Press Start, then talk for about ten seconds. Try a few short sentences with natural pauses — the weather, what's on tomorrow, anything."
+            )
         case .voice:
             phaseRecording(
                 title: "Now speak normally",
-                subtitle: "Talk for about ten seconds. Try a few short sentences with natural pauses — the weather, what's on tomorrow, anything. The white line on the bar marks the noise floor: aim for your voice to cross it on every word.",
+                subtitle: "Talk for about ten seconds. Try a few short sentences with natural pauses. The white line on the bar marks the noise floor: aim for your voice to cross it on every word.",
                 duration: voiceSeconds,
                 showCutoff: true
+            )
+        case .addressPrompt:
+            phaseInstruction(
+                title: "Ready to address Rocky?",
+                subtitle: "Press Start when you're seated where you normally sit, then read these to Rocky: \"Rocky, what time is it?\"  \"Rocky, what's the weather?\"  \"Rocky, set a timer for ten minutes.\""
             )
         case .address:
             phaseRecording(
                 title: "Address Rocky from your usual spot",
-                subtitle: "Now talk directly TO Rocky — face him from where you normally sit. Read these out: \"Rocky, what time is it?\"  \"Rocky, what's the weather?\"  \"Rocky, set a timer for ten minutes.\" This teaches him what 'addressed-to-me' sounds and looks like.",
+                subtitle: "Talk directly TO Rocky — face him. This teaches him what 'addressed-to-me' sounds and looks like.",
                 duration: addressSeconds,
                 showCutoff: true
             )
@@ -520,6 +542,10 @@ struct MicCalibrationView: View {
             switch phase {
             case .intro, .preRoomSleeping, .room, .waking, .robot, .voice, .address, .computing:
                 Button("Recording…") {}.disabled(true)
+            case .voicePrompt, .addressPrompt:
+                Button("Start") { userStartTicks += 1 }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
             case .results:
                 Button("Apply without verify") { applyAndDismiss() }
                 Button("Test it") { Task { await runVerify() } }
@@ -661,7 +687,24 @@ struct MicCalibrationView: View {
             if Task.isCancelled { return }
 
             await MainActor.run { phase = .robot }
+            // Suppress the face-tracker streamer for the whole
+            // robot-capture window so our deliberate motion sequence
+            // can run unfought. We extend `transitioningUntil` to
+            // cover the capture + a small tail; it expires
+            // naturally afterward.
+            await MainActor.run {
+                services.transitioningUntil =
+                    Date().addingTimeInterval(robotSeconds + 1.0)
+            }
+            // Run head motion concurrently with audio capture so we
+            // record the motors *while they're actually moving* —
+            // that's when the calibration data is realistic. Idle
+            // motors are nearly silent; under-load motors are where
+            // hum and gear chatter come from.
+            async let motion: Void = runRobotMotionSequence(during: robotSeconds)
             robotSamples = await capturePhase(seconds: robotSeconds)
+            _ = await motion
+            await MainActor.run { services.transitioningUntil = nil }
             if Task.isCancelled { return }
 
             let robotLoud = robotSamples.filter { $0 > 0.02 }.count
@@ -672,17 +715,22 @@ struct MicCalibrationView: View {
             }
         }
 
-        // Phase 3: Voice. The robot stays awake (or stays offline)
-        // — that's the realistic operating condition.
+        // Phase 3: Voice — user-gated. Show the prompt and wait for
+        // the Start button before recording. Speech capture should
+        // never fire without the user actively initiating it.
+        await MainActor.run { phase = .voicePrompt }
+        await waitForUserStart()
+        if Task.isCancelled { return }
         await MainActor.run { phase = .voice }
         voiceSamples = await capturePhase(seconds: voiceSeconds)
         if Task.isCancelled { return }
 
-        // Phase 4: Address — capture direct-address loudness and (on
-        // robot mic) the user's typical DoA from where they sit. The
-        // values feed the AddressFilter so it can reject background
-        // / off-axis speech in normal operation. Failing this phase
-        // is non-fatal: defaults will be used.
+        // Phase 4: Address — also user-gated. Same prompt pattern as
+        // phase 3. Captures direct-address loudness and (on robot
+        // mic) the user's typical DoA from where they sit.
+        await MainActor.run { phase = .addressPrompt }
+        await waitForUserStart()
+        if Task.isCancelled { return }
         await MainActor.run { phase = .address }
         let (addressR, addressD) = await captureAddressPhase(seconds: addressSeconds)
         addressSamples = addressR
@@ -713,6 +761,61 @@ struct MicCalibrationView: View {
             }
         case .failure(let reason):
             await failOut(reason: reason)
+        }
+    }
+
+    /// Block the orchestration loop until the user presses the
+    /// "Start" button in the footer (which bumps `userStartTicks`).
+    /// Polled at 10 Hz — well below human reaction latency and cheap
+    /// enough to not show up in instruments. Cancellation-aware so
+    /// dismissing the sheet mid-wait exits cleanly.
+    private func waitForUserStart() async {
+        let baseline = userStartTicks
+        while !Task.isCancelled {
+            if userStartTicks > baseline { return }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+    }
+
+    /// Drive the head and body through a short motion sequence so
+    /// the motor-noise capture phase records the motors *under load*.
+    /// Idle motors are nearly silent; the noise we need to measure is
+    /// the hum + gear chatter that only fires while servos are
+    /// actively tracking a target.
+    ///
+    /// Issued as a chain of minjerk `goto` calls (~1.2 s each) that
+    /// sweep yaw left-right, pitch up-down, and add a body twist on
+    /// the last beat. Total wall time ≈ `during` seconds; the loop
+    /// caps mid-sequence if the captured time runs out so we never
+    /// overrun. The face-tracker streamer is already gated by the
+    /// caller setting `transitioningUntil`.
+    private func runRobotMotionSequence(during seconds: Double) async {
+        // Each entry: (roll, pitch, yaw, body, duration).
+        // Angles in radians. Tuned to be visibly active but small
+        // enough to look like a calibration motion rather than a
+        // dance — Rocky shouldn't startle the user.
+        let leg: [(Double, Double, Double, Double, Double)] = [
+            (0,  0.15, -0.30, -0.20, 1.4),   // look down-left
+            (0, -0.10,  0.30,  0.20, 1.4),   // look up-right
+            (0,  0.20,  0.00,  0.00, 1.2),   // chin down
+            (0,  0.00,  0.00,  0.00, 1.2),   // back to neutral
+        ]
+        let start = Date()
+        for (roll, pitch, yaw, body, dur) in leg {
+            if Task.isCancelled { return }
+            if Date().timeIntervalSince(start) >= seconds { return }
+            let pose = RPYPose(roll: roll, pitch: pitch, yaw: yaw)
+            do {
+                try await services.robotLink.goto(
+                    headPose: pose, antennas: nil,
+                    bodyYaw: body, durationS: dur
+                )
+            } catch {
+                // Non-fatal — move on. Better to capture fewer
+                // motion-laden samples than to fail the whole
+                // calibration on a transient goto error.
+                return
+            }
         }
     }
 
