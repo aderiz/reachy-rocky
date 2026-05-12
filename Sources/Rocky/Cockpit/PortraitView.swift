@@ -47,9 +47,6 @@ struct PortraitView: View {
             Spacer(minLength: 0)
             namePlate
                 .padding(.horizontal, 24)
-                .padding(.bottom, 16)
-            primaryAction
-                .padding(.horizontal, 24)
                 .padding(.bottom, 24)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -83,16 +80,53 @@ struct PortraitView: View {
     // MARK: - Name plate (the only typography on the stage)
 
     private var namePlate: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Rocky")
-                .font(.title.weight(.semibold))
-            Text(presenceLine)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-                .fixedSize(horizontal: false, vertical: true)
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Rocky")
+                    .font(.title.weight(.semibold))
+                Text(presenceLine)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            wakeToggle
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    // MARK: - Wake / sleep toggle (replaces the full-width button)
+
+    /// Inline switch — awake when on, asleep when off. Disabled while
+    /// the bot is mid-transition. Mid-TTS "Stop talking" lives in the
+    /// toolbar's mute-voice button now; collapsing it into a binary
+    /// toggle here is the tradeoff for the cleaner inline layout.
+    private var wakeToggle: some View {
+        Toggle("Rocky awake", isOn: Binding(
+            get: { isAwake },
+            set: { newValue in
+                Task {
+                    if newValue { await services.wakeRobot() }
+                    else { await services.sleepRobot() }
+                }
+            }
+        ))
+        .toggleStyle(.switch)
+        .labelsHidden()
+        .controlSize(.large)
+        .disabled(services.rockyState == .waking)
+        .help(isAwake ? "Send Rocky to sleep." : "Wake Rocky up.")
+        .keyboardShortcut(.return, modifiers: [])
+    }
+
+    /// Mirror the state-machine into a binary awake/asleep view of
+    /// the toggle. The waking transition reads as "still asleep" so
+    /// the switch only flips on once the wake sequence completes.
+    private var isAwake: Bool {
+        switch services.rockyState {
+        case .sleeping, .waking, .error: return false
+        case .idle, .tracking, .listening, .thinking, .speaking: return true
+        }
     }
 
     /// Single sentence describing what Rocky is doing right now. The
@@ -129,90 +163,6 @@ struct PortraitView: View {
         "Rocky's head, animated. \(presenceLine)"
     }
 
-    // MARK: - Primary action — one button, follows state
-
-    /// Per the design doc: one primary action whose meaning follows the
-    /// state. Wake when asleep, Sleep when awake; "Stop talking" wins
-    /// while a TTS clip is playing because that's the most-likely thing
-    /// you want to interrupt.
-    @ViewBuilder
-    private var primaryAction: some View {
-        let primary = primaryActionDescriptor
-        Button(action: primary.action) {
-            HStack(spacing: 6) {
-                Image(systemName: primary.icon)
-                Text(primary.label)
-            }
-            .frame(maxWidth: .infinity)
-        }
-        .buttonStyle(.borderedProminent)
-        .controlSize(.large)
-        .tint(primary.tint)
-        .keyboardShortcut(primary.shortcut.0, modifiers: primary.shortcut.1)
-        .disabled(primary.disabled)
-        .help(primary.tooltip)
-    }
-
-    private struct PrimaryAction {
-        let label: String
-        let icon: String
-        let tint: Color
-        let action: () -> Void
-        let shortcut: (KeyEquivalent, EventModifiers)
-        let disabled: Bool
-        let tooltip: String
-    }
-
-    private var primaryActionDescriptor: PrimaryAction {
-        // Mute-while-speaking takes precedence — that's the most-likely
-        // thing you reach for the button to do mid-turn. (Real
-        // mid-clip cancel needs daemon-side support; muting is the
-        // user-visible equivalent for now.)
-        if let busyUntil = services.ttsBusyUntil, Date() < busyUntil,
-           !services.ttsMuted {
-            return .init(
-                label: "Stop talking",
-                icon: "speaker.slash.fill",
-                tint: .orange,
-                action: { Task { await services.toggleTTSMute() } },
-                shortcut: (".", [.command]),
-                disabled: false,
-                tooltip: "Mute Rocky's voice. ⌘."
-            )
-        }
-        switch services.rockyState {
-        case .sleeping, .error:
-            return .init(
-                label: "Wake him up",
-                icon: "sun.max.fill",
-                tint: .accentColor,
-                action: { Task { await services.wakeRobot() } },
-                shortcut: (.return, []),
-                disabled: false,
-                tooltip: "Enable motors and recover the neutral pose. ⏎"
-            )
-        case .waking:
-            return .init(
-                label: "Waking…",
-                icon: "hourglass",
-                tint: .secondary,
-                action: {},
-                shortcut: (.return, []),
-                disabled: true,
-                tooltip: "Rocky is currently waking up."
-            )
-        case .idle, .tracking, .listening, .thinking, .speaking:
-            return .init(
-                label: "Send him to sleep",
-                icon: "moon.fill",
-                tint: .indigo,
-                action: { Task { await services.sleepRobot() } },
-                shortcut: (.return, [.shift]),
-                disabled: false,
-                tooltip: "Disable motors after the goodbye animation. ⇧⏎"
-            )
-        }
-    }
 }
 
 // MARK: - Senses overlays
