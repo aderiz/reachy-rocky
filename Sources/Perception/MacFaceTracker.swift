@@ -73,13 +73,32 @@ public actor MacFaceTracker {
 
         // Antenna twitches — independent Poisson-process triggers per
         // antenna so the timing is genuinely random (exponentially-
-        // distributed gaps), not a regular tempo. Mean rate ~0.18/s
-        // per antenna ≈ one twitch every 5–6 s on average, but with
-        // wide variance: occasional bursts and long quiet periods.
-        public var antennaTwitchRatePerS: Double = 0.18
-        public var antennaTwitchAmplitude: Double = 0.20
+        // distributed gaps), not a regular tempo. Mean rate ~0.10/s
+        // per antenna ≈ one twitch every ~10 s on average, with two
+        // antennas combined that's noticeable life-signs without
+        // being constantly twitchy.
+        public var antennaTwitchRatePerS: Double = 0.10
+        // ~0.12 rad ≈ 7° — gentler than the old 0.20 rad (~11°)
+        // step which was visibly flicking the motors.
+        public var antennaTwitchAmplitude: Double = 0.12
         public var antennaTwitchMinHold: Double = 0.18
         public var antennaTwitchMaxHold: Double = 0.55
+        // Smoothing time-constants for the eased ramp toward the
+        // random target on trigger, and back to zero after release.
+        // ~80 ms in / 150 ms out. Eliminates the step-change "flick"
+        // that motors couldn't track at one frame's slew rate.
+        public var antennaEaseInTau: Double = 0.08
+        public var antennaEaseOutTau: Double = 0.15
+        // Output quantisation for the antenna setpoint sent to the
+        // bot. 0.02 rad ≈ 1.15° per step. Snapping the 50 Hz stream
+        // to a coarse grid means consecutive ticks emit the *same*
+        // value during the entire hold phase (no per-frame
+        // floating-point drift), and the ease-in / ease-out
+        // present as 5–7 discrete steps instead of 30 micro-
+        // adjustments. Eliminates the bot motor's high-frequency
+        // chase / vibration without changing the visual envelope
+        // of the twitch.
+        public var antennaQuantizeStepRad: Double = 0.02
 
         public init() {}
     }
@@ -182,6 +201,14 @@ public actor MacFaceTracker {
     private var antennaRightCmd: Double = 0
     private var leftTwitchReleaseAt: Date?
     private var rightTwitchReleaseAt: Date?
+    /// Target value each antenna eases toward. Set to a random
+    /// amplitude on trigger; reset to 0 on release. The actual
+    /// commanded value (`antenna{Left,Right}Cmd`) follows toward
+    /// this target via a critically-damped ramp instead of
+    /// stepping — eliminates the high-frequency motor "flick" that
+    /// the previous step-change implementation produced.
+    private var antennaLeftTarget: Double = 0
+    private var antennaRightTarget: Double = 0
 
     private var lastDetectionTs: Date?
     /// Suspends pushing to `streamer` while the daemon plays a primary
@@ -558,42 +585,63 @@ public actor MacFaceTracker {
     /// tick has probability `dt * rate` of firing — so the inter-
     /// twitch gaps are exponentially distributed and the pattern has
     /// no perceptible rhythm.
+    ///
+    /// Output is quantised to `config.antennaQuantizeStepRad` (0.02
+    /// rad ≈ 1°) before going on the wire. The internal `cmd` state
+    /// stays high-precision so the easing model is unaffected, but
+    /// the 50 Hz set_target stream emits identical quantised values
+    /// across most consecutive ticks — including the entire hold
+    /// phase, where the bot's motor sees the *exact same* setpoint
+    /// 25 times a second instead of a chasing target with
+    /// per-frame floating-point drift. Eliminates the
+    /// high-frequency motor vibration the unquantised stream
+    /// produced on the antennas' low-inertia motors.
     private func tickAntennas(dt: Double) -> Antennas {
         let now = Date()
         antennaLeftCmd = updateOneAntenna(
             cmd: antennaLeftCmd,
+            target: &antennaLeftTarget,
             releaseAt: &leftTwitchReleaseAt,
             now: now, dt: dt
         )
         antennaRightCmd = updateOneAntenna(
             cmd: antennaRightCmd,
+            target: &antennaRightTarget,
             releaseAt: &rightTwitchReleaseAt,
             now: now, dt: dt
         )
-        return Antennas(rightRad: antennaRightCmd, leftRad: antennaLeftCmd)
+        let step = config.antennaQuantizeStepRad
+        let lq = (antennaLeftCmd / step).rounded() * step
+        let rq = (antennaRightCmd / step).rounded() * step
+        return Antennas(rightRad: rq, leftRad: lq)
     }
 
-    /// Per-antenna twitch step. Three pieces:
-    /// 1. Poisson trigger — fire iff `Double.random < dt*rate`. With
-    ///    a 0.18/s rate that's ~one twitch every ~5.5 s on average,
-    ///    but the actual times are exponentially distributed so
-    ///    bursts and long lulls both happen.
-    /// 2. Random amplitude in `[-A, +A]` and random hold duration
-    ///    in `[minHold, maxHold]`, drawn separately each fire.
-    /// 3. Exponential decay back to neutral after the hold expires.
+    /// Per-antenna twitch step using a critically-damped ramp instead
+    /// of a step-change. Three pieces:
+    /// 1. Poisson trigger (only when idle): pick a new `target`
+    ///    amplitude in `[-A, +A]` and a hold duration. The trigger
+    ///    sets the target *value*, not the commanded value — the
+    ///    actual ramp happens in piece 3 below.
+    /// 2. Release: once `releaseAt` is in the past, set `target = 0`
+    ///    so the same ramp pulls the antenna back to neutral. When
+    ///    both target and cmd are essentially zero, clear releaseAt
+    ///    and let the next trigger fire.
+    /// 3. Ramp: every tick, ease `cmd` toward `target` exponentially.
+    ///    Time constants differ for in (~80 ms) vs. out (~150 ms);
+    ///    in is tighter so twitches register cleanly, out is gentler
+    ///    so the antenna settles without a snap. `dt/τ` clamped to
+    ///    1.0 so a long stalled frame can't overshoot.
     private func updateOneAntenna(
         cmd: Double,
+        target: inout Double,
         releaseAt: inout Date?,
         now: Date, dt: Double
     ) -> Double {
-        var c = cmd
-        // Don't queue another twitch while the current one is still
-        // holding — gives each twitch room to be visible. Poisson
-        // sampling resumes once the antenna has decayed back.
+        // 1. Maybe fire a new twitch.
         if releaseAt == nil {
             let triggerProb = dt * config.antennaTwitchRatePerS
             if Double.random(in: 0...1) < triggerProb {
-                c = Double.random(
+                target = Double.random(
                     in: -config.antennaTwitchAmplitude
                        ... config.antennaTwitchAmplitude
                 )
@@ -604,13 +652,24 @@ public actor MacFaceTracker {
                 releaseAt = now.addingTimeInterval(hold)
             }
         }
-        if let release = releaseAt, now >= release {
-            let k = max(0.0, 1.0 - 4.0 * dt)
-            c *= k
-            if abs(c) < 1e-3 {
-                c = 0
-                releaseAt = nil
-            }
+        // 2. Release: drop the target back to zero once the hold
+        //    expires. The ramp below carries cmd home.
+        if let release = releaseAt, now >= release, target != 0 {
+            target = 0
+        }
+        // 3. Ease cmd toward target. Different tau for in vs out so
+        //    the bot reads as "alert flick" rather than "wobble".
+        let movingTowardZero = abs(target) < abs(cmd)
+        let tau = movingTowardZero
+            ? config.antennaEaseOutTau
+            : config.antennaEaseInTau
+        let alpha = min(1.0, max(0.0, dt / max(tau, 0.001)))
+        var c = cmd + alpha * (target - cmd)
+        // Tidy up when fully decayed: clear releaseAt so the
+        // antenna is eligible to twitch again.
+        if releaseAt != nil, target == 0, abs(c) < 1e-3 {
+            c = 0
+            releaseAt = nil
         }
         return c
     }

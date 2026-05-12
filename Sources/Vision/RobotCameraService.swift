@@ -77,6 +77,26 @@ public actor RobotCameraService {
         let _: R? = try? await sidecar.send(method: "stop_streaming", params: Empty())
     }
 
+    /// Pause the WS subscription on the sidecar without tearing down
+    /// the pump or restarting the process. The bot relay only encodes
+    /// JPEGs while at least one /ws/video client is connected, so this
+    /// also makes the bot stop encoding video. Used to put the camera
+    /// to sleep when Rocky sleeps.
+    public func pauseStreaming() async {
+        guard isStreaming else { return }
+        isStreaming = false
+        struct Empty: Encodable, Sendable {}
+        struct R: Decodable, Sendable { let streaming: Bool }
+        let _: R? = try? await sidecar.send(method: "stop_streaming", params: Empty())
+    }
+
+    /// Resume the WS subscription after a `pauseStreaming()`.
+    public func resumeStreaming() async throws {
+        guard !isStreaming else { return }
+        try await sendStartStreaming()
+        isStreaming = true
+    }
+
     /// Hits the sidecar's `start_streaming` RPC. Caller handles errors.
     private func sendStartStreaming() async throws {
         struct Empty: Encodable, Sendable {}

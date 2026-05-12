@@ -1844,6 +1844,19 @@ final class AppServices {
         await MainActor.run {
             self.transitioningUntil = Date().addingTimeInterval(3.2)
         }
+        // Bring the camera feed back up *before* the wake motion so
+        // the first frames arrive while Rocky is opening his eyes.
+        // Mic stays on while sleeping (wake-on-name), so no mic call.
+        Task { [robotCamera, logBus] in
+            do { try await robotCamera.resumeStreaming() }
+            catch {
+                await logBus.publish(.error(
+                    scope: "robot-camera",
+                    message: "resume failed: \(error)",
+                    recoverable: true
+                ))
+            }
+        }
         do {
             try await robotLink.wakeUp()
             await MainActor.run { self.transitioningUntil = nil }
@@ -1878,6 +1891,11 @@ final class AppServices {
                 scope: "app/sleep", message: "\(error)", recoverable: true
             ))
         }
+        // Camera feed sleeps with the robot. Mic stays on so the
+        // user can still say "Rocky" to wake him. The relay only
+        // encodes JPEGs when it has a /ws/video client connected,
+        // so closing our subscription also stops bot-side encoding.
+        await robotCamera.pauseStreaming()
     }
 
     /// Ensure the on-bot `rocky_media_relay` Reachy Mini App is the
@@ -2428,18 +2446,39 @@ final class AppServices {
                 "required": .array([.string("name"), .string("text")]),
             ]),
             handler: { [weak self] args in
-                guard let self,
-                      let name = args.asObject?["name"]?.asString,
-                      let text = args.asObject?["text"]?.asString,
-                      !text.isEmpty,
-                      emotions.contains(name)
-                else {
+                guard let self else {
+                    return .object(["ok": .bool(false),
+                                    "error": .string("services unavailable")])
+                }
+                let obj = args.asObject ?? [:]
+                let name = obj["name"]?.asString
+                let text = obj["text"]?.asString
+                if text == nil || text!.isEmpty {
                     return .object([
                         "ok": .bool(false),
-                        "error": .string("missing or unknown args"),
+                        "error": .string("missing required `text` (what Rocky says)"),
                     ])
                 }
-                try await self.speakAndMove(text: text) {
+                guard let name else {
+                    return .object([
+                        "ok": .bool(false),
+                        "error": .string("missing required `name`"),
+                        "valid_names": .array(emotions.map { .string($0) }),
+                    ])
+                }
+                if !emotions.contains(name) {
+                    return .object([
+                        "ok": .bool(false),
+                        "error": .string("unknown emotion `\(name)`"),
+                        "valid_names": .array(emotions.map { .string($0) }),
+                        "hint": .string(
+                            "If you wanted a quick silent gesture, use `express` "
+                            + "(scared / agree / disagree / excited / sad / "
+                            + "curious / look_around / shy)."
+                        ),
+                    ])
+                }
+                try await self.speakAndMove(text: text!) {
                     try await self.playRecordedEmotion(name)
                 }
                 return .object(["ok": .bool(true), "name": .string(name)])
@@ -2483,17 +2522,55 @@ final class AppServices {
                 "required": .array([.string("name"), .string("text")]),
             ]),
             handler: { [weak self] args in
-                guard let self,
-                      let name = args.asObject?["name"]?.asString,
-                      let text = args.asObject?["text"]?.asString,
-                      !text.isEmpty,
-                      exprNames.contains(name) else {
+                guard let self else {
+                    return .object(["ok": .bool(false),
+                                    "error": .string("services unavailable")])
+                }
+                let obj = args.asObject ?? [:]
+                let name = obj["name"]?.asString
+                let text = obj["text"]?.asString
+                if text == nil || text!.isEmpty {
                     return .object([
                         "ok": .bool(false),
-                        "error": .string("missing or unknown args"),
+                        "error": .string("missing required `text` (what Rocky says)"),
                     ])
                 }
-                try await self.speakAndMove(text: text) {
+                guard let name else {
+                    return .object([
+                        "ok": .bool(false),
+                        "error": .string("missing required `name`"),
+                        "valid_names": .array(exprNames.map { .string($0) }),
+                    ])
+                }
+                if !exprNames.contains(name) {
+                    // Detect the most common confusion: the model
+                    // picked an emotion from `play_emotion`'s richer
+                    // catalogue. Route it explicitly so the model
+                    // can re-issue against the right tool.
+                    let hint: JSONValue
+                    if emotions.contains(name) {
+                        hint = .string(
+                            "`\(name)` is from the `play_emotion` library, "
+                            + "not `express`. Re-issue as `play_emotion(name: "
+                            + "\"\(name)\", text: ...)` for the full-body "
+                            + "recorded move with audio."
+                        )
+                    } else {
+                        hint = .string(
+                            "Valid `express` names are head-only silent "
+                            + "gestures; check the list and pick the closest, "
+                            + "or use `play_emotion` for the larger "
+                            + "library that includes sound."
+                        )
+                    }
+                    return .object([
+                        "ok": .bool(false),
+                        "error": .string("unknown expression `\(name)`"),
+                        "valid_names": .array(exprNames.map { .string($0) }),
+                        "hint": hint,
+                    ])
+                }
+                try await self.speakAndMove(text: text!) {
                     try await self.playExpression(name)
                 }
                 return .object(["ok": .bool(true), "name": .string(name)])

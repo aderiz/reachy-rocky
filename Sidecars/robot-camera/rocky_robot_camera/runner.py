@@ -6,12 +6,15 @@ Swift side using the existing `frame` event envelope. The Swift
 adapter (`RobotCameraService`) sees no protocol change.
 
 Stdin RPCs:
-  start_streaming → POST /control/start_recording on the bot relay
-                    (audio gating; video is always streaming on the
-                    bot side when a /ws/video client is connected,
-                    so this is a no-op for the camera path but
-                    kept for adapter symmetry).
-  stop_streaming  → no-op.
+  start_streaming → resume the WebSocket subscription (idempotent;
+                    re-opens /ws/video if `stop_streaming` previously
+                    closed it). On the bot relay, video JPEG encoding
+                    is gated on the count of /ws/video clients, so
+                    closing this client makes the bot stop encoding.
+  stop_streaming  → pause: close the active WS and stop reconnecting.
+                    Frames stop flowing both on the wire and on the
+                    bot CPU. Used so the camera feed sleeps with the
+                    robot.
   health          → connection + counters.
   shutdown        → graceful exit.
 
@@ -79,6 +82,7 @@ class RelaySubscriber:
     def __init__(self) -> None:
         self.shutdown = threading.Event()
         self.connected = threading.Event()
+        self.paused = threading.Event()
         self.frames_received = 0
         self.last_w = 0
         self.last_h = 0
@@ -88,6 +92,8 @@ class RelaySubscriber:
             target=self._thread_entry, name="ws-subscriber", daemon=True
         )
         self._logged_first_frame = False
+        self._active_ws: Any | None = None
+        self._resume_signal: asyncio.Event | None = None
 
     def start(self) -> None:
         self._thread.start()
@@ -96,7 +102,50 @@ class RelaySubscriber:
         self.shutdown.set()
         loop = self._loop
         if loop is not None:
+            # Wake any waiter on the resume signal so _supervise can exit.
+            loop.call_soon_threadsafe(self._signal_resume_from_loop)
+            self._close_active_ws_from_outside()
             loop.call_soon_threadsafe(loop.stop)
+
+    def pause(self) -> None:
+        """Stop streaming: set the paused flag and close the active WS.
+        The supervisor will see `paused` set on its next iteration and
+        wait on `_resume_signal` instead of reconnecting."""
+        if self.paused.is_set():
+            return
+        _stderr("pause requested")
+        self.paused.set()
+        self._close_active_ws_from_outside()
+
+    def resume(self) -> None:
+        """Resume streaming: clear the paused flag and wake the
+        supervisor so it reconnects."""
+        if not self.paused.is_set():
+            return
+        _stderr("resume requested")
+        self.paused.clear()
+        loop = self._loop
+        if loop is not None:
+            loop.call_soon_threadsafe(self._signal_resume_from_loop)
+
+    def _signal_resume_from_loop(self) -> None:
+        if self._resume_signal is not None:
+            self._resume_signal.set()
+
+    def _close_active_ws_from_outside(self) -> None:
+        loop = self._loop
+        ws = self._active_ws
+        if loop is None or ws is None:
+            return
+        async def _close():
+            try:
+                await ws.close()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            asyncio.run_coroutine_threadsafe(_close(), loop)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _thread_entry(self) -> None:
         self._loop = asyncio.new_event_loop()
@@ -112,14 +161,28 @@ class RelaySubscriber:
                 pass
 
     async def _supervise(self) -> None:
+        self._resume_signal = asyncio.Event()
         attempt = 0
         while not self.shutdown.is_set():
+            if self.paused.is_set():
+                # Don't burn cycles or reconnect while paused.
+                self._resume_signal.clear()
+                _stderr("paused; waiting for resume")
+                await self._resume_signal.wait()
+                if self.shutdown.is_set():
+                    return
+                attempt = 0
+                continue
             try:
                 await self._connect_once()
                 attempt = 0
             except asyncio.CancelledError:
                 break
             except Exception as exc:  # noqa: BLE001
+                if self.paused.is_set():
+                    # The exception is our own close() — go round the
+                    # loop and wait for resume; don't backoff-log.
+                    continue
                 wait = self.RECONNECT_BACKOFF_S[min(
                     attempt, len(self.RECONNECT_BACKOFF_S) - 1
                 )]
@@ -128,8 +191,8 @@ class RelaySubscriber:
                 self.connected.clear()
                 attempt += 1
                 for _ in range(int(wait * 10)):
-                    if self.shutdown.is_set():
-                        return
+                    if self.shutdown.is_set() or self.paused.is_set():
+                        break
                     await asyncio.sleep(0.1)
 
     async def _connect_once(self) -> None:
@@ -143,6 +206,7 @@ class RelaySubscriber:
             max_size=None,
             close_timeout=5,
         ) as ws:
+            self._active_ws = ws
             self.connected.set()
             _stderr(f"ws connected to {WS_URL}")
             try:
@@ -150,6 +214,7 @@ class RelaySubscriber:
                     self._handle_message(raw)
             finally:
                 self.connected.clear()
+                self._active_ws = None
 
     def _handle_message(self, raw) -> None:
         if isinstance(raw, (bytes, bytearray)):
@@ -233,11 +298,17 @@ class Runner:
             return
         try:
             if method == "start_streaming":
-                # Video is on whenever a /ws/video client is connected.
-                # Kept for adapter symmetry with the mic side.
+                # Resume the WS subscription. The bot relay only
+                # encodes JPEGs while it has at least one /ws/video
+                # client, so reconnecting here also restarts encoding
+                # on the bot side.
+                self.subscriber.resume()
                 self.streaming = True
                 respond(rid, {"streaming": True})
             elif method == "stop_streaming":
+                # Close the WS so the bot relay stops encoding video
+                # (camera feed sleeps with the robot).
+                self.subscriber.pause()
                 self.streaming = False
                 respond(rid, {"streaming": False})
             elif method == "health":

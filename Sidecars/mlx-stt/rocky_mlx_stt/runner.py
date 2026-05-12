@@ -54,6 +54,91 @@ def _stderr(msg: str) -> None:
     sys.stderr.flush()
 
 
+_WORD_RE_PATTERN = r"\S+"
+
+
+def _collapse_repetition(text: str, min_repeats: int = 3) -> str:
+    """Detect and collapse runs of any repeating n-gram in the
+    transcript. Whisper hallucinations come in three shapes:
+
+      a) Sentence-level: "X. X. X. X. X."
+      b) Phrase-level w/o punctuation: "I'm going to X I'm going to X..."
+      c) Single-word loops: "yeah yeah yeah yeah yeah yeah"
+
+    The previous sentence-split approach only caught (a). This walks
+    the text token-by-token and, at each position, finds the LONGEST
+    n-gram (n from a few words up to a sentence-ish length) that
+    repeats consecutively `min_repeats` times. The longest match
+    wins so we collapse the most aggressive run rather than a
+    fragment of it.
+
+    Leaves untouched any text where the same phrase doesn't appear
+    consecutively at least `min_repeats` times — natural repetition
+    in human speech ("yes yes" / "no no") is preserved.
+    """
+    import re
+    if not text:
+        return text
+    tokens = re.findall(_WORD_RE_PATTERN, text)
+    if len(tokens) < min_repeats * 2:
+        return text
+
+    # Normaliser used for matching only — output uses original casing.
+    def norm(s: str) -> str:
+        return re.sub(r"[^\w]", "", s).lower()
+    norms = [norm(t) for t in tokens]
+
+    n_tokens = len(tokens)
+    keep = [True] * n_tokens
+    # Try n-gram sizes from largest plausible (half the input)
+    # down to single tokens. Largest-first means a 4-word loop
+    # gets collapsed as a whole, not as a 1-word loop nested
+    # inside it.
+    max_n = max(1, n_tokens // min_repeats)
+    i = 0
+    collapsed_examples: list[str] = []
+    while i < n_tokens:
+        if not keep[i]:
+            i += 1
+            continue
+        matched_n = 0
+        matched_run = 0
+        for n in range(min(max_n, n_tokens - i), 0, -1):
+            if i + n * min_repeats > n_tokens:
+                continue
+            # Count consecutive identical n-grams starting at i.
+            run = 1
+            base = norms[i:i + n]
+            # Skip if the n-gram contains only empty / pure-punctuation
+            # tokens (post-normalisation), which can produce spurious
+            # matches on filler.
+            if not any(b for b in base):
+                continue
+            while True:
+                j = i + run * n
+                if j + n > n_tokens:
+                    break
+                if norms[j:j + n] != base:
+                    break
+                run += 1
+            if run >= min_repeats and run * n > matched_run:
+                matched_n = n
+                matched_run = run * n
+        if matched_n > 0:
+            run_copies = matched_run // matched_n
+            phrase = " ".join(tokens[i:i + matched_n])
+            for k in range(matched_n, matched_run):
+                keep[i + k] = False
+            collapsed_examples.append(f"{run_copies}× {phrase!r}")
+            i += matched_run
+        else:
+            i += 1
+
+    if collapsed_examples:
+        _stderr(f"collapsed repetition: {'; '.join(collapsed_examples)}")
+    return " ".join(t for t, k in zip(tokens, keep) if k).strip()
+
+
 class Runner:
     def __init__(self) -> None:
         self.model_id = (
@@ -109,16 +194,35 @@ class Runner:
             audio,
             path_or_hf_repo=self.model_id,
             language=language,
-            # Greedy decode for lowest latency on short utterances.
-            # The wake/conversation pipeline never deals with hours-
-            # long audio segments — they're capped by VoiceCoordinator
-            # at ~12 s — so beam search overhead isn't justified.
-            temperature=0.0,
+            # Whisper-large-v3 is prone to repetition hallucinations
+            # on short utterances. Use the official OpenAI ladder
+            # so the model retries at higher temperatures when its
+            # `compression_ratio_threshold` fires.
+            temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+            # 2.4 is the upstream default but lets through "X. X. X."
+            # 3-4 times before flagging. 1.8 catches milder cases
+            # too — false-positive rate is low for natural speech.
+            compression_ratio_threshold=1.8,
+            # 0.7 is more aggressive than upstream's 0.6 — discards
+            # segments Whisper considers low-confidence speech, which
+            # is where hallucinated continuations live.
+            no_speech_threshold=0.7,
+            # Don't feed this turn's transcript back as context for
+            # the next call — compounds repetition errors across
+            # consecutive utterances in a conversation.
+            condition_on_previous_text=False,
             verbose=False,
         )
         duration_ms = (time.perf_counter() - t0) * 1000
 
         text = (result.get("text") or "").strip()
+        # Belt-and-braces: even with the upstream fallback, every
+        # temperature sometimes produces the same repetitive trap
+        # and the last attempt is returned. A sliding-window n-gram
+        # filter catches all the common patterns — sentence repeats,
+        # phrase repeats without punctuation, single-word stuck loops.
+        text = _collapse_repetition(text)
+
         return {
             "text": text,
             "duration_ms": duration_ms,
