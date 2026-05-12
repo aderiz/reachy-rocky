@@ -80,50 +80,75 @@ private struct BatteryGlyph: View {
     let snapshot: BatteryService.Snapshot?
 
     var body: some View {
-        GeometryReader { geo in
-            let w = geo.size.width
-            let h = geo.size.height
-            let bodyW = max(0, w - 3)            // 1 px gap + 2 px tip
-            let cornerR = h * 0.32
-            let strokeWidth = max(1.0, h * 0.10)
+        // Canvas gives deterministic absolute positioning so the
+        // outline / fill / terminal nub stay aligned regardless of
+        // SwiftUI's layout inference (the previous ZStack version
+        // got the fill vertically centred *then* offset, breaking
+        // alignment).
+        Canvas { ctx, size in
+            let w = size.width
+            let h = size.height
+            let strokeW: CGFloat = max(1.2, h * 0.085)
+            let bodyW = w - 3                      // 1pt gap + 2.5pt nub
+            let cornerR = h * 0.30
 
-            ZStack(alignment: .leading) {
-                // Outline
-                RoundedRectangle(cornerRadius: cornerR, style: .continuous)
-                    .stroke(.primary.opacity(0.55), lineWidth: strokeWidth)
-                    .frame(width: bodyW, height: h)
+            // 1. Outline — stroked rounded pill, inset by half stroke
+            //    so the line sits inside the bounding box.
+            let outlineRect = CGRect(
+                x: strokeW / 2, y: strokeW / 2,
+                width: bodyW - strokeW, height: h - strokeW
+            )
+            ctx.stroke(
+                Path(roundedRect: outlineRect, cornerRadius: cornerR - strokeW / 2),
+                with: .color(.primary.opacity(0.6)),
+                lineWidth: strokeW
+            )
 
-                // Positive terminal nub on the right
-                RoundedRectangle(cornerRadius: 0.6, style: .continuous)
-                    .fill(.primary.opacity(0.55))
-                    .frame(width: 2, height: h * 0.45)
-                    .offset(x: bodyW + 1)
+            // 2. Positive terminal nub on the right
+            let nubH = h * 0.45
+            let nubRect = CGRect(
+                x: bodyW + 0.5, y: (h - nubH) / 2,
+                width: 2.5, height: nubH
+            )
+            ctx.fill(
+                Path(roundedRect: nubRect, cornerRadius: 0.8),
+                with: .color(.primary.opacity(0.6))
+            )
 
-                // Inner fill — width proportional to charge
-                if let frac = fillFraction {
-                    let inset = strokeWidth + 1
-                    let innerW = max(0, bodyW - inset * 2)
-                    let innerH = max(0, h - inset * 2)
-                    RoundedRectangle(cornerRadius: cornerR - inset,
-                                     style: .continuous)
-                        .fill(fillColor)
-                        .frame(width: max(2, innerW * frac), height: innerH)
-                        .offset(x: inset, y: inset)
-                        .animation(.easeOut(duration: 0.25), value: frac)
-                }
-
-                // Charging bolt overlay (DC plugged in). Sits on top
-                // of the fill, centred on the glyph.
-                if snapshot?.powerSource == "dc" {
+            // 3. Inner fill — left-aligned, proportional to charge
+            if let frac = fillFraction {
+                let inset = strokeW + 1.0
+                let innerW = (bodyW - inset * 2) * frac
+                let innerH = h - inset * 2
+                let innerRect = CGRect(
+                    x: inset, y: inset,
+                    width: max(2, innerW), height: innerH
+                )
+                ctx.fill(
+                    Path(roundedRect: innerRect,
+                         cornerRadius: max(0, cornerR - inset)),
+                    with: .color(fillColor)
+                )
+            }
+        }
+        .overlay {
+            // 4. Charging bolt — only when on DC. Drawn as a SwiftUI
+            //    overlay (not into the Canvas) so SF Symbol rendering
+            //    stays vector-perfect at any size.
+            if snapshot?.powerSource == "dc" {
+                GeometryReader { geo in
                     Image(systemName: "bolt.fill")
-                        .font(.system(size: h * 0.78,
+                        .font(.system(size: geo.size.height * 0.72,
                                       weight: .heavy))
                         .foregroundStyle(.white)
-                        .shadow(color: .black.opacity(0.35), radius: 0.6)
-                        .frame(width: bodyW, height: h, alignment: .center)
+                        .shadow(color: .black.opacity(0.30), radius: 0.5)
+                        .frame(width: geo.size.width - 3,
+                               height: geo.size.height,
+                               alignment: .center)
                 }
             }
         }
+        .animation(.easeOut(duration: 0.25), value: fillFraction)
     }
 
     /// 0.0–1.0 fill, or nil when there's nothing to draw.
