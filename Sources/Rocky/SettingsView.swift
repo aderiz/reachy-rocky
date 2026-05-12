@@ -763,47 +763,61 @@ private struct EnrollFaceForm: View {
     @State private var pronouncing: Bool = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            row("Name", placeholder: "Alice", text: $name)
-            row("Says",
-                placeholder: "phonetic spelling (optional)",
-                text: $pronunciation, width: 360,
-                hint: "e.g. \u{201C}shi-vawn\u{201D} for Siobhán",
-                trailing: {
-                    AnyView(
-                        Button {
-                            speakPronunciationTest()
-                        } label: {
-                            Image(systemName: pronouncing
-                                  ? "speaker.wave.2.fill"
-                                  : "play.circle.fill")
-                                .symbolRenderingMode(.hierarchical)
-                                .foregroundStyle(.tint)
-                                .font(.system(size: 20))
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(pronunciationTestDisabled)
-                        .help(pronunciationHelp)
-                        .symbolEffect(.pulse, isActive: pronouncing)
-                    )
-                })
-
-            HStack(spacing: 8) {
-                Button {
-                    choosePhotos()
-                } label: {
-                    Label("Choose photos\u{2026}",
-                          systemImage: "photo.on.rectangle.angled")
-                }
-                Button {
-                    useCameraFrame()
-                } label: {
-                    Label("Use current frame", systemImage: "camera")
-                }
-                Spacer()
+        // Standard macOS Form. LabeledContent gives us the leading
+        // label / trailing control alignment for free (matches the
+        // rest of System Settings) and the system TextField style
+        // handles placeholder rendering correctly — none of the
+        // multi-text-position glitches the previous custom .plain
+        // styling produced.
+        Form {
+            LabeledContent("Name") {
+                TextField("Alice", text: $name)
             }
 
-            if !photos.isEmpty { photoStrip }
+            LabeledContent("Says") {
+                HStack(spacing: 8) {
+                    TextField("phonetic spelling (optional)",
+                              text: $pronunciation)
+                    Button {
+                        speakPronunciationTest()
+                    } label: {
+                        Image(systemName: pronouncing
+                              ? "speaker.wave.2.fill"
+                              : "play.circle.fill")
+                            .symbolRenderingMode(.hierarchical)
+                            .foregroundStyle(.tint)
+                            .font(.system(size: 18))
+                            .symbolEffect(.pulse, isActive: pronouncing)
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(pronunciationTestDisabled)
+                    .help(pronunciationHelp)
+                }
+            }
+            Text("e.g. \u{201C}shi-vawn\u{201D} for Siobhán")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            LabeledContent("Photos") {
+                HStack(spacing: 8) {
+                    Button {
+                        choosePhotos()
+                    } label: {
+                        Label("Choose photos\u{2026}",
+                              systemImage: "photo.on.rectangle.angled")
+                    }
+                    Button {
+                        useCameraFrame()
+                    } label: {
+                        Label("Use current frame", systemImage: "camera")
+                    }
+                    Spacer()
+                }
+            }
+
+            if !photos.isEmpty {
+                photoStrip
+            }
 
             if let err = error {
                 Text(err).font(.caption).foregroundStyle(.red)
@@ -831,62 +845,10 @@ private struct EnrollFaceForm: View {
                 )
             }
         }
-        .padding(12)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(.gray.opacity(0.05))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(.gray.opacity(0.18), lineWidth: 1)
-        )
+        .formStyle(.grouped)
     }
 
     // MARK: - Subviews
-
-    @ViewBuilder
-    private func row(_ label: String,
-                     placeholder: String,
-                     text: Binding<String>,
-                     width: CGFloat = 280,
-                     hint: String? = nil,
-                     trailing: (() -> AnyView)? = nil) -> some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text(label)
-                .font(.callout.weight(.medium))
-                .frame(width: 80, alignment: .leading)
-                .foregroundStyle(.secondary)
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 6) {
-                    // Plain TextField with explicit frame width. No
-                    // .lineLimit / .truncationMode — those are Text
-                    // modifiers and SwiftUI's .plain TextField on macOS
-                    // mis-applies them, ending up rendering the
-                    // placeholder and the typed value in two different
-                    // positions inside the field.
-                    TextField(placeholder, text: text)
-                        .textFieldStyle(.plain)
-                        .padding(.horizontal, 12).padding(.vertical, 8)
-                        .frame(width: width)
-                        .background(
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .fill(.gray.opacity(0.08))
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .strokeBorder(.gray.opacity(0.20), lineWidth: 1)
-                        )
-                    if let trailing { trailing() }
-                }
-                if let hint {
-                    Text(hint)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .padding(.leading, 4)
-                }
-            }
-        }
-    }
 
     private var photoStrip: some View {
         ScrollView(.horizontal, showsIndicators: false) {
