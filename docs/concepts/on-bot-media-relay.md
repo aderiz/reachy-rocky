@@ -2,17 +2,19 @@
 title: On-bot media relay (rocky_media_relay)
 type: concept
 status: current
-last_updated: 2026-05-11
+last_updated: 2026-05-12
 sources:
   - sources/hf-docs.md   # SDK/media-architecture, platforms/.../media_advanced_controls
-tags: [media, audio, video, webrtc, websocket, apps]
+  - OnBot/rocky_media_relay/rocky_media_relay/main.py
+tags: [media, audio, video, webrtc, websocket, apps, battery]
 ---
 
 # On-bot media relay
 
-Rocky's v0.3 media path. Audio + video capture moved from a
-Mac-side WebRTC client to a bot-side Reachy Mini App that serves
-the same data over plain WebSocket.
+Rocky's v0.3 media + telemetry conduit. Audio + video capture moved
+from a Mac-side WebRTC client to a bot-side Reachy Mini App that
+serves the same data over plain WebSocket, **plus** a small REST
+surface for state the daemon doesn't expose (battery / power health).
 
 ## Why the change
 
@@ -83,6 +85,26 @@ constraint means the bot can't run other apps while
 `rocky_media_relay` is active — fine for Rocky's use case where
 it's the only thing running.
 
+## HTTP surface
+
+Mounted at `http://<bot>:8042/` (the app's `custom_app_url`):
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Liveness, counters, build version, and battery block (cached 2 s). |
+| `GET /battery` | Battery snapshot — see [power monitoring](../reference/power-monitoring.md) for the full schema. Falls back to defaults when the bot's kernel doesn't surface a BMS (which it doesn't on the stock image; the relay reads supply voltage via the Dynamixel motors as a workaround). |
+| `POST /control/start_recording` | Begin audio capture (idempotent). |
+| `POST /control/stop_recording` | Stop audio capture (idempotent). |
+| `WS /ws/audio` | PCM + DoA stream. |
+| `WS /ws/video` | JPEG frames. |
+
+The video producer is gated on `len(state.video_clients) > 0` — when
+no Mac client is subscribed, the bot stops JPEG-encoding entirely
+(saves bot CPU). That's also why the camera "sleeps" when Rocky
+sleeps: the Mac-side `robot-camera` sidecar disconnects its WS
+subscription on sleep, drops `video_clients` to zero, and the bot's
+encoder idles. Reconnects on wake (see *Camera sleep* below).
+
 ## Wire format
 
 Each WS message is one JSON object, newline-terminated:
@@ -96,6 +118,37 @@ Each WS message is one JSON object, newline-terminated:
 
 `audio` and `doa` envelopes arrive on `/ws/audio`. `frame` envelopes
 arrive on `/ws/video`. `hello` is sent once when a client connects.
+
+## Camera sleep
+
+When Rocky goes to sleep, `AppServices.sleepRobot()` calls
+`robotCamera.pauseStreaming()` on the Mac side which sends a
+`stop_streaming` RPC to the camera sidecar; the sidecar closes its
+`/ws/video` subscription. The bot's relay sees `video_clients == 0`
+and skips the JPEG encode path in its capture loop. On wake,
+`resumeStreaming()` re-subscribes and encoding resumes.
+
+The **microphone stays subscribed even when Rocky is asleep** — needed
+for wake-on-name. Closing the audio WS would mean the bot couldn't
+hear "Rocky" while asleep.
+
+## Auto-start on Mac launch
+
+The daemon doesn't persist "which app was last running" across
+reboots. After a bot power-cycle, `/api/apps/current-app-status`
+returns `null` and any Mac-side WebSocket subscriber spins in its
+reconnect loop forever.
+
+`AppServices.ensureRelayAppRunning()` closes that gap from the Mac
+side: at app launch, wait (with backoff) for the daemon HTTP endpoint
+to respond, probe `/api/apps/current-app-status`, and:
+
+- If `rocky_media_relay` is already running → done.
+- If a *different* app is running → log a hint and leave it alone
+  (user picked it).
+- If nothing is running → `POST /api/apps/start-app/rocky_media_relay`.
+
+Runs once per Mac launch.
 
 ## Reliability
 

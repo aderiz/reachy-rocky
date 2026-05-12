@@ -71,6 +71,12 @@ IDs: `10` (body), `11`–`16` (Stewart), `17` (right antenna), `18` (left antenn
 - BMS with overcharge / over-discharge / over-current / short / temperature protections.
 - LED indicator: green → orange → red as battery drops.
 - USB-C is **data only**, does not charge.
+- **No fuel-gauge IC.** The BMS is purely protective — no SOC,
+  no charging-status pin, no software-readable register. The
+  daemon also exposes no `/battery` API.
+- **Supply voltage IS software-readable** as a side-effect, via the
+  Dynamixel motors' `PRESENT_INPUT_VOLTAGE` register (144). See
+  [power monitoring](power-monitoring.md) for the workaround.
 
 ## Ports / interfaces
 

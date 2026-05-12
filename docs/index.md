@@ -21,6 +21,7 @@ The catalog of every page in the wiki.
 - [Cockpit design](concepts/cockpit-design.md) — UI design contract: stage + margin + drawer + toolbar window, menu bar as persistent surface, six-wave roadmap.
 - [Voice / listen pipeline](concepts/voice-pipeline.md) — mic → ring buffer → VAD → STT → wake filter → **AddressFilter** → cognition; four-phase calibration with motors-under-load + DoA, Whisper hallucination mitigation, echo gate.
 - [AddressFilter](concepts/address-filter.md) — strict post-STT pre-brain dispatch gate fusing loudness, DoA, face, confidence; wake-name now requires real audio energy so Whisper hallucinations can't wake the bot.
+- [Portrait composition](concepts/portrait.md) — avatar + senses chip + power chip + name plate + wake toggle; light/dark backdrop, iOS-style switch + battery chip, single-source-of-truth bindings.
 - [Tools registry](concepts/tools-registry.md) — schema/handler shape, dispatch path, fenced-JSON fallback for Gemma, inventory of the shipped tools.
 - [Permissions authority](concepts/permissions-authority.md) — single source of truth, 5-state enum, TCC + signing pitfalls, debug-binary trap.
 - [On-bot media relay](concepts/on-bot-media-relay.md) — `rocky_media_relay` Reachy Mini App + Mac-side WS subscribers; replaces WebRTC.
@@ -29,7 +30,8 @@ The catalog of every page in the wiki.
 
 - [Hardware](reference/hardware.md) — physical specs of the Wireless variant.
 - [Python SDK](reference/sdk-python.md) — `ReachyMini` class API surface.
-- [Motors](reference/motors.md) — IDs, names, ranges, common faults.
+- [Motors](reference/motors.md) — IDs, names, ranges, common faults; antenna anti-vibration constraint; supply-voltage register pointer.
+- [Power monitoring](reference/power-monitoring.md) — the bot has no fuel gauge; supply voltage is read via Dynamixel reg 144 through the daemon's raw-packet WS and surfaced via the on-bot relay's `/battery` endpoint. LiFePO4 SOC mapping.
 - [Glossary](reference/glossary.md) — terms.
 
 ## Workflows

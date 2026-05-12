@@ -2,6 +2,22 @@
 
 Append-only chronological record. Each entry: `## [YYYY-MM-DD] <op> | <subject>`. Run `grep "^## \[" log.md | tail -20` for the recent timeline.
 
+## [2026-05-12] docs | Backfill — on-bot relay extras + power monitoring + portrait + antenna constraint
+
+The wiki had drifted significantly behind the `main` and `listening-rework` branches. This pass closes the gap.
+
+**`docs/concepts/on-bot-media-relay.md`** — added an HTTP-surface table (covering `GET /battery`, the new `/health` battery field, control endpoints), a "Camera sleep" section explaining how `video_clients == 0` gates JPEG encoding on the bot (and how `sleepRobot` triggers it), and an "Auto-start on Mac launch" section documenting `AppServices.ensureRelayAppRunning()`. Previously the doc covered only the WS streams and the WebRTC trade-offs.
+
+**`docs/reference/power-monitoring.md`** — new page covering the **Dynamixel reg-144 workaround** for supply voltage. Documents: why the Wireless has no software-readable battery state (BMS is purely protective, no kernel power-supply driver, no daemon API), what GPIO 23 actually is (shutdown push-button, not charger-detect), the daemon's existing `voltage_ok` reader, the empirical voltage thresholds (DC 7.30 V vs battery 6.40–6.50 V), the LiFePO4 voltage→SOC anchors, the relay's `/battery` schema, the Mac-side BatteryService + BatteryChip rendering, why we route through the relay instead of polling motors directly.
+
+**`docs/reference/hardware.md`** — Power section now notes "no fuel-gauge IC" + the motor-voltage workaround, with a pointer to power-monitoring.md.
+
+**`docs/reference/motors.md`** — added two sections: "Antennas resonate at vertical — never command 0 rad" (the ±0.1745 rad rest constraint, with the `INIT_ANTENNAS_JOINT_POSITIONS` citation from Pollen's daemon source) and "Reading supply voltage from motors" pointing at the power-monitoring page.
+
+**`docs/concepts/portrait.md`** — new page documenting the portrait composition: avatar + senses chip + power chip + name plate + wake toggle, light/dark backdrop adaptation (`backdrop(for: ColorScheme)`), `WakeSleepSwitch` conventions (green-when-awake, thumb-right = on, ⏎ toggles, sun/moon glyphs), state-source bindings for each element.
+
+**`docs/index.md`** — added portrait + power-monitoring entries; updated motors summary.
+
 ## [2026-05-12] code | Listening rework — `listening-rework` branch
 
 The single-signal "did VAD see speech?" dispatch gate was producing constant unwanted turns: Whisper hallucinations ("thank you", "subtitles by Amara"), background TV, other people's conversations. Auto-extending conversation window meant one bad hallucination locked Rocky in "engaged" mode for an hour. Face tracker autonomous idle pan made the head wander whenever nobody was directly in frame. Wake-on-name had no gate at all — a Whisper hallucination of "rocky" on silence woke the bot from sleep.
