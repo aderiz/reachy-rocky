@@ -579,7 +579,10 @@ struct MicCalibrationView: View {
         }
         if !robotWasAwake,
            services.daemonReachability == .online {
-            Task { try? await services.robotLink.goToSleep() }
+            // Use the Mac-side sleepRobot() so the streamer is
+            // suppressed during the slump — same reason as the
+            // wake path in runFullFlow().
+            Task { await services.sleepRobot() }
         }
     }
 
@@ -610,17 +613,15 @@ struct MicCalibrationView: View {
         if Task.isCancelled { return }
 
         // Phase 1: Room. If Rocky's awake, send him to sleep first
-        // so motor noise doesn't pollute the room sample.
+        // so motor noise doesn't pollute the room sample. Use the
+        // Mac-side `sleepRobot()` (not the raw `robotLink.goToSleep`)
+        // so the 50 Hz face-tracker streamer is suppressed for the
+        // sleep duration via `transitioningUntil` — without that
+        // gate, the streamer fights the daemon's slump animation.
         if services.daemonReachability == .online,
            robotWasAwake {
             await MainActor.run { phase = .preRoomSleeping }
-            do {
-                try await services.robotLink.goToSleep()
-            } catch {
-                // Non-fatal — proceed with room capture even if the
-                // sleep request failed; the user will see Rocky in
-                // whatever state he ended up in.
-            }
+            await services.sleepRobot()
         }
         if Task.isCancelled { return }
 
@@ -644,13 +645,14 @@ struct MicCalibrationView: View {
         // the wake fails.
         if services.daemonReachability == .online {
             await MainActor.run { phase = .waking }
-            do {
-                try await services.robotLink.wakeUp()
-            } catch {
-                // Wake failed — skip phase 2, threshold will just
-                // use room noise.
-                await MainActor.run { phase = .room }  // leaves stepper at room-done
-            }
+            // Use the Mac-side wakeRobot() (not raw robotLink.wakeUp())
+            // so the face-tracker streamer is suppressed for the wake
+            // duration via `transitioningUntil`. Otherwise the
+            // streamer's 50 Hz set_target stream overrides the
+            // daemon's minjerk goto-neutral immediately, and Rocky
+            // ends up pointed at whatever face is in view rather than
+            // his home position.
+            await services.wakeRobot()
             if Task.isCancelled { return }
 
             // Brief settle so the wake-up move's tail doesn't show
