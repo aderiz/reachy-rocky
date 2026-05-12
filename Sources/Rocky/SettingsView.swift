@@ -858,10 +858,14 @@ private struct EnrollFaceForm: View {
                 .foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
+                    // Plain TextField with explicit frame width. No
+                    // .lineLimit / .truncationMode — those are Text
+                    // modifiers and SwiftUI's .plain TextField on macOS
+                    // mis-applies them, ending up rendering the
+                    // placeholder and the typed value in two different
+                    // positions inside the field.
                     TextField(placeholder, text: text)
                         .textFieldStyle(.plain)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
                         .padding(.horizontal, 12).padding(.vertical, 8)
                         .frame(width: width)
                         .background(
