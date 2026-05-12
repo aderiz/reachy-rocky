@@ -23,37 +23,31 @@ struct BatteryChip: View {
     let snapshot: BatteryService.Snapshot?
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 8) {
             BatteryGlyph(snapshot: snapshot)
-                .frame(width: 26, height: 12)
+                .frame(width: 42, height: 18)
             Text(readout)
-                .font(.system(size: 12, weight: .semibold, design: .rounded)
+                .font(.system(size: 15, weight: .semibold, design: .rounded)
                         .monospacedDigit())
                 .foregroundStyle(.primary)
                 .lineLimit(1)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
         .background(.ultraThinMaterial, in: Capsule())
         .overlay(
             Capsule()
-                .stroke(.white.opacity(0.08), lineWidth: 0.5)
+                .stroke(.white.opacity(0.10), lineWidth: 0.5)
         )
         .help(tooltip)
     }
 
-    /// What sits to the right of the glyph.
-    ///   - On DC: voltage, because percent isn't measurable while
-    ///     the charger is regulating the rail. Voltage is the most
-    ///     honest available number.
-    ///   - On battery: percent, the iPhone-style "65%" readout.
-    ///   - Otherwise: voltage if known, "—" as last resort.
+    /// Always a percentage — matches iPhone status-bar behaviour
+    /// (the bolt overlay indicates charging, the percent indicates
+    /// state-of-charge). On DC the relay reports 100% because the
+    /// rail voltage is above the LiFePO4 fully-charged threshold.
     private var readout: String {
         guard let s = snapshot else { return "—" }
-        if s.powerSource == "dc" {
-            if let v = s.voltageV { return String(format: "%.1fV", v) }
-            return "DC"
-        }
         if let p = s.percent { return "\(p)%" }
         if let v = s.voltageV { return String(format: "%.1fV", v) }
         return "—"

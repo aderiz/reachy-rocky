@@ -539,20 +539,22 @@ class RockyMediaRelay(ReachyMiniApp):
             snap["voltage_v"] = v_med
             snap["source"] = "dynamixel:reg144"
             snap["motor_samples_v"] = samples
+            # Estimate percent in both states. On DC the rail is the
+            # charger's regulated voltage (~7.3 V) which maps to 100%
+            # in the LiFePO4 curve; that matches iPhone-style "100% +
+            # charging bolt" semantics once a battery has been on
+            # charge for a while.
+            snap["percent"] = _estimate_lifepo4_percent(v_med)
             if v_med > _DC_THRESHOLD_V:
                 snap["power_source"] = "dc"
                 snap["plugged_in"] = True
-                snap["charging"] = True  # charger present → BMS is topping up
-                snap["status"] = "On DC"
-                # Percent isn't meaningful while charging — the rail is
-                # the charger voltage, not the cell voltage.
-                snap["percent"] = None
+                snap["charging"] = True
+                snap["status"] = "Charging"
             else:
                 snap["power_source"] = "battery"
                 snap["plugged_in"] = False
                 snap["charging"] = False
                 snap["status"] = "On battery"
-                snap["percent"] = _estimate_lifepo4_percent(v_med)
             return snap
 
         @self.settings_app.get("/health")
