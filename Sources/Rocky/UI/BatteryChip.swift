@@ -1,10 +1,11 @@
 import SwiftUI
 
-/// Glass-styled power chip for overlay on the portrait avatar.
-/// Mirrors `BatteryChip` (same data + tooltip) but renders in a
-/// rounded-rectangle material capsule so it sits cleanly on the
-/// portrait gradient. Hides itself when there's no signal so the
-/// avatar isn't permanently bracketed by a grey placeholder.
+/// Glass-capsule power chip for the portrait. Apple-style pill
+/// battery glyph + an explicit percent/voltage readout — modelled on
+/// the iOS status-bar battery indicator. The glyph fills left-to-right
+/// based on charge tier; on DC the fill is solid with a charging-bolt
+/// overlay because the rail voltage reflects the charger, not the
+/// cell, and we can't honestly report state-of-charge while powered.
 struct PowerChipOverlay: View {
     @Environment(AppServices.self) private var services
 
@@ -13,54 +14,44 @@ struct PowerChipOverlay: View {
         let visible = (snap?.reachable == true) && (snap?.present == true)
         if visible {
             BatteryChip(snapshot: snap)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(.ultraThinMaterial,
-                            in: Capsule())
-                .overlay(
-                    Capsule()
-                        .stroke(.white.opacity(0.08), lineWidth: 0.5)
-                )
-                .help(BatteryChip(snapshot: snap).tooltip)
                 .transition(.opacity)
         }
     }
 }
 
-/// Compact toolbar chip that shows Rocky's battery state.
-///
-/// Tier:
-///   - `< 15%` red, "Charging" trumps low so a charging bot reads green.
-///   - `< 30%` orange.
-///   - else green.
-///
-/// Variants:
-///   - `nil` snapshot → "—" placeholder (haven't polled yet).
-///   - `reachable: false` → unreachable glyph + tooltip.
-///   - `present: false` → "BMS off" glyph + tooltip.
-///
-/// Wired into the toolbar as a `Label`; macOS renders it as a glyph
-/// chip in the toolbar group.
 struct BatteryChip: View {
     let snapshot: BatteryService.Snapshot?
 
     var body: some View {
-        Label(label, systemImage: symbol)
-            .labelStyle(.titleAndIcon)
-            .font(.callout.monospacedDigit())
-            .foregroundStyle(tint)
-            .help(tooltip)
+        HStack(spacing: 6) {
+            BatteryGlyph(snapshot: snapshot)
+                .frame(width: 26, height: 12)
+            Text(readout)
+                .font(.system(size: 12, weight: .semibold, design: .rounded)
+                        .monospacedDigit())
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(.ultraThinMaterial, in: Capsule())
+        .overlay(
+            Capsule()
+                .stroke(.white.opacity(0.08), lineWidth: 0.5)
+        )
+        .help(tooltip)
     }
 
-    private var label: String {
+    /// What sits to the right of the glyph.
+    ///   - On DC: voltage, because percent isn't measurable while
+    ///     the charger is regulating the rail. Voltage is the most
+    ///     honest available number.
+    ///   - On battery: percent, the iPhone-style "65%" readout.
+    ///   - Otherwise: voltage if known, "—" as last resort.
+    private var readout: String {
         guard let s = snapshot else { return "—" }
-        if !s.reachable { return "—" }
-        if !s.present { return "—" }
-        // On DC the percent is unknown (the rail shows the charger
-        // voltage, not the cell voltage). Show "DC" so the user knows
-        // it's a binary state, not a low-battery warning.
         if s.powerSource == "dc" {
-            if let v = s.voltageV { return String(format: "DC %.1fV", v) }
+            if let v = s.voltageV { return String(format: "%.1fV", v) }
             return "DC"
         }
         if let p = s.percent { return "\(p)%" }
@@ -68,52 +59,97 @@ struct BatteryChip: View {
         return "—"
     }
 
-    private var symbol: String {
-        guard let s = snapshot else { return "battery.0percent" }
-        if !s.reachable { return "battery.0percent" }
-        if !s.present { return "battery.0percent" }
-        // DC plugged in: power plug icon — distinct from "battery
-        // charging" because here we can't see actual SOC during
-        // charge (the rail is at charger voltage).
-        if s.powerSource == "dc" {
-            return "powerplug.fill"
-        }
-        let pct = s.percent ?? 0
-        // SF Symbols ladder: 0/25/50/75/100. Pick the highest tier
-        // whose threshold the battery still meets.
-        if pct >= 88 { return "battery.100percent" }
-        if pct >= 63 { return "battery.75percent" }
-        if pct >= 38 { return "battery.50percent" }
-        if pct >= 13 { return "battery.25percent" }
-        return "battery.0percent"
-    }
-
     var tint: Color {
-        guard let s = snapshot else { return .secondary }
-        if !s.reachable || !s.present { return .secondary }
-        if s.powerSource == "dc" { return .blue }
-        let pct = s.percent ?? 100
-        if pct < 15 { return .red }
-        if pct < 30 { return .orange }
-        return .green
+        BatteryGlyph(snapshot: snapshot).fillColor
     }
 
     var tooltip: String {
-        guard let s = snapshot else { return "Battery — waiting for relay…" }
+        guard let s = snapshot else { return "Power — waiting for relay…" }
         if !s.reachable {
-            return "Battery — relay unreachable. Is `rocky_media_relay` running on the bot?"
+            return "Power — relay unreachable. Is rocky_media_relay running on the bot?"
         }
         if !s.present {
-            return "Battery — bot kernel doesn't expose the BMS, and the motors aren't reporting voltage. No data available."
+            return "Power — no signal. Bot can't report supply voltage."
         }
         var parts: [String] = []
         if let st = s.status { parts.append(st) }
         if let v = s.voltageV { parts.append(String(format: "%.2f V", v)) }
-        if let p = s.percent { parts.append("\(p)%") }
-        if let t = s.temperatureC { parts.append(String(format: "%.0f°C", t)) }
-        if s.source == "dynamixel:reg144" {
-            parts.append("via motors")
-        }
+        if let p = s.percent { parts.append("≈\(p)%") }
+        if s.source == "dynamixel:reg144" { parts.append("via motor reg 144") }
         return parts.joined(separator: " · ")
+    }
+}
+
+// MARK: - Battery glyph (iOS-style horizontal pill with charge fill)
+
+private struct BatteryGlyph: View {
+    let snapshot: BatteryService.Snapshot?
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let h = geo.size.height
+            let bodyW = max(0, w - 3)            // 1 px gap + 2 px tip
+            let cornerR = h * 0.32
+            let strokeWidth = max(1.0, h * 0.10)
+
+            ZStack(alignment: .leading) {
+                // Outline
+                RoundedRectangle(cornerRadius: cornerR, style: .continuous)
+                    .stroke(.primary.opacity(0.55), lineWidth: strokeWidth)
+                    .frame(width: bodyW, height: h)
+
+                // Positive terminal nub on the right
+                RoundedRectangle(cornerRadius: 0.6, style: .continuous)
+                    .fill(.primary.opacity(0.55))
+                    .frame(width: 2, height: h * 0.45)
+                    .offset(x: bodyW + 1)
+
+                // Inner fill — width proportional to charge
+                if let frac = fillFraction {
+                    let inset = strokeWidth + 1
+                    let innerW = max(0, bodyW - inset * 2)
+                    let innerH = max(0, h - inset * 2)
+                    RoundedRectangle(cornerRadius: cornerR - inset,
+                                     style: .continuous)
+                        .fill(fillColor)
+                        .frame(width: max(2, innerW * frac), height: innerH)
+                        .offset(x: inset, y: inset)
+                        .animation(.easeOut(duration: 0.25), value: frac)
+                }
+
+                // Charging bolt overlay (DC plugged in). Sits on top
+                // of the fill, centred on the glyph.
+                if snapshot?.powerSource == "dc" {
+                    Image(systemName: "bolt.fill")
+                        .font(.system(size: h * 0.78,
+                                      weight: .heavy))
+                        .foregroundStyle(.white)
+                        .shadow(color: .black.opacity(0.35), radius: 0.6)
+                        .frame(width: bodyW, height: h, alignment: .center)
+                }
+            }
+        }
+    }
+
+    /// 0.0–1.0 fill, or nil when there's nothing to draw.
+    var fillFraction: Double? {
+        guard let s = snapshot, s.reachable, s.present else { return nil }
+        // On DC the rail voltage is the charger output, not the
+        // cell — we can't honestly state state-of-charge while
+        // powered. Show a solid-full fill so the iconography reads
+        // "powered" rather than "drained".
+        if s.powerSource == "dc" { return 1.0 }
+        if let p = s.percent { return max(0.0, min(1.0, Double(p) / 100.0)) }
+        return nil
+    }
+
+    var fillColor: Color {
+        guard let s = snapshot else { return .gray }
+        if s.powerSource == "dc" { return .green }
+        let pct = s.percent ?? 100
+        if pct < 15 { return .red }
+        if pct < 30 { return .yellow }
+        return .green
     }
 }

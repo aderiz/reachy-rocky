@@ -36,13 +36,13 @@ struct PortraitView: View {
                     .padding(.horizontal, 16)
                     .padding(.top, 14)
                 // Power chip on the opposite corner so it balances the
-                // SensesChip and stays clear of the antennas. Shows DC
-                // vs battery + voltage; sources the data from
-                // BatteryService (via the on-bot relay's /battery).
+                // SensesChip and stays clear of the antennas. iOS-style
+                // pill glyph + percent (or voltage on DC); auto-hides
+                // when there's no signal.
                 PowerChipOverlay()
+                    .frame(maxWidth: .infinity, alignment: .topTrailing)
                     .padding(.horizontal, 16)
                     .padding(.top, 14)
-                    .frame(maxWidth: .infinity, alignment: .topTrailing)
             }
             Spacer(minLength: 0)
             namePlate
