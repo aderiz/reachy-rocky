@@ -763,89 +763,120 @@ private struct EnrollFaceForm: View {
     @State private var pronouncing: Bool = false
 
     var body: some View {
-        // Standard macOS Form. LabeledContent gives us the leading
-        // label / trailing control alignment for free (matches the
-        // rest of System Settings) and the system TextField style
-        // handles placeholder rendering correctly — none of the
-        // multi-text-position glitches the previous custom .plain
-        // styling produced.
-        Form {
-            LabeledContent("Name") {
+        // A two-column grid (label / control) instead of a nested
+        // `Form { .formStyle(.grouped) }`. Nesting a grouped Form
+        // inside the parent grouped Form was the bug: LabeledContent
+        // inside a nested grouped form collapses the trailing control
+        // to right-aligned static text, which is why "Alice" rendered
+        // as a label and "phonetic spelling…" wrapped centred.
+        //
+        // Grid with leading/firstTextBaseline alignment gives the
+        // same trailing-control feel as System Settings without the
+        // nested-Form glitches, and lets the hint + photo strip
+        // attach naturally below the row they belong to.
+        Grid(alignment: .leadingFirstTextBaseline,
+             horizontalSpacing: 12,
+             verticalSpacing: 10) {
+            GridRow {
+                Text("Name")
+                    .gridColumnAlignment(.trailing)
+                    .foregroundStyle(.secondary)
                 TextField("Alice", text: $name)
+                    .textFieldStyle(.roundedBorder)
             }
 
-            LabeledContent("Says") {
-                HStack(spacing: 8) {
-                    TextField("phonetic spelling (optional)",
-                              text: $pronunciation)
-                    Button {
-                        speakPronunciationTest()
-                    } label: {
-                        Image(systemName: pronouncing
-                              ? "speaker.wave.2.fill"
-                              : "play.circle.fill")
-                            .symbolRenderingMode(.hierarchical)
-                            .foregroundStyle(.tint)
-                            .font(.system(size: 18))
-                            .symbolEffect(.pulse, isActive: pronouncing)
+            GridRow {
+                Text("Says")
+                    .gridColumnAlignment(.trailing)
+                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        TextField("phonetic spelling (optional)",
+                                  text: $pronunciation)
+                            .textFieldStyle(.roundedBorder)
+                        Button {
+                            speakPronunciationTest()
+                        } label: {
+                            Image(systemName: pronouncing
+                                  ? "speaker.wave.2.fill"
+                                  : "play.circle.fill")
+                                .symbolRenderingMode(.hierarchical)
+                                .font(.title3)
+                                .symbolEffect(.pulse, isActive: pronouncing)
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(pronunciationTestDisabled)
+                        .help(pronunciationHelp)
+                        .accessibilityLabel("Test pronunciation")
                     }
-                    .buttonStyle(.borderless)
-                    .disabled(pronunciationTestDisabled)
-                    .help(pronunciationHelp)
-                }
-            }
-            Text("e.g. \u{201C}shi-vawn\u{201D} for Siobhán")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            LabeledContent("Photos") {
-                HStack(spacing: 8) {
-                    Button {
-                        choosePhotos()
-                    } label: {
-                        Label("Choose photos\u{2026}",
-                              systemImage: "photo.on.rectangle.angled")
-                    }
-                    Button {
-                        useCameraFrame()
-                    } label: {
-                        Label("Use current frame", systemImage: "camera")
-                    }
-                    Spacer()
+                    Text("e.g. \u{201C}shi-vawn\u{201D} for Siobhán")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
 
-            if !photos.isEmpty {
-                photoStrip
+            GridRow(alignment: .firstTextBaseline) {
+                Text("Photos")
+                    .gridColumnAlignment(.trailing)
+                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        Button {
+                            choosePhotos()
+                        } label: {
+                            Label("Choose photos\u{2026}",
+                                  systemImage: "photo.on.rectangle.angled")
+                        }
+                        Button {
+                            useCameraFrame()
+                        } label: {
+                            Label("Use current frame", systemImage: "camera")
+                        }
+                    }
+                    if !photos.isEmpty {
+                        photoStrip
+                    }
+                }
             }
 
             if let err = error {
-                Text(err).font(.caption).foregroundStyle(.red)
+                GridRow {
+                    Color.clear.frame(width: 0, height: 0)
+                    Text(err)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
-            HStack {
-                Spacer()
-                Button {
-                    Task { await submit() }
-                } label: {
-                    if submitting {
-                        HStack(spacing: 6) {
-                            ProgressView().controlSize(.small)
-                            Text("Adding\u{2026}")
+            GridRow {
+                Color.clear.frame(width: 0, height: 0)
+                HStack {
+                    Spacer()
+                    Button {
+                        Task { await submit() }
+                    } label: {
+                        if submitting {
+                            HStack(spacing: 6) {
+                                ProgressView().controlSize(.small)
+                                Text("Adding\u{2026}")
+                            }
+                        } else {
+                            Label("Add face",
+                                  systemImage: "person.fill.badge.plus")
                         }
-                    } else {
-                        Label("Add face", systemImage: "person.fill.badge.plus")
                     }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(
+                        submitting
+                        || name.trimmingCharacters(in: .whitespaces).isEmpty
+                        || photos.isEmpty
+                    )
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(
-                    submitting
-                    || name.trimmingCharacters(in: .whitespaces).isEmpty
-                    || photos.isEmpty
-                )
             }
         }
-        .formStyle(.grouped)
+        .padding(.vertical, 2)
     }
 
     // MARK: - Subviews
