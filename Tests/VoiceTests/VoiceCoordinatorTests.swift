@@ -55,7 +55,7 @@ struct VoiceCoordinatorTests {
         var dispatched: (text: String, reason: WakeFilter.Reason)?
 
         for await output in outputs {
-            if case .finalText(let text, let didDispatch, let reason) = output, didDispatch {
+            if case let .finalText(text, didDispatch, reason, _, _, _) = output, didDispatch {
                 dispatched = (text, reason!)
                 break
             }

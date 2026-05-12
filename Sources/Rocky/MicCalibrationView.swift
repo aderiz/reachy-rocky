@@ -44,21 +44,37 @@ struct MicCalibrationView: View {
     @State private var roomSamples: [Float] = []
     @State private var robotSamples: [Float] = []
     @State private var voiceSamples: [Float] = []
+    /// Direct-address samples — captured while the user speaks to Rocky
+    /// from their usual seating position. Used to derive the
+    /// `AddressFilter`'s loudness floor / ratio (and the DoA centre /
+    /// tolerance, when the robot mic is the active source). Separate
+    /// from `voiceSamples` because the voice phase asks the user to
+    /// "talk naturally" (any direction); this one asks them to
+    /// directly address Rocky.
+    @State private var addressSamples: [Float] = []
+    @State private var addressDoASamples: [Double] = []
     @State private var verifySamples: [Float] = []
     @State private var verifyTriggers: Int = 0
     @State private var verifyAboveLastTick: Bool = false
     @State private var recommendedThreshold: Float? = nil
+    /// Outputs of the new address phase. Populated by
+    /// `computeAddressCalibration()` after the address phase finishes.
+    @State private var recommendedAddressRMSFloor: Double? = nil
+    @State private var recommendedAddressLoudnessRatio: Double? = nil
+    @State private var recommendedAddressDoACenter: Double? = nil
+    @State private var recommendedAddressDoATolerance: Double? = nil
     @State private var failureReason: String? = nil
     @State private var phaseTask: Task<Void, Never>? = nil
 
     /// Per-phase durations. Tuned in conversation with the user — the
     /// previous 2 + 3 = 5 s flow felt rushed and didn't separate room
-    /// from robot. Total active time is ~26 s (+ 8 s if the user runs
-    /// verify), plus the wake/sleep transitions which can add another
-    /// 3-4 s when a robot is connected.
+    /// from robot. Total active time is ~34 s with the address phase
+    /// added (+ 8 s if the user runs verify), plus wake/sleep
+    /// transitions when a robot is connected.
     private let roomSeconds: Double = 8.0
     private let robotSeconds: Double = 6.0
     private let voiceSeconds: Double = 12.0
+    private let addressSeconds: Double = 8.0
     private let verifySeconds: Double = 8.0
 
     /// Sampling cadence. 30 Hz over a 30 ms VAD frame gives roughly one
@@ -75,6 +91,7 @@ struct MicCalibrationView: View {
         case waking              // wakeUp in flight
         case robot
         case voice
+        case address             // direct-address capture for AddressFilter
         case computing
         case results
         case verify
@@ -118,15 +135,18 @@ struct MicCalibrationView: View {
     /// Once we hit `.computing` or beyond, all three are filled. The
     /// `.verify` and `.applied` states sit beyond the stepper.
     private var phaseStepper: some View {
-        HStack(spacing: 14) {
+        HStack(spacing: 10) {
             stepLabel(index: 1, name: "Room", active: phase == .room,
                       done: stepDoneAt(1))
             connector(filled: stepDoneAt(1))
             stepLabel(index: 2, name: "Rocky", active: phase == .robot,
                       done: stepDoneAt(2))
             connector(filled: stepDoneAt(2))
-            stepLabel(index: 3, name: "Your voice", active: phase == .voice,
+            stepLabel(index: 3, name: "Voice", active: phase == .voice,
                       done: stepDoneAt(3))
+            connector(filled: stepDoneAt(3))
+            stepLabel(index: 4, name: "Address", active: phase == .address,
+                      done: stepDoneAt(4))
         }
         .font(.caption)
     }
@@ -134,16 +154,19 @@ struct MicCalibrationView: View {
     private func stepDoneAt(_ index: Int) -> Bool {
         switch (index, phase) {
         case (1, .robot), (1, .waking),
-             (1, .voice), (1, .computing),
+             (1, .voice), (1, .address), (1, .computing),
              (1, .results), (1, .verify),
              (1, .applied):
             return true
-        case (2, .voice), (2, .computing),
+        case (2, .voice), (2, .address), (2, .computing),
              (2, .results), (2, .verify),
              (2, .applied):
             return true
-        case (3, .computing), (3, .results),
+        case (3, .address), (3, .computing), (3, .results),
              (3, .verify), (3, .applied):
+            return true
+        case (4, .computing), (4, .results),
+             (4, .verify), (4, .applied):
             return true
         default:
             return false
@@ -217,6 +240,13 @@ struct MicCalibrationView: View {
                 title: "Now speak normally",
                 subtitle: "Talk for about ten seconds. Try a few short sentences with natural pauses — the weather, what's on tomorrow, anything. The white line on the bar marks the noise floor: aim for your voice to cross it on every word.",
                 duration: voiceSeconds,
+                showCutoff: true
+            )
+        case .address:
+            phaseRecording(
+                title: "Address Rocky from your usual spot",
+                subtitle: "Now talk directly TO Rocky — face him from where you normally sit. Read these out: \"Rocky, what time is it?\"  \"Rocky, what's the weather?\"  \"Rocky, set a timer for ten minutes.\" This teaches him what 'addressed-to-me' sounds and looks like.",
+                duration: addressSeconds,
                 showCutoff: true
             )
         case .computing:
@@ -488,7 +518,7 @@ struct MicCalibrationView: View {
                 .keyboardShortcut(.cancelAction)
             Spacer()
             switch phase {
-            case .intro, .preRoomSleeping, .room, .waking, .robot, .voice, .computing:
+            case .intro, .preRoomSleeping, .room, .waking, .robot, .voice, .address, .computing:
                 Button("Recording…") {}.disabled(true)
             case .results:
                 Button("Apply without verify") { applyAndDismiss() }
@@ -561,9 +591,15 @@ struct MicCalibrationView: View {
             roomSamples = []
             robotSamples = []
             voiceSamples = []
+            addressSamples = []
+            addressDoASamples = []
             verifySamples = []
             verifyTriggers = 0
             recommendedThreshold = nil
+            recommendedAddressRMSFloor = nil
+            recommendedAddressLoudnessRatio = nil
+            recommendedAddressDoACenter = nil
+            recommendedAddressDoATolerance = nil
             failureReason = nil
             phase = .intro
         }
@@ -640,11 +676,32 @@ struct MicCalibrationView: View {
         voiceSamples = await capturePhase(seconds: voiceSeconds)
         if Task.isCancelled { return }
 
+        // Phase 4: Address — capture direct-address loudness and (on
+        // robot mic) the user's typical DoA from where they sit. The
+        // values feed the AddressFilter so it can reject background
+        // / off-axis speech in normal operation. Failing this phase
+        // is non-fatal: defaults will be used.
+        await MainActor.run { phase = .address }
+        let (addressR, addressD) = await captureAddressPhase(seconds: addressSeconds)
+        addressSamples = addressR
+        addressDoASamples = addressD
+        if Task.isCancelled { return }
+
         // Compute.
         await MainActor.run { phase = .computing }
         try? await Task.sleep(nanoseconds: 400_000_000)
         let result = computeThreshold()
         if Task.isCancelled { return }
+
+        // Address-filter values: best-effort, never fails the flow.
+        // Stored to @State, then committed in applyThresholdToServices.
+        let addressResult = computeAddressCalibration()
+        await MainActor.run {
+            recommendedAddressRMSFloor = addressResult.rmsFloor
+            recommendedAddressLoudnessRatio = addressResult.loudnessRatio
+            recommendedAddressDoACenter = addressResult.doaCenter
+            recommendedAddressDoATolerance = addressResult.doaTolerance
+        }
 
         switch result {
         case .success(let value):
@@ -655,6 +712,109 @@ struct MicCalibrationView: View {
         case .failure(let reason):
             await failOut(reason: reason)
         }
+    }
+
+    /// Like `capturePhase` but also samples the robot mic's live DoA
+    /// at 10 Hz alongside the RMS samples. DoA capture is a no-op when
+    /// the active mic source is Mac (no array → no DoA data).
+    private func captureAddressPhase(seconds: Double) async -> (rms: [Float], doa: [Double]) {
+        var rmsSamples: [Float] = []
+        var doaSamples: [Double] = []
+        let intervalNs = UInt64(1_000_000_000 / sampleHz)
+        let totalSamples = Int(seconds * sampleHz)
+        // DoA samples land every 3rd RMS tick to keep the rate near
+        // 10 Hz without coordinating two timers.
+        let doaStride = max(1, Int(sampleHz / 10))
+        let started = Date()
+        await MainActor.run { self.elapsed = 0 }
+        for i in 0..<totalSamples {
+            if Task.isCancelled { break }
+            let rms = await readRMS()
+            rmsSamples.append(rms)
+            if services.settings.micSource == "robot", i % doaStride == 0 {
+                if let doa = await services.robotMic.lastDoaRad,
+                   await services.robotMic.lastDoaIsSpeech == true {
+                    doaSamples.append(doa)
+                }
+            }
+            await MainActor.run {
+                self.elapsed = Date().timeIntervalSince(started)
+            }
+            if i < totalSamples - 1 {
+                try? await Task.sleep(nanoseconds: intervalNs)
+            }
+        }
+        return (rmsSamples, doaSamples)
+    }
+
+    /// Derive the AddressFilter calibration values from the captured
+    /// address-phase samples + room/robot percentiles. Returns
+    /// sensible defaults for any field where evidence is insufficient.
+    private func computeAddressCalibration() -> (
+        rmsFloor: Double, loudnessRatio: Double,
+        doaCenter: Double, doaTolerance: Double
+    ) {
+        // Loudness floor: a fraction above the noise ceiling, plus a
+        // safety margin keyed to the address phase's P25 (we don't
+        // want the floor sitting above any actual addressed speech).
+        let noiseCeiling = Double(max(percentile(roomSamples, 0.99),
+                                       percentile(robotSamples, 0.99)))
+        let addressP50 = addressSamples.isEmpty ? 0
+            : Double(percentile(addressSamples, 0.50))
+        let addressP25 = addressSamples.isEmpty ? 0
+            : Double(percentile(addressSamples, 0.25))
+        let floor: Double
+        if addressP25 > 0 {
+            // Stay safely below the user's typical addressed-speech
+            // amplitude — 70% of P25. Floor is "definitely too quiet
+            // to be direct address".
+            floor = max(0.005, min(addressP25 * 0.7, 0.04))
+        } else {
+            floor = 0.012  // default
+        }
+        let ratio: Double
+        if noiseCeiling > 1e-6 && addressP50 > noiseCeiling {
+            // Address speech is `addressP50 / noise` louder than the
+            // background floor. Use a fraction of that ratio so the
+            // gate is achievable for slightly-quieter follow-ups.
+            ratio = max(2.0, min(addressP50 / noiseCeiling * 0.65, 8.0))
+        } else {
+            ratio = 4.0  // default
+        }
+
+        // DoA: circular mean + 2× circular MAD from the captured
+        // samples. Falls back to "facing the bot" (0 rad) with a wide
+        // default tolerance when there's no usable data.
+        let (centre, tolerance) = circularMeanAndMAD(addressDoASamples)
+        return (
+            rmsFloor: floor,
+            loudnessRatio: ratio,
+            doaCenter: centre,
+            doaTolerance: tolerance
+        )
+    }
+
+    /// Circular mean + 2× MAD of an array of angles in radians.
+    /// Returns (0, 0.45) when the array is empty / too small to be
+    /// meaningful — those are the same defaults `SettingsStore` ships
+    /// with so the AddressFilter remains conservative when DoA is
+    /// missing.
+    private func circularMeanAndMAD(_ angles: [Double]) -> (centre: Double, tolerance: Double) {
+        guard angles.count >= 5 else { return (0, 0.45) }
+        let sumX = angles.reduce(0.0) { $0 + cos($1) }
+        let sumY = angles.reduce(0.0) { $0 + sin($1) }
+        let mean = atan2(sumY / Double(angles.count), sumX / Double(angles.count))
+        let deltas = angles.map { angle -> Double in
+            var d = (angle - mean).truncatingRemainder(dividingBy: 2 * .pi)
+            if d > .pi { d -= 2 * .pi }
+            if d <= -.pi { d += 2 * .pi }
+            return abs(d)
+        }
+        // MAD = median absolute deviation; robust to outliers.
+        let sorted = deltas.sorted()
+        let median = sorted[sorted.count / 2]
+        let tol = min(max(median * 2.0, 0.25), 0.9)
+        return (mean, tol)
     }
 
     private func runVerify() async {
@@ -839,5 +999,27 @@ struct MicCalibrationView: View {
         // Live-apply to the running VAD without waiting for the
         // next applySettings cycle.
         Task { await services.voice.setVADThreshold(t) }
+
+        // Push the address-phase results into AppServices so the
+        // AddressFilter starts using them on the very next dispatch.
+        // Each value falls back to the prior persisted setting when
+        // calibration didn't produce one (e.g. capture failed, Mac
+        // mic with no DoA).
+        let rmsFloor = recommendedAddressRMSFloor
+            ?? services.settings.addressRMSFloor
+        let loudnessRatio = recommendedAddressLoudnessRatio
+            ?? services.settings.addressLoudnessRatio
+        let doaCenter = recommendedAddressDoACenter
+            ?? services.settings.addressUserDoaCenterRad
+        let doaTolerance = recommendedAddressDoATolerance
+            ?? services.settings.addressUserDoaToleranceRad
+        Task {
+            await services.applyAddressFilterCalibration(
+                rmsFloor: rmsFloor,
+                loudnessRatio: loudnessRatio,
+                userDoaCenterRad: doaCenter,
+                userDoaToleranceRad: doaTolerance
+            )
+        }
     }
 }

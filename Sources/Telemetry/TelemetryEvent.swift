@@ -23,6 +23,15 @@ public enum TelemetryEvent: Sendable {
     case sttFinal(text: String, totalMs: Double)
     case wakeMatch(name: String, transcript: String)
     case conversationWindow(transition: ConversationTransition, reason: String)
+    /// AddressFilter dispatched a transcript to the brain. `reasons`
+    /// carries the gates that contributed positively (e.g. ["wake",
+    /// "loud", "face"]); score is the composite confidence in [0,1].
+    case addressFilterAccept(text: String, score: Double, reasons: [String])
+    /// AddressFilter dropped a transcript. `reasons` carries the
+    /// negative gates (e.g. ["low_loudness", "no_face", "doa_off_axis"]).
+    /// Pairs with vadSegment / sttFinal so the user can trace any
+    /// dropped utterance back through the pipeline.
+    case addressFilterDrop(text: String, score: Double, reasons: [String])
     case ttsRequest(text: String, voiceRefId: String, firstChunkMs: Double?)
     case ttsChunk(index: Int, sinceStartMs: Double, bytes: Int)
 

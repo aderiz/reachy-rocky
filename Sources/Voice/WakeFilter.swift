@@ -1,11 +1,17 @@
 import Foundation
 
-/// State machine for "Rocky, ..." wake detection + 60 s conversation window.
+/// State machine for "Rocky, ..." wake detection + conversation window.
 ///
-/// SLEEPING -> wake match in final transcript -> DISPATCHED -> OPEN_60s.
-/// During OPEN_60s every final transcript is dispatched without needing the
-/// wake word; the window auto-extends each turn. Closes on timeout, mute, or
-/// explicit "stop listening" / "go to sleep".
+/// SLEEPING -> wake match in final transcript -> DISPATCHED -> OPEN_window.
+/// During OPEN_window every final transcript is **admitted** (not auto-
+/// dispatched); the downstream `AddressFilter` then decides whether the
+/// admitted transcript was actually addressed to Rocky. The window only
+/// extends when the caller invokes `extendOnEngaged()` after a genuinely
+/// engaged dispatch (loud + face / DoA / verb). Pure `.withinWindow`
+/// hits that don't show real engagement do not perpetuate the window —
+/// this prevents hallucinations from holding it open indefinitely.
+///
+/// Closes on timeout, mute, or explicit "stop listening" / "go to sleep".
 public actor WakeFilter {
     public struct Config: Sendable, Equatable {
         public var wakeName: String
@@ -14,7 +20,7 @@ public actor WakeFilter {
 
         public init(
             wakeName: String = "rocky",
-            conversationWindowS: TimeInterval = 60,
+            conversationWindowS: TimeInterval = 20,
             stopPhrases: [String] = ["go to sleep", "stop listening", "good night"]
         ) {
             self.wakeName = wakeName
@@ -90,17 +96,34 @@ public actor WakeFilter {
         }
 
         if state.isOpen {
-            extendWindow()
+            // Admit only — the AddressFilter decides whether to
+            // dispatch and whether this transcript was *engaged*
+            // (and therefore extends the window). The window does
+            // NOT auto-extend here; callers must invoke
+            // `extendOnEngaged()` after an engaged dispatch.
             return .dispatch(transcript: transcript, reason: .withinWindow)
         }
 
         if Self.containsName(transcript, name: config.wakeName) {
+            // Wake-name match opens (or refreshes) the window. The
+            // explicit address is itself the engagement evidence.
             extendWindow()
             return .dispatch(transcript: transcript,
                              reason: .wakeMatch(name: config.wakeName))
         }
 
         return .ignore
+    }
+
+    /// Refresh the conversation window because the last admitted
+    /// transcript showed real engagement (loud + face / DoA / verb
+    /// prefix). The AddressFilter signals this via its `.dispatch`
+    /// decision's `engaged` flag; `AppServices.handleVoice` calls
+    /// this from there. Idempotent and safe to call when the
+    /// window is currently sleeping (no-op).
+    public func extendOnEngaged() {
+        guard state.isOpen else { return }
+        extendWindow()
     }
 
     private func extendWindow() {

@@ -34,7 +34,26 @@ public actor VoiceCoordinator {
 
     public enum Output: Sendable {
         case partial(text: String)
-        case finalText(text: String, dispatched: Bool, reason: WakeFilter.Reason?)
+        /// A final transcript. Carries enough metadata for the
+        /// downstream `AddressFilter` to score the audio segment
+        /// the transcript came from (without re-running STT or
+        /// re-reading the ring buffer):
+        ///   - `dispatched`: `true` if the WakeFilter ADMITTED it
+        ///     (wake-match OR within-window). The address filter
+        ///     then makes the actual brain-dispatch call.
+        ///   - `reason`: what the WakeFilter decided.
+        ///   - `confidence`: STT confidence in [0, 1]. 1.0 for
+        ///     MLX-Whisper / WhisperKit; varies on Apple Speech.
+        ///   - `peakRMS` / `meanRMS`: loudness statistics over the
+        ///     captured segment (after VAD trim, before STT).
+        case finalText(
+            text: String,
+            dispatched: Bool,
+            reason: WakeFilter.Reason?,
+            confidence: Double,
+            peakRMS: Double,
+            meanRMS: Double
+        )
         case windowOpened(until: Date)
         case windowClosed(reason: String)
     }
@@ -282,6 +301,11 @@ public actor VoiceCoordinator {
         // frame because `vad.inSpeech` stays true.
         _ = forceEnd
 
+        // Compute peak / mean RMS for the captured segment. Cheap
+        // (single pass) and gives the downstream AddressFilter a
+        // loudness measurement without re-reading the ring buffer.
+        let (peakRMS, meanRMS) = Self.computeRMS(segment)
+
         // STT is single-in-flight (Apple Speech doesn't pipeline a
         // second request well). Earlier behaviour was "drop new
         // segment if STT is busy", which silently ate every other
@@ -307,11 +331,46 @@ public actor VoiceCoordinator {
         }
 
         sttTask = Task { [weak self] in
-            await self?.runSTT(segment: segment, started: started)
+            await self?.runSTT(
+                segment: segment, started: started,
+                peakRMS: peakRMS, meanRMS: meanRMS
+            )
         }
     }
 
-    private func runSTT(segment: [Float], started: Date) async {
+    /// Single-pass peak + mean RMS over a float32 PCM segment.
+    /// "Peak RMS" here is the loudest 30 ms window — gives us a
+    /// number that survives transient silence at the segment's
+    /// edges while still penalising mostly-quiet utterances.
+    private static func computeRMS(_ samples: [Float]) -> (peak: Double, mean: Double) {
+        guard !samples.isEmpty else { return (0, 0) }
+        var sumSq: Double = 0
+        var peak: Double = 0
+        // 30 ms windows at 16 kHz = 480 samples. Cheap rolling
+        // window — accumulate sum-of-squares, subtract the leaving
+        // sample, divide and sqrt at each step.
+        let windowSize = 480
+        var winSq: Double = 0
+        for (i, s) in samples.enumerated() {
+            let sq = Double(s) * Double(s)
+            sumSq += sq
+            winSq += sq
+            if i >= windowSize {
+                let leaving = Double(samples[i - windowSize])
+                winSq -= leaving * leaving
+            }
+            let denom = Double(min(i + 1, windowSize))
+            let rms = (winSq / denom).squareRoot()
+            if rms > peak { peak = rms }
+        }
+        let mean = (sumSq / Double(samples.count)).squareRoot()
+        return (peak, mean)
+    }
+
+    private func runSTT(
+        segment: [Float], started: Date,
+        peakRMS: Double, meanRMS: Double
+    ) async {
         if Task.isCancelled { sttTask = nil; return }
         do {
             let transcript = try await stt.transcribe(
@@ -320,7 +379,12 @@ public actor VoiceCoordinator {
             if Task.isCancelled { sttTask = nil; return }
             let totalMs = Date().timeIntervalSince(started) * 1000
             await logBus.publish(.sttFinal(text: transcript.text, totalMs: totalMs))
-            await dispatchFinal(transcript.text)
+            await dispatchFinal(
+                transcript.text,
+                confidence: transcript.confidence,
+                peakRMS: peakRMS,
+                meanRMS: meanRMS
+            )
         } catch {
             await logBus.publish(.error(
                 scope: "stt", message: "\(error)", recoverable: true
@@ -335,13 +399,22 @@ public actor VoiceCoordinator {
         // both back-to-back".
         if let next = queuedSegment {
             queuedSegment = nil
+            let (np, nm) = Self.computeRMS(next.samples)
             sttTask = Task { [weak self] in
-                await self?.runSTT(segment: next.samples, started: next.started)
+                await self?.runSTT(
+                    segment: next.samples, started: next.started,
+                    peakRMS: np, meanRMS: nm
+                )
             }
         }
     }
 
-    private func dispatchFinal(_ text: String) async {
+    private func dispatchFinal(
+        _ text: String,
+        confidence: Double,
+        peakRMS: Double,
+        meanRMS: Double
+    ) async {
         let decision = await wake.decide(transcript: text)
         switch decision {
         case .dispatch(let transcript, let reason):
@@ -365,16 +438,26 @@ public actor VoiceCoordinator {
                     fields: ["normalized": normalized,
                              "since_last_ms": "\(Int(now.timeIntervalSince(lastDispatchedAt) * 1000))"]
                 ))
-                outputsContinuation.yield(.finalText(text: text, dispatched: false, reason: nil))
+                outputsContinuation.yield(.finalText(
+                    text: text, dispatched: false, reason: nil,
+                    confidence: confidence, peakRMS: peakRMS, meanRMS: meanRMS
+                ))
                 return
             }
             lastDispatchedNormalized = normalized
             lastDispatchedAt = now
 
-            outputsContinuation.yield(.finalText(text: transcript, dispatched: true, reason: reason))
+            outputsContinuation.yield(.finalText(
+                text: transcript, dispatched: true, reason: reason,
+                confidence: confidence, peakRMS: peakRMS, meanRMS: meanRMS
+            ))
             // Surface the (re)opened window to AppServices so its
-            // `conversationOpenUntil` mirror tracks the wake filter and
-            // schedule the idle-close timer for the new deadline.
+            // `conversationOpenUntil` mirror tracks the wake filter
+            // and schedule the idle-close timer for the new deadline.
+            // The WakeFilter no longer auto-extends on .withinWindow
+            // — only wake-match opens the window here. Engaged
+            // extensions are driven by AppServices calling
+            // `wake.extendOnEngaged()` after AddressFilter accepts.
             if case .open(let until) = await wake.state {
                 outputsContinuation.yield(.windowOpened(until: until))
                 scheduleIdleClose(at: until)
@@ -384,10 +467,17 @@ public actor VoiceCoordinator {
                 await logBus.publish(.wakeMatch(name: name, transcript: transcript))
                 await logBus.publish(.conversationWindow(transition: .opened, reason: "wake"))
             case .withinWindow:
-                await logBus.publish(.conversationWindow(transition: .extended, reason: "follow-up"))
+                // No conversation-window event here — only emit
+                // "extended" later, when AddressFilter signals
+                // engaged dispatch and the window is actually
+                // refreshed.
+                break
             }
         case .ignore:
-            outputsContinuation.yield(.finalText(text: text, dispatched: false, reason: nil))
+            outputsContinuation.yield(.finalText(
+                text: text, dispatched: false, reason: nil,
+                confidence: confidence, peakRMS: peakRMS, meanRMS: meanRMS
+            ))
         case .close(let reason):
             windowCloseTask?.cancel()
             windowCloseTask = nil
