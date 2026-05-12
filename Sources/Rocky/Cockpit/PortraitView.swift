@@ -20,6 +20,7 @@ import SwiftUI
 /// inspector. This column is for *reading Rocky as a being*.
 struct PortraitView: View {
     @Environment(AppServices.self) private var services
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         VStack(spacing: 0) {
@@ -56,7 +57,7 @@ struct PortraitView: View {
         // The stops descend through slate to near-black so the name
         // and primary action sit on dark, readable territory at the
         // base.
-        .background(ReachyMiniAvatar.backdrop)
+        .background(ReachyMiniAvatar.backdrop(for: colorScheme))
     }
 
     // MARK: - Head
