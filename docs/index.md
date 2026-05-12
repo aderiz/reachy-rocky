@@ -22,6 +22,7 @@ The catalog of every page in the wiki.
 - [Voice / listen pipeline](concepts/voice-pipeline.md) — mic → ring buffer → VAD → STT → wake filter → **AddressFilter** → cognition; four-phase calibration with motors-under-load + DoA, Whisper hallucination mitigation, echo gate.
 - [AddressFilter](concepts/address-filter.md) — strict post-STT pre-brain dispatch gate fusing loudness, DoA, face, confidence; wake-name now requires real audio energy so Whisper hallucinations can't wake the bot.
 - [Portrait composition](concepts/portrait.md) — avatar + senses chip + power chip + name plate + wake toggle; light/dark backdrop, iOS-style switch + battery chip, single-source-of-truth bindings.
+- [Hermes Agent](concepts/hermes-agent.md) — NousResearch's MIT-licensed agent loop as an optional advanced cognition backend for Rocky (proposed; see ADR 0004).
 - [Tools registry](concepts/tools-registry.md) — schema/handler shape, dispatch path, fenced-JSON fallback for Gemma, inventory of the shipped tools.
 - [Permissions authority](concepts/permissions-authority.md) — single source of truth, 5-state enum, TCC + signing pitfalls, debug-binary trap.
 - [On-bot media relay](concepts/on-bot-media-relay.md) — `rocky_media_relay` Reachy Mini App + Mac-side WS subscribers; replaces WebRTC.
@@ -40,6 +41,7 @@ The catalog of every page in the wiki.
 - [Create an app](workflows/create-app.md) — `reachy-mini-app-assistant` CLI.
 - [Run and debug](workflows/run-and-debug.md) — daemon logs, `journalctl`, common pitfalls.
 - [Deploy the on-bot media relay](workflows/deploy-media-relay.md) — `reachy-mini-app-assistant check/publish`, dev-iteration loop on the bot, start/stop via daemon REST.
+- [Integrate Hermes Agent](workflows/integrate-hermes-agent.md) — implementation plan referenced by ADR 0004. Lives on `hermes-agent` branch; documented on `main` for visibility.
 
 ## Patterns
 
@@ -58,6 +60,7 @@ The catalog of every page in the wiki.
 - [0001 — Target platform](decisions/0001-target-platform.md) — Wireless on-robot Python is the default for upstream Pollen apps.
 - [0002 — Rocky as a macOS-native nervous system](decisions/0002-rocky-app.md) — explains why Rocky is a Swift app, not a Python app on the CM4.
 - [0003 — Sidecar convention for external processes](decisions/0003-sidecar-convention.md) — JSON manifests, line-delimited JSON wire format, supervisor with restart policy + circuit breaker.
+- [0004 — Hermes Agent integration](decisions/0004-hermes-agent-integration.md) — Rocky-as-MCP-server approach for the NousResearch Hermes Agent as Rocky's optional advanced cognition backend. Implementation lives on the `hermes-agent` branch.
 - [0005 — Brain backend as a protocol, MLX-VLM as the default](decisions/0005-brain-backend-protocol.md) — `BrainBackend` seam, vision-aware default, Status panel resolves rows by active backend.
 
 ## Rocky implementation

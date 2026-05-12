@@ -2,6 +2,18 @@
 
 Append-only chronological record. Each entry: `## [YYYY-MM-DD] <op> | <subject>`. Run `grep "^## \[" log.md | tail -20` for the recent timeline.
 
+## [2026-05-12] docs | Backfill ADR 0004 (Hermes Agent) + flesh out OnBot relay README
+
+The wiki catalog had a hole between ADRs 0003 and 0005 because ADR 0004 (Hermes Agent integration) was authored on the `hermes-agent` branch and never merged. Cherry-picked the three artifacts onto `main`:
+
+- `docs/decisions/0004-hermes-agent-integration.md` — the decision itself, status `accepted` with an implementation-status note pointing at the `hermes-agent` branch where the work lives.
+- `docs/concepts/hermes-agent.md` — concept doc covering Hermes' role as Rocky's optional advanced cognition backend.
+- `docs/workflows/integrate-hermes-agent.md` — implementation plan referenced by the ADR.
+
+`docs/index.md` lists all three; concepts and decisions sections updated.
+
+Separately: `OnBot/rocky_media_relay/README.md` was missing every battery / camera-sleep / autostart addition shipped on the `listening-rework` branch. Rewrote to include the `/battery` endpoint + schema + empirical thresholds, the Dynamixel reg-144 workaround story, the camera-sleep behaviour driven by `video_clients == 0`, and the Mac-side `ensureRelayAppRunning` autostart.
+
 ## [2026-05-12] docs | Backfill — on-bot relay extras + power monitoring + portrait + antenna constraint
 
 The wiki had drifted significantly behind the `main` and `listening-rework` branches. This pass closes the gap.
