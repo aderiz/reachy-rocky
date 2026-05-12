@@ -760,13 +760,33 @@ private struct EnrollFaceForm: View {
     @State private var photos: [Data] = []
     @State private var error: String?
     @State private var submitting: Bool = false
+    @State private var pronouncing: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             row("Name", placeholder: "Alice", text: $name)
             row("Says",
-                placeholder: "phonetic spelling (optional, e.g. shi-vawn)",
-                text: $pronunciation, width: 360)
+                placeholder: "phonetic spelling (optional)",
+                text: $pronunciation, width: 360,
+                hint: "e.g. \u{201C}shi-vawn\u{201D} for Siobhán",
+                trailing: {
+                    AnyView(
+                        Button {
+                            speakPronunciationTest()
+                        } label: {
+                            Image(systemName: pronouncing
+                                  ? "speaker.wave.2.fill"
+                                  : "play.circle.fill")
+                                .symbolRenderingMode(.hierarchical)
+                                .foregroundStyle(.tint)
+                                .font(.system(size: 20))
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(pronunciationTestDisabled)
+                        .help(pronunciationHelp)
+                        .symbolEffect(.pulse, isActive: pronouncing)
+                    )
+                })
 
             HStack(spacing: 8) {
                 Button {
@@ -828,24 +848,39 @@ private struct EnrollFaceForm: View {
     private func row(_ label: String,
                      placeholder: String,
                      text: Binding<String>,
-                     width: CGFloat = 280) -> some View {
+                     width: CGFloat = 280,
+                     hint: String? = nil,
+                     trailing: (() -> AnyView)? = nil) -> some View {
         HStack(alignment: .firstTextBaseline) {
             Text(label)
                 .font(.callout.weight(.medium))
                 .frame(width: 80, alignment: .leading)
                 .foregroundStyle(.secondary)
-            TextField(placeholder, text: text)
-                .textFieldStyle(.plain)
-                .padding(.horizontal, 12).padding(.vertical, 8)
-                .frame(width: width)
-                .background(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(.gray.opacity(0.08))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .strokeBorder(.gray.opacity(0.20), lineWidth: 1)
-                )
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    TextField(placeholder, text: text)
+                        .textFieldStyle(.plain)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .padding(.horizontal, 12).padding(.vertical, 8)
+                        .frame(width: width)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(.gray.opacity(0.08))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .strokeBorder(.gray.opacity(0.20), lineWidth: 1)
+                        )
+                    if let trailing { trailing() }
+                }
+                if let hint {
+                    Text(hint)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .padding(.leading, 4)
+                }
+            }
         }
     }
 
@@ -907,6 +942,48 @@ private struct EnrollFaceForm: View {
         }
         photos.append(frame.jpeg)
         error = nil
+    }
+
+    // MARK: - Pronunciation test
+
+    /// Text to send through TTS for the pronunciation test. Uses the
+    /// pronunciation field if non-empty, falls back to the name —
+    /// that mirrors how the rest of the app treats the pronunciation:
+    /// it overrides the displayed name when speaking, otherwise the
+    /// name itself is spoken.
+    private var pronunciationTestText: String {
+        let pron = pronunciation.trimmingCharacters(in: .whitespaces)
+        if !pron.isEmpty { return pron }
+        return name.trimmingCharacters(in: .whitespaces)
+    }
+
+    private var pronunciationTestDisabled: Bool {
+        pronouncing || pronunciationTestText.isEmpty
+    }
+
+    private var pronunciationHelp: String {
+        if !pronunciationTestText.isEmpty {
+            return "Hear how Rocky says \u{201C}\(pronunciationTestText)\u{201D}."
+        }
+        return "Enter a name (or phonetic spelling) to hear how Rocky says it."
+    }
+
+    /// Send the pronunciation through Rocky's TTS so the user can hear
+    /// whether the phonetic spelling produces the right sound before
+    /// committing the enrollment. Plays through the robot speaker
+    /// (same path as any other TTS).
+    private func speakPronunciationTest() {
+        let text = pronunciationTestText
+        guard !text.isEmpty, !pronouncing else { return }
+        pronouncing = true
+        Task {
+            do {
+                _ = try await services.robotTTS.speak(text)
+            } catch {
+                await MainActor.run { self.error = "TTS test failed: \(error)" }
+            }
+            await MainActor.run { self.pronouncing = false }
+        }
     }
 
     private func submit() async {
