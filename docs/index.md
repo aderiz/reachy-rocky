@@ -27,6 +27,11 @@ The catalog of every page in the wiki.
 - [TTS engines + voice cloning](concepts/tts-engines.md) — Chatterbox (default 8-bit), Qwen3-TTS-12Hz (non-streaming after ICL drift A/B), Fish / Higgs / Sesame; per-backend RTF; reference-clip layout; streaming vs. non-streaming.
 - [Memory — mempalace + recall_memory](concepts/memory.md) — ChromaDB-backed semantic memory: auto-recall before every turn + the `recall_memory` brain tool; storage path; stdout protection gotcha; failure modes.
 - [Brain sidecar (MLX-VLM)](concepts/brain-sidecar.md) — mlx-vlm 0.5.0 wrapper; Gemma `<|tool_call>` markers vs. fenced JSON extraction paths; image provider + KV/vision caches; model selection.
+- [Face tracker + face library](concepts/face-tracker.md) — Apple Vision detection on relay frames; EMA + critically-damped controller at 50 Hz; antenna twitch with ±10° rest; identity matching against the enrolled feature-print store.
+- [Telemetry pipeline](concepts/telemetry-pipeline.md) — `LogBus` actor + closed `TelemetryEvent` taxonomy + `MomentFeed` coalescence; what becomes a Moment and what stays in the Raw tab.
+- [State subscription](concepts/state-subscription.md) — daemon WebSocket pump (`StateSubscriber`) + outbound 50 Hz `TargetStreamer` with `setPrimaryMoveActive` suppression gate; the state-WS-not-in-OpenAPI quirk and the `target_*` vs. bare-keys wire shapes.
+- [Sidecar supervisor](concepts/sidecar-supervisor.md) — restart policy with exponential backoff + 60 s circuit breaker; stderr mirroring; non-JSON stdout tolerance; failure-mode triage table.
+- [FastPath — sub-second time-to-first-word](concepts/fast-path.md) — regex-based intent matcher that bypasses the brain for time/weather/calendar/search/remember/greeting.
 - [Tools registry](concepts/tools-registry.md) — schema/handler shape, dispatch path, fenced-JSON fallback for Gemma, inventory of the shipped tools.
 - [Permissions authority](concepts/permissions-authority.md) — single source of truth, 5-state enum, TCC + signing pitfalls, debug-binary trap.
 - [On-bot media relay](concepts/on-bot-media-relay.md) — `rocky_media_relay` Reachy Mini App + Mac-side WS subscribers; replaces WebRTC.

@@ -185,6 +185,11 @@
   },
   "active": "9376ad150d16ea19",
   "lastOpenFiles": [
+    "concepts/fast-path.md",
+    "concepts/sidecar-supervisor.md",
+    "concepts/state-subscription.md",
+    "concepts/telemetry-pipeline.md",
+    "concepts/face-tracker.md",
     "concepts/brain-sidecar.md",
     "concepts/memory.md",
     "concepts/tts-engines.md",

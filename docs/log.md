@@ -2,6 +2,22 @@
 
 Append-only chronological record. Each entry: `## [YYYY-MM-DD] <op> | <subject>`. Run `grep "^## \[" log.md | tail -20` for the recent timeline.
 
+## [2026-05-12] docs | Batch 3 of code-review backfill — supporting infrastructure
+
+Five new concept pages closing out the supporting-infrastructure gap. All grounded against current source via `file:line` citations.
+
+**`docs/concepts/face-tracker.md`** (new) — `MacFaceTracker` end-to-end: Vision detection on relay frames, EMA smoother (α=0.25), opt-in idle Lissajous, critically-damped 50 Hz controller with body-follow, independent Poisson antenna twitch with the ±10° anti-vibration rest, `FaceLibrary` feature-print matching, the `EnrollFaceForm` user flow including the pronunciation-test play-button.
+
+**`docs/concepts/telemetry-pipeline.md`** (new) — `LogBus` actor + closed `TelemetryEvent` taxonomy + `MomentFeed` narrative coalescence. Per-group event inventory, the STT→wake coalescence rule, brain-turn aggregation, sidecar-transition collapse, the "events that explicitly don't become moments" list. Includes the "switch exhaustiveness catches drift at build time" discipline.
+
+**`docs/concepts/state-subscription.md`** (new) — `StateSubscriber` + `TargetStreamer`. The state-WS-not-in-OpenAPI quirk (`/api/state/ws/full` only discoverable by knowing it exists), the `fullStateQuery` WITH_* parameters, `.bufferingNewest(64)` policy, exponential-ish reconnect backoff, the `control_mode`/`head_pose`/`antennas_position` wire-shape gotchas, `setPrimaryMoveActive` suppression gate, the `target_*` prefix vs. bare-keys distinction between `/set_target` and `/goto`.
+
+**`docs/concepts/sidecar-supervisor.md`** (new) — `SidecarSupervisor` lifecycle state diagram, restart policy with exponential backoff, 60 s circuit breaker (`enterCircuitBreak`), stderr mirroring for Console.app, `JSONLineCodec` resilience (non-JSON tolerance, partial-line accumulation, per-event error reporting), public API, failure-mode triage table.
+
+**`docs/concepts/fast-path.md`** (new) — `FastPath` actor: regex-anchored intent matching that bypasses the brain entirely for `time`, `weather`, `calendar`, `search`, `remember`, `greeting`. Wiring through `CognitionEngine.setFastPath`, the no-`llmRequest`-emitted telemetry behaviour, when NOT to use FastPath (multi-turn, tool composition, memory-dependent answers).
+
+Index entries added. This completes the three-batch backfill triggered by the user's loss-of-faith audit. Total: 14 new pages + significant expansion of voice-pipeline.md, all anchored against current code.
+
 ## [2026-05-12] docs | Batch 2 of code-review backfill — Python sidecars
 
 Three new concept pages covering the three substantive Python sidecars that were either undocumented or only briefly mentioned in cross-refs.
