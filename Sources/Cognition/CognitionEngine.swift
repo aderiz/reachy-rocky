@@ -336,9 +336,14 @@ public actor CognitionEngine {
                         ))
                         continuation.yield(.toolCallResult(result))
                     }
-                    // Post-turn write: append both sides of this exchange
-                    // to the palace as verbatim drawers. Fire-and-forget
-                    // so the user-facing latency is unaffected.
+                    // Post-turn write — fire-and-forget. Same helper
+                    // every other turn-exit path uses, so the write
+                    // discipline is consistent. The auto-say above
+                    // routes through registry.invoke("say", ...)
+                    // which would also be captured by the say-tool
+                    // path in writeTurnToMemory; here `calls` is
+                    // empty (we're in the no-LLM-tool-calls branch)
+                    // so the spoken text comes from `cleanedText`.
                     if let memory {
                         memory.recordDetached(role: .user, text: userText)
                         if !cleanedText.isEmpty {
@@ -405,6 +410,9 @@ public actor CognitionEngine {
                 continuation.yield(.error(
                     "model repeated identical tool calls; ending turn"
                 ))
+                Self.writeTurnToMemory(
+                    memory: memory, userText: userText, calls: calls
+                )
                 return
             }
             // End the turn once `say` has fired. After Rocky has
@@ -414,13 +422,50 @@ public actor CognitionEngine {
             // the chat and TTS diverge. The semantic contract is
             // "say IS the response"; nothing more is expected.
             if spokeThisTurn {
+                // CRITICAL: previously the post-turn memory write
+                // lived ONLY in the no-tools branch above, so every
+                // real reply (which always involves `say`) skipped
+                // memory recording. Only the brain's explicit
+                // `remember(...)` tool was landing data, leaving
+                // user statements like "my age is 44" unwritten.
+                // Persist the exchange before bailing.
+                Self.writeTurnToMemory(
+                    memory: memory, userText: userText, calls: calls
+                )
                 return
             }
             // Loop: feed tool outputs back to the model for another turn.
         }
 
         // Hit max rounds — surface a soft warning rather than hanging.
+        // Still record the exchange so the next session has the
+        // user's turn at least.
+        Self.writeTurnToMemory(memory: memory, userText: userText, calls: [])
         continuation.yield(.error("hit max tool rounds (\(config.maxToolRounds))"))
+    }
+
+    /// Append the user's turn + Rocky's spoken text (extracted from
+    /// the round's `say` tool calls, if any) to the memory palace.
+    /// Fire-and-forget; failures surface on the LogBus, never block
+    /// the user-facing reply path. Used by every turn-exit branch
+    /// in `runStream` so post-turn writes always happen regardless
+    /// of which path the brain took to end the turn.
+    private static func writeTurnToMemory(
+        memory: MemoryService?,
+        userText: String,
+        calls: [ToolCall]
+    ) {
+        guard let memory else { return }
+        memory.recordDetached(role: .user, text: userText)
+        for call in calls where call.function.name == "say" {
+            guard let data = call.function.arguments.data(using: .utf8),
+                  let parsed = try? JSONSerialization.jsonObject(with: data)
+                    as? [String: Any],
+                  let said = parsed["text"] as? String,
+                  !said.trimmingCharacters(in: .whitespaces).isEmpty
+            else { continue }
+            memory.recordDetached(role: .assistant, text: said)
+        }
     }
 
     // MARK: - Memory injection
