@@ -718,35 +718,32 @@ final class AppServices {
         // turns. No need to block boot on it.
         do {
             try await memory.start()
-            // Warm the embedding model on a detached task so the
-            // first user-facing recall doesn't pay the ChromaDB
+            // Warm the embedding model BEFORE returning from start()
+            // so the user's first recall doesn't pay the ChromaDB
             // lazy-init cost (~1.5–3 s for the COREML providers to
-            // load). Without this warm-up, the first recall after
-            // app launch frequently times out and the brain
-            // answers the user's first memory-question with no
-            // recall envelope — that's the "Rocky not know" symptom
-            // immediately after restart that the user has been
-            // reporting. Fire-and-forget; failures are non-fatal.
-            let warmMemory = memory
-            let warmBus = logBus
-            Task.detached(priority: .utility) {
-                let started = Date()
-                do {
-                    _ = try await warmMemory.initPalace()
-                    _ = try await warmMemory.recall(query: "warm-up", k: 1)
-                    let ms = Date().timeIntervalSince(started) * 1000
-                    await warmBus.publish(.sidecarLog(
-                        sidecar: "mempalace", level: .info,
-                        message: String(format: "embedding model warm in %.0f ms", ms),
-                        fields: [:]
-                    ))
-                } catch {
-                    await warmBus.publish(.sidecarLog(
-                        sidecar: "mempalace", level: .warn,
-                        message: "warm-up failed: \(error)",
-                        fields: [:]
-                    ))
-                }
+            // load). Earlier attempt used a detached task; that
+            // raced against the user's first turn and the recall
+            // still timed out under fast launches. Synchronous
+            // here adds ~2 s to app startup but guarantees recall
+            // is hot before the brain sees a query. Failures are
+            // non-fatal — fall through with logging and the
+            // existing 4 s timeout in CognitionEngine still gates.
+            let started = Date()
+            do {
+                _ = try await memory.initPalace()
+                _ = try await memory.recall(query: "warm-up", k: 1)
+                let ms = Date().timeIntervalSince(started) * 1000
+                await logBus.publish(.sidecarLog(
+                    sidecar: "mempalace", level: .info,
+                    message: String(format: "embedding model warm in %.0f ms", ms),
+                    fields: [:]
+                ))
+            } catch {
+                await logBus.publish(.sidecarLog(
+                    sidecar: "mempalace", level: .warn,
+                    message: "warm-up failed: \(error)",
+                    fields: [:]
+                ))
             }
         } catch {
             await logBus.publish(.error(scope: "app/memory",

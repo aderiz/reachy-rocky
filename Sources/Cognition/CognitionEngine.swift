@@ -534,9 +534,23 @@ public actor CognitionEngine {
             }
             return nil
         }
+        // Strip the `[role @ timestamp] ` prefix mempalace adds when
+        // storing drawers — the brain doesn't need it for the
+        // auto-recall envelope (the timestamps are confusing noise
+        // and small models occasionally read them aloud). The
+        // explicit `recall_memory` tool still returns the raw form
+        // for the brain's targeted searches.
         let formatted = hits
             .prefix(topK)
-            .map { "- " + $0.text.replacingOccurrences(of: "\n", with: " ") }
+            .map { hit -> String in
+                let text = hit.text.replacingOccurrences(of: "\n", with: " ")
+                let stripped = text.replacingOccurrences(
+                    of: #"^\[(?:user|assistant|system|tool) @ [^\]]+\]\s*"#,
+                    with: "",
+                    options: .regularExpression
+                )
+                return "- " + stripped
+            }
             .joined(separator: "\n")
         let body = """
         Rocky's memory of this user. These are real, persisted \
