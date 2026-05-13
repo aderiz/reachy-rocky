@@ -226,6 +226,59 @@ def handle_count(_params: dict) -> dict:
     return {"count": int(n)}
 
 
+def handle_list(params: dict) -> dict:
+    """List drawers in chronological order (most-recent first by
+    default). Used by the Memory tab to show what Rocky has stored
+    so the user can review + selectively delete entries. Distinct
+    from `recall` which is semantic — this is just a chronological
+    page.
+
+    Params:
+      limit: max drawers to return (default 50, capped at 500).
+      offset: pagination offset (default 0).
+    """
+    limit = int(params.get("limit") or 50)
+    limit = max(1, min(limit, 500))
+    offset = max(0, int(params.get("offset") or 0))
+    try:
+        result = _mcp.tool_list_drawers(
+            wing=WING, room=ROOM, limit=limit, offset=offset
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"drawers": [], "total": 0,
+                "error": f"list_drawers failed: {exc}"}
+    if not isinstance(result, dict):
+        return {"drawers": [], "total": 0}
+    raw = result.get("drawers") or result.get("results") or []
+    total = result.get("total") or result.get("count") or len(raw)
+    drawers = []
+    for d in raw:
+        if not isinstance(d, dict):
+            continue
+        drawers.append({
+            "id": d.get("id") or d.get("drawer_id") or "",
+            "text": d.get("text") or d.get("body") or "",
+            "role": d.get("role") or d.get("speaker") or "",
+            "ts": d.get("ts") or d.get("timestamp") or "",
+        })
+    return {"drawers": drawers, "total": int(total)}
+
+
+def handle_delete(params: dict) -> dict:
+    """Delete a single drawer by id. Used by the Memory tab's
+    per-row delete button.
+    """
+    drawer_id = (params.get("id") or params.get("drawer_id") or "").strip()
+    if not drawer_id:
+        return {"deleted": False, "error": "id required"}
+    try:
+        _mcp.tool_delete_drawer(drawer_id=drawer_id)
+        return {"deleted": True, "id": drawer_id}
+    except Exception as exc:  # noqa: BLE001
+        return {"deleted": False, "id": drawer_id,
+                "error": f"{type(exc).__name__}: {exc}"}
+
+
 def handle_forget_all(_params: dict) -> dict:
     """Delete every drawer in the wing/room. Wired to the destructive
     'Forget everything' button in Settings. Idempotent — safe to call
@@ -260,6 +313,8 @@ HANDLERS = {
     "recall": handle_recall,
     "health": handle_health,
     "count": handle_count,
+    "list": handle_list,
+    "delete": handle_delete,
     "forget_all": handle_forget_all,
 }
 

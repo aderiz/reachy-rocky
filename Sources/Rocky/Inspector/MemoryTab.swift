@@ -165,12 +165,18 @@ struct MemoryTab: View {
             } else {
                 VStack(spacing: 0) {
                     ForEach(recent, id: \.idOrText) { hit in
-                        DrawerRow(hit: hit,
-                                   expanded: expandedID == hit.idOrText)
-                            .onTapGesture {
-                                expandedID = expandedID == hit.idOrText
-                                    ? nil : hit.idOrText
+                        DrawerRow(
+                            hit: hit,
+                            expanded: expandedID == hit.idOrText,
+                            canDelete: hit.id != nil,
+                            onDelete: {
+                                Task { await deleteDrawer(hit) }
                             }
+                        )
+                        .onTapGesture {
+                            expandedID = expandedID == hit.idOrText
+                                ? nil : hit.idOrText
+                        }
                         if hit.idOrText != recent.last?.idOrText {
                             Divider()
                         }
@@ -266,15 +272,33 @@ struct MemoryTab: View {
         guard services.memorySidecarState == .ready else { return }
         await MainActor.run { loadingRecent = true }
         defer { Task { @MainActor in loadingRecent = false } }
-        // Bias the recall toward generic content rather than a specific
-        // query so we surface the most-recent drawers in roughly
-        // recency order (mempalace's search is semantic — the empty
-        // query is treated as "most recently added").
+        // Chronological list, not semantic recall. The previous
+        // `recall(query: " ")` returned zero hits because mempalace's
+        // semantic search doesn't handle whitespace queries — the
+        // Memory tab would then say "No drawers yet" even when
+        // `count` was non-zero.
         do {
-            let hits = try await services.memory.recall(query: " ", k: 8)
+            let hits = try await services.memory.listDrawers(limit: 50)
             await MainActor.run { recent = hits }
         } catch {
             await MainActor.run { recent = [] }
+        }
+    }
+
+    fileprivate func deleteDrawer(_ hit: MemoryService.Hit) async {
+        guard let id = hit.id else { return }
+        do {
+            _ = try await services.memory.deleteDrawer(id: id)
+            // Optimistic local removal so the row drops out
+            // immediately; loadRecent re-syncs from the truth.
+            await MainActor.run {
+                recent.removeAll { $0.idOrText == hit.idOrText }
+            }
+            await services.refreshMemoryCount()
+            await loadRecent()
+        } catch {
+            // Silent failure for now — non-fatal; user can retry
+            // or use Forget Everything as the nuclear option.
         }
     }
 }
@@ -284,6 +308,10 @@ struct MemoryTab: View {
 private struct DrawerRow: View {
     let hit: MemoryService.Hit
     let expanded: Bool
+    let canDelete: Bool
+    let onDelete: () -> Void
+
+    @State private var hovering: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -305,11 +333,23 @@ private struct DrawerRow: View {
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.tertiary)
                 }
+                if canDelete {
+                    Button(role: .destructive, action: onDelete) {
+                        Image(systemName: "trash")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.borderless)
+                    .opacity(hovering ? 1.0 : 0.0)
+                    .help("Forget this memory.")
+                }
             }
         }
         .contentShape(Rectangle())
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
+        .onHover { hovering = $0 }
+        .animation(.easeInOut(duration: 0.12), value: hovering)
     }
 }
 

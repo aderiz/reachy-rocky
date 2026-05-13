@@ -71,6 +71,44 @@ public actor MemoryService {
         )
     }
 
+    /// Chronological page through every drawer in the configured
+    /// wing/room. Distinct from `recall` (which is semantic) — this
+    /// returns the most-recent N entries in order so the Memory tab
+    /// can show what's actually stored. The Hit shape is reused for
+    /// rendering symmetry; `score` / `distance` are nil for listed
+    /// drawers.
+    public func listDrawers(limit: Int = 50, offset: Int = 0)
+        async throws -> [Hit]
+    {
+        struct P: Encodable, Sendable { let limit: Int; let offset: Int }
+        let resp: ListResponse = try await sidecar.send(
+            method: "list",
+            params: P(limit: limit, offset: offset)
+        )
+        return resp.drawers.map {
+            Hit(
+                text: $0.text,
+                score: nil,
+                distance: nil,
+                id: $0.id.isEmpty ? nil : $0.id
+            )
+        }
+    }
+
+    /// Delete a single drawer by id. Used by the per-row delete
+    /// button in the Memory tab so the user can prune individual
+    /// entries instead of nuking the whole palace via
+    /// `forgetAll()`.
+    @discardableResult
+    public func deleteDrawer(id: String) async throws -> Bool {
+        struct P: Encodable, Sendable { let id: String }
+        let resp: DeleteResponse = try await sidecar.send(
+            method: "delete",
+            params: P(id: id)
+        )
+        return resp.deleted
+    }
+
     /// Top-K semantically-similar drawers for a query. Pure read.
     public func recall(query: String, k: Int = 5) async throws -> [Hit] {
         struct P: Encodable, Sendable { let query: String; let k: Int }
@@ -153,6 +191,24 @@ public actor MemoryService {
         let deleted: Int
         let wing: String?
         let room: String?
+        let error: String?
+    }
+
+    private struct ListResponse: Decodable, Sendable {
+        struct DrawerRow: Decodable, Sendable {
+            let id: String
+            let text: String
+            let role: String
+            let ts: String
+        }
+        let drawers: [DrawerRow]
+        let total: Int
+        let error: String?
+    }
+
+    private struct DeleteResponse: Decodable, Sendable {
+        let deleted: Bool
+        let id: String?
         let error: String?
     }
 }
