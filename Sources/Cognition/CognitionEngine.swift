@@ -539,22 +539,25 @@ public actor CognitionEngine {
             .map { "- " + $0.text.replacingOccurrences(of: "\n", with: " ") }
             .joined(separator: "\n")
         let body = """
-        Background memories — Rocky's actual recollections of prior \
-        conversations with this user. They are real and you may rely \
-        on them.
+        Rocky's memory of this user. These are real, persisted \
+        facts from prior conversations — Rocky already knows them. \
+        Treat this list as ground truth.
 
-        How to use them:
-          • If the user asks what you remember about them, or asks \
-        about something you talked about before, cite the relevant \
-        items naturally in your own voice. Don't read raw timestamps \
-        or role tags aloud.
-          • For ordinary turns, let the memories inform your reply \
-        without forcing a citation — only mention them if they \
-        change what you'd say.
-          • If a memory contradicts something the user just said, \
-        prefer the new statement and treat the older memory as out \
-        of date.
-          • For deeper or more targeted searches, call the \
+        Rules:
+          1. If the user asks a recall question ("how old am I", \
+        "what's my name", "when is my birthday", "what do you \
+        remember about me", "do you know X"), the answer is in \
+        this list — find it and state it. Do NOT say "Rocky not \
+        know" or fall back to the camera frame to guess; the \
+        memory is more reliable than vision for facts the user \
+        previously stated.
+          2. Phrase the answer naturally in Rocky's voice. Don't \
+        read raw timestamps or role tags ("[user @ ...]", \
+        "[system @ ...]") aloud.
+          3. If a memory contradicts what the user just said, \
+        prefer the new statement and treat the older memory as \
+        out of date.
+          4. For deeper or more targeted searches, call the \
         `recall_memory` tool with a specific query.
 
         Memories:
