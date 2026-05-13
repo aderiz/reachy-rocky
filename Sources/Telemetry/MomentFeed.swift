@@ -225,7 +225,14 @@ public actor MomentFeed {
     private func emitHeardIfStillPending(text: String, at time: Date) {
         guard let pending = pendingHeard, pending.text == text else { return }
         pendingHeard = nil
-        push(Moment(timestamp: time, kind: .rockyHeard(text: text)))
+        // `rockyHeard` moments — STT finals that were never wake-
+        // matched — used to render in the activity strip as
+        // `Rocky heard: "..."`. They cluttered the UI with
+        // overheard noise + Whisper hallucinations (the
+        // `initial_prompt` regurgitation in particular looked like
+        // user speech). Drop them on the floor; the raw STT events
+        // still flow through LogBus → LogsView for diagnostics.
+        _ = time
     }
 
     // MARK: - Assistant turn flush

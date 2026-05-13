@@ -22,17 +22,6 @@ struct ConversationView: View {
     @State private var draft: String = ""
     @FocusState private var inputFocused: Bool
 
-    // Footer state lives here (not on CockpitView) because the
-    // footer is part of the conversation column per design §3.2 — it
-    // tracks the splitter when the user resizes columns. Keeping
-    // state with the view that owns it also avoids the long-window
-    // rendering bug where the Remember field stretched across the
-    // entire window.
-    @State private var rememberDraft: String = ""
-    @State private var rememberConfirmation: String?
-    @State private var pinNext: Bool = false
-    @State private var diagnoseShown: Bool = false
-
     var body: some View {
         VStack(spacing: 0) {
             HearingStrip()
@@ -47,90 +36,9 @@ struct ConversationView: View {
                 .padding(.vertical, 12)
             Divider().opacity(0.10)
             MomentStrip()
-            Divider().opacity(0.10)
-            footer
-                .padding(.horizontal, 24)
-                .padding(.vertical, 10)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.regularMaterial)
-    }
-
-    // MARK: - Footer (remember + diagnose)
-
-    private var footer: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            footerRow
-            if diagnoseShown {
-                DiagnoseStrip()
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-            }
-        }
-        .animation(.easeInOut(duration: 0.18), value: diagnoseShown)
-    }
-
-    private var footerRow: some View {
-        HStack(spacing: 10) {
-            Image(systemName: pinNext ? "pin.fill" : "pin")
-                .foregroundStyle(pinNext ? .yellow : .secondary)
-                .onTapGesture { pinNext.toggle() }
-                .help(pinNext
-                      ? "Pinned: this memory will always be recalled."
-                      : "Click to pin: always recall this memory.")
-
-            TextField("Remember: a fact, preference, or note Rocky should keep…",
-                      text: $rememberDraft)
-                .textFieldStyle(.roundedBorder)
-                // Cap so the field stays a compact input even when
-                // the conversation column is wide; the confirmation
-                // chip + Why-no-reply button sit beside it and we
-                // want them visible together.
-                .frame(maxWidth: 360)
-                .onSubmit { submitRemember() }
-
-            if let confirmation = rememberConfirmation {
-                Label(confirmation, systemImage: "checkmark.circle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.green)
-                    .transition(.opacity)
-            }
-
-            Spacer(minLength: 0)
-
-            Button {
-                diagnoseShown.toggle()
-            } label: {
-                Label(diagnoseShown ? "Hide diagnose" : "Why no reply?",
-                      systemImage: "stethoscope")
-            }
-            .buttonStyle(.borderless)
-            .controlSize(.small)
-            .help("Walk the mic / STT / wake / brain / TTS chain for the most recent utterance.")
-        }
-        .animation(.easeInOut(duration: 0.2), value: rememberConfirmation)
-    }
-
-    private func submitRemember() {
-        let text = rememberDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
-        let body = pinNext ? "[pinned] " + text : text
-        rememberDraft = ""
-        Task {
-            do {
-                _ = try await services.memory.record(role: .system, text: body)
-                await MainActor.run {
-                    rememberConfirmation = "Filed"
-                    pinNext = false
-                }
-                try? await Task.sleep(nanoseconds: 1_500_000_000)
-                await MainActor.run { rememberConfirmation = nil }
-                await services.refreshMemoryCount()
-            } catch {
-                await MainActor.run {
-                    rememberConfirmation = "failed: \(error)"
-                }
-            }
-        }
     }
 
     // MARK: - Transcript
