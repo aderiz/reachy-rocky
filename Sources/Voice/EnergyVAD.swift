@@ -41,14 +41,15 @@ public struct EnergyVAD: VAD {
         ///   still crosses it. The previous 0.015 was too strict and made
         ///   listen mode appear "stalled" (it never entered speech state
         ///   for someone not speaking close to the mic).
-        /// - minSilenceFrames 22 (~660 ms at 30 ms frames): the previous
-        ///   420 ms was clipping natural mid-sentence pauses, so the user
-        ///   would say "Rocky… [breath] what time is it" and the wake
-        ///   token landed on its own with no follow-up payload.
+        /// - minSilenceFrames 16 (~480 ms at 30 ms frames): the previous
+        ///   660 ms was the safest default but added perceptible lag to
+        ///   every turn. 480 ms still spans natural mid-sentence breaths
+        ///   on most users; longer pauses now split into two utterances
+        ///   (a worse failure than slower response, but rare in practice).
         public init(
             rmsThreshold: Float = 0.008,
             minSpeechFrames: Int = 3,
-            minSilenceFrames: Int = 22
+            minSilenceFrames: Int = 16
         ) {
             self.rmsThreshold = rmsThreshold
             self.minSpeechFrames = minSpeechFrames

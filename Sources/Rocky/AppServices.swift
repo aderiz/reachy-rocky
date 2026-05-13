@@ -757,6 +757,44 @@ final class AppServices {
         // to hot-swap without restarting Rocky.
         await applyBrainBackend()
 
+        // Brain pre-warm. Forces the model into memory + primes the
+        // KV cache with a one-token dummy turn so the user's first
+        // real question doesn't pay the cold-start cost (~500–
+        // 1000 ms for MLX-VLM 4B). Detached + short-circuited on
+        // success — no awaited wait on user-facing startup, but
+        // the model is loaded by the time the user finishes their
+        // first sentence. Failures are non-fatal; the first real
+        // turn just pays the warmup cost itself.
+        let warmBrain = await cognition.brain
+        let warmBus = logBus
+        Task.detached(priority: .utility) {
+            let started = Date()
+            let probe = ChatMessage(role: .user, content: "ok")
+            let stream = warmBrain.chatStream(
+                messages: [probe], tools: nil, image: nil
+            )
+            do {
+                for try await _ in stream {
+                    // Read one token to confirm prefill+decode hot,
+                    // then bail. We don't care about the response
+                    // content.
+                    break
+                }
+                let ms = Date().timeIntervalSince(started) * 1000
+                await warmBus.publish(.sidecarLog(
+                    sidecar: "brain", level: .info,
+                    message: String(format: "model warm in %.0f ms", ms),
+                    fields: [:]
+                ))
+            } catch {
+                await warmBus.publish(.sidecarLog(
+                    sidecar: "brain", level: .warn,
+                    message: "warm-up failed: \(error)",
+                    fields: [:]
+                ))
+            }
+        }
+
         // Pump LogBus events into MomentFeed and mirror new moments
         // back into the @Observable `recentMoments` slice for SwiftUI.
         // The two pumps run on detached Tasks so they survive any
