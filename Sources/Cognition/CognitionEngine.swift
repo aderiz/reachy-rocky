@@ -429,7 +429,16 @@ public actor CognitionEngine {
     /// message. Returns `nil` when memory is offline, recall fails, or
     /// no hits come back. Recall is bounded by `recallTimeoutS` so the
     /// LLM call isn't held up by a slow sidecar.
-    private static let recallTimeoutS: Double = 1.5
+    /// Recall budget. Wider than the original 1.5 s because the
+    /// mempalace sidecar lazy-loads its ChromaDB embedding model on
+    /// the first call per session ("Embedding function initialized"
+    /// on stderr). On a cold start that init can take 1.5–3 s by
+    /// itself, and a tight timeout silently drops the recall
+    /// envelope so the brain answers the first user turn with no
+    /// memory context. 4 s covers cold start with comfortable
+    /// headroom; warm recalls return in ~50–150 ms so this is only
+    /// a worst-case ceiling.
+    private static let recallTimeoutS: Double = 4.0
 
     private static func fetchRecallEnvelope(
         memory: MemoryService?,
@@ -441,6 +450,7 @@ public actor CognitionEngine {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count >= 3 else { return nil }
         let topK = max(1, min(k, 20))
+        let started = Date()
         let hits: [MemoryService.Hit]? = await withTaskGroup(
             of: [MemoryService.Hit]?.self
         ) { group in
@@ -455,7 +465,30 @@ public actor CognitionEngine {
             group.cancelAll()
             return first
         }
-        guard let hits, !hits.isEmpty else { return nil }
+        let elapsedMs = Date().timeIntervalSince(started) * 1000
+        guard let hits else {
+            // Distinguish "timed out" from "no hits" so the user can
+            // diagnose which side of the gate failed. Both end up
+            // injecting nothing, but only the timeout is a problem.
+            Task {
+                await logBus.publish(.sidecarLog(
+                    sidecar: "mempalace", level: .warn,
+                    message: String(format: "recall timed out after %.0f ms", elapsedMs),
+                    fields: ["query": trimmed]
+                ))
+            }
+            return nil
+        }
+        guard !hits.isEmpty else {
+            Task {
+                await logBus.publish(.sidecarLog(
+                    sidecar: "mempalace", level: .info,
+                    message: String(format: "recall returned 0 hits in %.0f ms", elapsedMs),
+                    fields: ["query": trimmed]
+                ))
+            }
+            return nil
+        }
         let formatted = hits
             .prefix(topK)
             .map { "- " + $0.text.replacingOccurrences(of: "\n", with: " ") }
@@ -482,11 +515,13 @@ public actor CognitionEngine {
         Memories:
         \(formatted)
         """
-        Task { await logBus.publish(.error(
-            scope: "memory.recall",
-            message: "injected \(hits.count) hit(s)",
-            recoverable: true
-        )) }
+        Task {
+            await logBus.publish(.sidecarLog(
+                sidecar: "mempalace", level: .info,
+                message: String(format: "recall %d hit(s) in %.0f ms", hits.count, elapsedMs),
+                fields: ["query": trimmed]
+            ))
+        }
         return ChatMessage(role: .system, content: body)
     }
 
