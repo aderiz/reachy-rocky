@@ -2,6 +2,18 @@
 
 Append-only chronological record. Each entry: `## [YYYY-MM-DD] <op> | <subject>`. Run `grep "^## \[" log.md | tail -20` for the recent timeline.
 
+## [2026-05-13] code | look_at_object tool — image-grounded head pointing
+
+New tool `look_at_object` in `Sources/Rocky/Tools/LookAtTool.swift`. Lets the user say "Rocky, look at the cup" when face tracking is off and have the head turn to the object.
+
+Pairs with the existing angle-based `look_at`: brain picks `look_at` when given an explicit angle ("look 30° left"), picks `look_at_object` when the target is visible in the current camera frame. The vision-capable brain (MLX-VLM with Qwen3-VL) locates the object in the JPEG it sees and passes normalised image coordinates `(x, y)` in `[0, 1]`. The tool reads the current head pose from `services.lastRobotState`, converts the coords to a yaw / pitch delta via the camera's 120° HFOV (VFOV derived from the input frame's aspect ratio, default 16:9), clamps to `SafetyLimits.headYawMax / headPitchMax`, sets `transitioningUntil` to suppress the face-tracker streamer for the move's duration, and issues a fast 0.7 s minjerk `goto`.
+
+When face tracking is off the head stays at the looked-at target (no streamer to pull it back). When face tracking is on the move plays then the face tracker resumes — accept that as the intended behaviour for an explicit one-shot look.
+
+7-case math test suite in `Tests/CognitionTests/LookAtMathTests.swift` covers centre / edges / corner / aspect-ratio sensitivity. Total suite 83 tests passing.
+
+Docs: `tools-registry.md` entry added; the existing `look_at` description tweaked to point at `look_at_object` for image-grounded calls.
+
 ## [2026-05-12] docs | Batch 3 of code-review backfill — supporting infrastructure
 
 Five new concept pages closing out the supporting-infrastructure gap. All grounded against current source via `file:line` citations.

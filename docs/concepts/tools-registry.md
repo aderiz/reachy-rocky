@@ -55,6 +55,7 @@ log bus. Registered eagerly during `AppServices` boot:
 | Tool                      | Purpose |
 |---------------------------|---------|
 | `look_at`                 | Orient the head to yaw/pitch (degrees), with a calm 1.2 s default duration. |
+| `look_at_object`          | Image-grounded variant of `look_at` — brain passes normalised `(x, y)` image coordinates of a target it can see in the current frame; the tool converts via the camera FOV and issues a fast minjerk `goto`. Use when the user says "look at the cup" rather than "look 30° left". See `Sources/Rocky/Tools/LookAtTool.swift`. |
 | `set_motor_mode`          | `enabled` / `disabled` / `gravity_compensation`. |
 | `wake_up`                 | Plays the recorded `wake_up` move. |
 | `go_to_sleep`             | Plays the recorded `goto_sleep` move. |

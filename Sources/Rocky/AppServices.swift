@@ -2420,9 +2420,16 @@ final class AppServices {
         let robot = robotLink
         let bus = logBus
 
+        // Image-grounded variant — call this when the user asks to
+        // look at something visible in the current camera frame
+        // ("look at the cup", "look over there at the book"). The
+        // brain locates the target in the frame it sees and passes
+        // normalised image coordinates; the tool handles FOV math.
+        await LookAtTool.register(in: toolRegistry, services: self)
+
         await toolRegistry.register(
             name: "look_at",
-            description: "Make Rocky orient his head toward a yaw/pitch in degrees. Yaw: -180..180 (positive = left). Pitch: -40..40 (positive = down). The default duration_s is deliberately slow (1.2s) for a calm, deliberate look — only specify shorter durations if the user explicitly asks for a quick glance.",
+            description: "Make Rocky orient his head toward a yaw/pitch in degrees. Yaw: -180..180 (positive = left). Pitch: -40..40 (positive = down). The default duration_s is deliberately slow (1.2s) for a calm, deliberate look — only specify shorter durations if the user explicitly asks for a quick glance. Use this when you have a specific angle in mind; if the user asks to look at something visible in the current camera frame, prefer `look_at_object` so you don't have to estimate the FOV yourself.",
             parameters: .object([
                 "type": .string("object"),
                 "properties": .object([
