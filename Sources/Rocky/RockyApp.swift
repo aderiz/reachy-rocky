@@ -142,18 +142,26 @@ struct RockyApp: App {
             }
         }
 
-        // Per the cockpit design (`docs/concepts/cockpit-design.md`),
-        // Settings lives in a real macOS Settings scene, not as a tab in
-        // the main window. ⌘, opens it from anywhere; the Settings entry
-        // disappears from the sidebar in a follow-up step.
+        // Settings as a real `Window` scene, not the macOS
+        // `Settings { }` scene. The latter is designed around a
+        // TabView with Form sections — its custom window chrome
+        // suppresses the title bar background and breaks
+        // NavigationSplitView's auto-laid sidebar toggle. A plain
+        // Window lets NavigationSplitView own the title bar
+        // (traffic-lights + sidebar-toggle + section title align on
+        // one row, just like System Settings does on macOS 14+).
         //
-        // Wave 1 ships the scene wrapping the existing SettingsView
-        // verbatim — no content changes. Wave 5 splits it into six
-        // tabs (Robot, Brain, Voice, Memory, Faces, Persona).
-        Settings {
+        // ⌘, is wired via a custom Button command below that uses
+        // `openWindow` to materialise this scene by id.
+        Window("Rocky Settings", id: SettingsView.windowID) {
             SettingsView()
                 .environment(services)
-                .frame(minWidth: 720, minHeight: 540)
+        }
+        .windowResizability(.contentMinSize)
+        .commands {
+            CommandGroup(replacing: .appSettings) {
+                SettingsMenuButton()
+            }
         }
 
         MenuBarExtra {

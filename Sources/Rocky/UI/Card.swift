@@ -59,10 +59,20 @@ struct CardHeader<Trailing: View>: View {
 }
 
 /// Compact pill — single styling rule for every status/badge in the app.
+///
+/// Animation behaviour:
+///   - Spring transition when the pill's text/tint changes (via
+///     `.animation(.snappy, value:)` on the container) so state
+///     changes don't visibly flicker.
+///   - When `pulse` is true, the SF Symbol pulses with
+///     `.symbolEffect(.pulse, options: .repeating)` — used for
+///     "Starting…" so the user gets a kinetic cue that work is
+///     happening.
 struct StatusPill: View {
     let text: String
     let tint: Color
     var systemImage: String? = nil
+    var pulse: Bool = false
 
     var body: some View {
         HStack(spacing: 4) {
@@ -70,12 +80,16 @@ struct StatusPill: View {
                 Image(systemName: systemImage)
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(tint)
+                    .symbolEffect(
+                        .pulse, options: .repeating, isActive: pulse
+                    )
             } else {
                 Circle().fill(tint).frame(width: 6, height: 6)
             }
             Text(text)
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.primary)
+                .contentTransition(.opacity)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
@@ -85,6 +99,45 @@ struct StatusPill: View {
         .overlay(
             Capsule().stroke(tint.opacity(0.25), lineWidth: 1)
         )
+        .animation(.snappy(duration: 0.25), value: tint)
+        .animation(.snappy(duration: 0.25), value: text)
+    }
+}
+
+extension StatusPill {
+    /// Semantic intent → consistent tint + default SF Symbol. Lets
+    /// callers (especially the Settings UI) avoid choosing colours
+    /// ad-hoc; "ok is always green, warn is always orange".
+    enum Intent: Sendable, Equatable {
+        case ok, pending, warn, bad, dormant
+
+        var tint: Color {
+            switch self {
+            case .ok: .green
+            case .pending: .secondary
+            case .warn: .orange
+            case .bad: .red
+            case .dormant: .gray
+            }
+        }
+
+        var defaultIcon: String {
+            switch self {
+            case .ok: "checkmark.circle.fill"
+            case .pending: "hourglass"
+            case .warn: "exclamationmark.triangle.fill"
+            case .bad: "xmark.circle.fill"
+            case .dormant: "circle.dashed"
+            }
+        }
+    }
+
+    /// Intent-based convenience init. Most callsites just want
+    /// "Engine X is in state Y" — this collapses tint + icon choice.
+    init(intent: Intent, text: String, systemImage: String? = nil) {
+        self.text = text
+        self.tint = intent.tint
+        self.systemImage = systemImage ?? intent.defaultIcon
     }
 }
 

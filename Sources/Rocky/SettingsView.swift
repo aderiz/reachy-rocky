@@ -11,37 +11,152 @@ import Perception
 
 /// Macroscopic shell for the macOS Settings scene. Per
 /// `docs/concepts/cockpit-design.md` §7, settings live in a separate
-/// window with six tabs (Robot, Brain, Voice, Memory, Faces, Persona).
-/// Apply-on-commit per field where safe; the robot endpoint is the
-/// sole exception (relaunch-required, so it stages with a dedicated
-/// Apply button).
+/// window organised as a sidebar of named sections + a detail pane.
+/// The sidebar follows System Settings conventions on macOS 14+:
+/// SF Symbol + label per row, current selection highlighted, smooth
+/// detail swap.
 ///
-/// Each tab body uses `Form` for native macOS spacing and label
-/// alignment. The tabs all share the surrounding `TabView`'s padding
-/// and the same minimum width so switching tabs doesn't reflow the
-/// window.
+/// Why NavigationSplitView vs the old TabView: nine sections fit
+/// cleanly in a list (would crowd a tab bar), each section gets the
+/// full width of the detail pane (Voice tab used to scroll because
+/// five subsystems were stacked vertically), and the URL of the
+/// active section is one piece of state we can preserve.
+///
+/// Each section body uses `Form` for native macOS spacing and label
+/// alignment, wrapped in `formStyle(.grouped)` for the inset-card
+/// look. Hot-apply per field where safe; the robot endpoint stays
+/// staged behind an Apply button because URLSession + sidecars
+/// can't pick up an endpoint change without a relaunch.
 struct SettingsView: View {
+    /// Stable id used by `Window(id:)` registration and the
+    /// `openWindow(id:)` action that the Settings menu Button calls.
+    /// Kept here (not in RockyApp) so the registration site and the
+    /// open-action share a single string with no risk of drift.
+    static let windowID: String = "rocky-settings"
+
     @Environment(AppServices.self) private var services
+    @State private var selection: SettingsSection = .robot
 
     var body: some View {
-        TabView {
-            RobotSettingsTab()
-                .tabItem { Label("Robot", systemImage: "antenna.radiowaves.left.and.right") }
-            BrainSettingsTab()
-                .tabItem { Label("Brain", systemImage: "brain") }
-            VoiceSettingsTab()
-                .tabItem { Label("Voice", systemImage: "speaker.wave.2") }
-            MemorySettingsTab()
-                .tabItem { Label("Memory", systemImage: "tray.full") }
-            FacesSettingsTab()
-                .tabItem { Label("Faces", systemImage: "person.crop.rectangle.stack") }
-            PersonaSettingsTab()
-                .tabItem { Label("Persona", systemImage: "text.quote") }
-            PermissionsSettingsTab()
-                .tabItem { Label("Permissions", systemImage: "checkmark.shield") }
+        NavigationSplitView {
+            List(SettingsSection.allCases, selection: $selection) { section in
+                NavigationLink(value: section) {
+                    Label {
+                        Text(section.title)
+                    } icon: {
+                        Image(systemName: section.symbol)
+                            .symbolRenderingMode(.hierarchical)
+                            .foregroundStyle(section.tint)
+                    }
+                }
+                .listRowSeparator(.hidden)
+            }
+            .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 240)
+            .listStyle(.sidebar)
+        } detail: {
+            // Section content swaps with a directional slide so the
+            // user gets a kinetic cue about which way they moved
+            // through the sidebar.
+            SectionDetail(section: selection)
+                .id(selection)
+                .transition(.asymmetric(
+                    insertion: .move(edge: .trailing).combined(with: .opacity),
+                    removal: .move(edge: .leading).combined(with: .opacity)
+                ))
+                .navigationTitle(selection.title)
+                .frame(minWidth: 520)
         }
-        .padding(20)
-        .frame(minWidth: 580, minHeight: 460)
+        .frame(minWidth: 740, minHeight: 480)
+        .animation(.snappy(duration: 0.22), value: selection)
+    }
+}
+
+/// One enum, one switch — every section is reachable from here.
+/// Adding a new section means: case in the enum, view in the switch,
+/// done. No tab-bar crowding to worry about.
+enum SettingsSection: String, CaseIterable, Identifiable, Hashable {
+    case robot, brain, listen, speak, memory, faces, persona, display, permissions
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .robot:        "Robot"
+        case .brain:        "Brain"
+        case .listen:       "Listen"
+        case .speak:        "Speak"
+        case .memory:       "Memory"
+        case .faces:        "Faces"
+        case .persona:      "Persona"
+        case .display:      "Display"
+        case .permissions:  "Permissions"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .robot:        "antenna.radiowaves.left.and.right"
+        case .brain:        "brain"
+        case .listen:       "ear.fill"
+        case .speak:        "speaker.wave.2.fill"
+        case .memory:       "tray.full"
+        case .faces:        "person.crop.rectangle.stack"
+        case .persona:      "text.quote"
+        case .display:      "rectangle.on.rectangle"
+        case .permissions:  "checkmark.shield"
+        }
+    }
+
+    /// Section-specific accent for the sidebar icon. Each section
+    /// gets its own hue so the user can recognise it at a glance
+    /// — and the `.hierarchical` rendering mode picks up these
+    /// tints across the SF Symbol's layered glyphs.
+    var tint: Color {
+        switch self {
+        case .robot:        .teal
+        case .brain:        .purple
+        case .listen:       .blue
+        case .speak:        .indigo
+        case .memory:       .orange
+        case .faces:        .pink
+        case .persona:      .yellow
+        case .display:      .mint
+        case .permissions:  .green
+        }
+    }
+}
+
+/// `Settings…` menu item. Lives inside a SwiftUI view so it can use
+/// `@Environment(\.openWindow)` to materialise the settings window
+/// scene — `App.commands` itself doesn't have access to that
+/// environment, but a view used inside a `CommandGroup` does.
+struct SettingsMenuButton: View {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Button("Settings…") {
+            NSApp.activate(ignoringOtherApps: true)
+            openWindow(id: SettingsView.windowID)
+        }
+        .keyboardShortcut(",", modifiers: [.command])
+    }
+}
+
+private struct SectionDetail: View {
+    let section: SettingsSection
+
+    var body: some View {
+        switch section {
+        case .robot:        RobotSettingsTab()
+        case .brain:        BrainSettingsTab()
+        case .listen:       ListenSettingsTab()
+        case .speak:        SpeakSettingsTab()
+        case .memory:       MemorySettingsTab()
+        case .faces:        FacesSettingsTab()
+        case .persona:      PersonaSettingsTab()
+        case .display:      DisplaySettingsTab()
+        case .permissions:  PermissionsSettingsTab()
+        }
     }
 }
 
@@ -185,7 +300,24 @@ private struct BrainSettingsTab: View {
 
     var body: some View {
         Form {
-            backendSection
+            EnginePicker(
+                title: "Backend",
+                selection: Binding(
+                    get: { services.settings.brainBackend },
+                    set: { newValue in
+                        services.settings.brainBackend = newValue
+                        Task { await services.applyBrainBackend() }
+                    }
+                ),
+                options: [
+                    ("auto",      "Auto — MLX-VLM if installed, else LM Studio"),
+                    ("mlx-vlm",   "MLX-VLM (native MLX, vision-aware)"),
+                    ("lm-studio", "LM Studio (HTTP, text-only)"),
+                ],
+                activeBadge: { StatusPill(sidecar: services.brainSidecarState) },
+                restart: { @Sendable in await services.applyBrainBackend() },
+                footer: "MLX-VLM runs natively on Apple Silicon — no HTTP hop, vision-aware, native tool calling. Auto picks MLX-VLM when the brain sidecar venv is installed."
+            )
             switch services.settings.brainBackend {
             case "lm-studio":
                 lmStudioSection
@@ -196,7 +328,6 @@ private struct BrainSettingsTab: View {
                 lmStudioSection
             }
             webSearchSection
-            conversationDisplaySection
             statusSection
         }
         .formStyle(.grouped)
@@ -207,33 +338,6 @@ private struct BrainSettingsTab: View {
             showingCustomMlxField = !Self.mlxModelOptions.contains {
                 $0.id == services.settings.brainModel
             }
-        }
-    }
-
-    // MARK: - Backend picker
-
-    private var backendSection: some View {
-        Section {
-            Picker("Backend", selection: Binding(
-                get: { services.settings.brainBackend },
-                set: { newValue in
-                    services.settings.brainBackend = newValue
-                    Task { await services.applyBrainBackend() }
-                }
-            )) {
-                Text("Auto — MLX-VLM if installed, else LM Studio")
-                    .tag("auto")
-                Text("MLX-VLM (native MLX, vision-aware)")
-                    .tag("mlx-vlm")
-                Text("LM Studio (HTTP, text-only)")
-                    .tag("lm-studio")
-            }
-        } header: {
-            Text("Brain")
-        } footer: {
-            Text("Auto picks MLX-VLM when the brain sidecar venv is installed (`Sidecars/brain/setup.sh`). MLX-VLM runs natively on Apple Silicon — no HTTP hop, vision-aware, native tool calling.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
         }
     }
 
@@ -283,48 +387,13 @@ private struct BrainSettingsTab: View {
                 }
             }
 
-            LabeledContent("Sidecar status") {
-                brainSidecarStatusLabel
-            }
-            HStack {
-                Spacer()
-                Button {
-                    Task { await services.applyBrainBackend() }
-                } label: {
-                    Label("Restart brain", systemImage: "arrow.clockwise")
-                }
-            }
         } header: {
-            Text("MLX-VLM")
+            Text("MLX-VLM model")
         } footer: {
-            Text("Custom field accepts EITHER a Hugging Face repo id (`mlx-community/…`) OR a local filesystem path (e.g. `/Users/you/Models/Qwen3-VL-4B`, or `~/Models/…`). Use **Choose folder…** to browse for a local directory. HF-id first-run downloads ~2.5 GB of weights into ~/.cache/huggingface/. Switching models hot-swaps the sidecar — the next chat uses the new model. Restart Brain manually if the sidecar got into a bad state.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    @ViewBuilder
-    private var brainSidecarStatusLabel: some View {
-        let state = services.brainSidecarState
-        switch state {
-        case .ready:
-            Label("Ready", systemImage: "checkmark.circle.fill")
-                .foregroundStyle(.green)
-        case .starting:
-            Label("Starting…", systemImage: "hourglass")
-                .foregroundStyle(.secondary)
-        case .stopped:
-            Label("Not running", systemImage: "circle.dashed")
-                .foregroundStyle(.secondary)
-        case .failing(let r):
-            Label("Failing: \(r)", systemImage: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
-                .lineLimit(2)
-        case .circuitOpen(let until):
-            Label("Backing off until \(until.formatted(.dateTime.hour().minute().second()))",
-                  systemImage: "exclamationmark.octagon")
-                .foregroundStyle(.orange)
-                .lineLimit(2)
+            LearnMoreFooter(
+                summary: "Switching models hot-swaps the sidecar — the next chat uses the new model.",
+                detail: "Custom field accepts EITHER a Hugging Face repo id (`mlx-community/…`) OR a local filesystem path (e.g. `/Users/you/Models/Qwen3-VL-4B`, or `~/Models/…`). Use **Choose folder…** to browse for a local directory. HF-id first-run downloads ~2.5 GB of weights into ~/.cache/huggingface/. If the sidecar gets into a bad state, click the restart icon next to the Active pill in the Backend section above."
+            )
         }
     }
 
@@ -372,35 +441,6 @@ private struct BrainSettingsTab: View {
             Text("Used by the `search_web` tool. Free tier allows 1 query/sec; leave blank to disable web search.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
-        }
-    }
-
-    // MARK: - Conversation display
-
-    private var conversationDisplaySection: some View {
-        Section {
-            Toggle("Show tool calls in chat",
-                   isOn: Binding(
-                       get: { services.settings.showToolCalls },
-                       set: { services.settings.showToolCalls = $0 }
-                   ))
-            Toggle("Profiling mode",
-                   isOn: Binding(
-                       get: { services.settings.profilingEnabled },
-                       set: { newValue in
-                           services.settings.profilingEnabled = newValue
-                           Task { await services.applySettings() }
-                       }
-                   ))
-        } header: {
-            Text("Conversation")
-        } footer: {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("When off, the small `⌘ → tool · args` and `⌘ ← tool (ok, Nms) · result` lines are hidden between bubbles. Tool activity is still recorded in the Activity tab and the log.")
-                Text("Profiling mode emits one end-to-end timing line per turn to the Logs view: VAD → STT → AddressFilter → brain → tools → TTS, so you can see exactly where the latency is.")
-            }
-            .font(.footnote)
-            .foregroundStyle(.secondary)
         }
     }
 
@@ -512,109 +552,87 @@ private struct BrainSettingsTab: View {
     }
 }
 
-// MARK: - Voice tab
+// MARK: - Listen section
 
-/// Microphone source + TTS engine + speaker volume. Source / engine
-/// changes are saved instantly but only take effect on the next listen
-/// toggle / next launch (the underlying sidecars hold the original
-/// configuration); the volume slider applies live via PCM scaling
-/// during synthesis.
-private struct VoiceSettingsTab: View {
+/// Everything in the audio → text path: mic source, VAD engine + threshold,
+/// STT engine, wake word. Was the top half of the old Voice tab; split out
+/// so users tuning latency can find every relevant control on one screen
+/// without scrolling past TTS settings.
+private struct ListenSettingsTab: View {
     @Environment(AppServices.self) private var services
     @State private var calibrating: Bool = false
 
     var body: some View {
+        // @Bindable on an @Observable class gives us free Binding
+        // projection via $settings.foo — replaces ~20 lines of
+        // hand-rolled Binding(get:set:) helpers that used to live in
+        // this tab.
+        @Bindable var settings = services.settings
         Form {
             Section {
-                Picker("Source", selection: micSourceBinding) {
+                Picker("Source", selection: $settings.micSource) {
                     Text("Robot mic (Reachy 4-mic array)").tag("robot")
                     Text("Mac mic (built-in / system)").tag("mac")
                 }
             } header: {
                 Text("Microphone")
             } footer: {
-                Text("Robot mic uses Reachy's 4-mic ReSpeaker array via WebRTC. " +
-                     "Run ./Sidecars/robot-mic/setup.sh once. Source change " +
-                     "applies on the next Listen toggle.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                LearnMoreFooter(
+                    summary: "Robot mic uses Reachy's 4-mic ReSpeaker array via WebRTC. Source change applies on the next Listen toggle.",
+                    detail: "Run `./Sidecars/robot-mic/setup.sh` once to install the WebRTC + reachy_mini SDK venv. The Mac mic path bypasses the robot entirely — useful when working without the bot on the desk."
+                )
             }
 
+            EnginePicker(
+                title: "Voice activity detection",
+                selection: $settings.vadEngine,
+                options: [
+                    ("auto",   "Auto — Silero if installed, else Energy"),
+                    ("silero", "Silero VAD (CoreML, ML-based)"),
+                    ("energy", "Energy threshold (RMS, simplest)"),
+                ],
+                activeBadge: { vadActiveBadge },
+                footer: "Engine change applies on next Listen toggle. Threshold and silence-wait are tuned in the sensitivity row below.",
+                learnMore: "Silero recognises speech (pitched, formant-shaped) and ignores chair scrapes, fan ticks, mouse clicks. Run `./scripts/download-models.sh silero` to install the CoreML model. Threshold semantics differ between engines (RMS for Energy, probability for Silero)."
+            )
+
             Section {
-                Picker("VAD engine", selection: vadEngineBinding) {
-                    Text("Auto — Silero if installed, else Energy").tag("auto")
-                    Text("Silero VAD (CoreML, ML-based)").tag("silero")
-                    Text("Energy threshold (RMS, simplest)").tag("energy")
-                }
                 MicSensitivityRow(calibrating: $calibrating)
             } header: {
-                Text("Voice activity detection")
-            } footer: {
-                Text("Silero recognises speech (pitched, formant-shaped) and ignores chair scrapes, fan ticks, mouse clicks. Run `./scripts/download-models.sh silero` to install the CoreML model. Engine change applies on next Listen toggle. Threshold semantics differ between engines (RMS for Energy, probability for Silero).")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                Text("Sensitivity")
             }
 
-            Section {
-                Picker("STT engine", selection: sttEngineBinding) {
-                    Text("Auto — Race Apple Speech + MLX-Whisper").tag("auto")
-                    Text("MLX-Whisper (whisper-small-mlx, via sidecar)").tag("mlx-whisper")
-                    Text("WhisperKit (whisper-large-v3-turbo, CoreML)").tag("whisperkit")
-                    Text("Apple Speech (SFSpeechRecognizer)").tag("apple")
-                }
-            } header: {
-                Text("Speech-to-text")
-            } footer: {
-                Text("Auto races Apple Speech (typically ~100 ms on clean speech, on-device on macOS 13+) against MLX-Whisper (~250–500 ms, more accurate on noisy / distant speech); the first non-empty transcript wins. MLX-Whisper alone runs whisper-small-mlx via the mlx-stt sidecar (~470 MB on first transcribe; set ROCKY_STT_MODEL for a bigger model). WhisperKit uses CoreML weights at ~700 MB. Apple Speech is the system fallback. Engine change applies on next launch.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            }
+            EnginePicker(
+                title: "Speech-to-text",
+                selection: $settings.sttEngine,
+                options: [
+                    ("auto",        "Auto — Race Apple Speech + MLX-Whisper"),
+                    ("mlx-whisper", "MLX-Whisper (whisper-small-mlx, via sidecar)"),
+                    ("whisperkit",  "WhisperKit (whisper-large-v3-turbo, CoreML)"),
+                    ("apple",       "Apple Speech (SFSpeechRecognizer)"),
+                ],
+                activeBadge: { sttActiveBadge },
+                footer: "Auto races Apple Speech against MLX-Whisper — first non-empty transcript wins. Engine change applies on next launch.",
+                learnMore: "Apple Speech typically lands in ~100 ms on clean speech (on-device on macOS 13+). MLX-Whisper takes ~250–500 ms but handles noisy / distant speech better. MLX-Whisper alone runs whisper-small-mlx (~470 MB on first transcribe; set ROCKY_STT_MODEL for a bigger model). WhisperKit uses CoreML weights at ~700 MB. Apple Speech is the system fallback."
+            )
 
             Section {
-                TextField("Wake phrase", text: wakeWordBinding,
+                TextField("Wake phrase", text: lowercasedBinding($settings.wakeWord),
                           prompt: Text("rocky"))
-                Picker("Wake engine", selection: wakeEngineBinding) {
+                Picker("Wake engine", selection: $settings.wakeEngine) {
                     Text("STT-derived (uses transcript)").tag("stt")
                     Text("Porcupine (placeholder — not yet integrated)")
                         .tag("porcupine")
                 }
                 Toggle("Wake on chassis tap / loud sound",
-                       isOn: wakeOnPatBinding)
+                       isOn: $settings.wakeOnPat)
             } header: {
                 Text("Wake word")
             } footer: {
-                Text("Lower-case stored. STT-derived is the v0.1 path: WakeFilter pattern-matches the wake phrase in the final transcript. Porcupine slot is reserved for a future dedicated keyword spotter (97% accuracy, ~50 ms latency). Wake-phrase change applies on next launch.\n\nWake-on-tap routes any loud sound (RMS > 0.03) into a wake. Off by default — the on-robot mic hears Rocky's own goodnight TTS and ambient noise, which immediately undoes a sleep command.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section {
-                Picker("TTS engine", selection: ttsBackendBinding) {
-                    Text("Chatterbox 8-bit (fastest, 0.15× RTF) — recommended")
-                        .tag("chatterbox")
-                    Text("Qwen3-TTS-12Hz 1.7B (multilingual, 0.36× RTF in 8-bit)")
-                        .tag("qwen3-tts")
-                    Text("Fish Audio S2 Pro (high-quality clone, ~1× RTF)")
-                        .tag("fish-audio")
-                }
-                HStack {
-                    TextField("HF model id (blank = engine default)",
-                              text: ttsModelBinding)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.body.monospaced())
-                        .help("Hugging Face repo id of the TTS model — e.g. mlx-community/chatterbox-8bit, mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16. Leave empty to use the engine's built-in default.")
-                    Button("Clear") {
-                        services.settings.ttsModel = ""
-                    }
-                    .disabled(services.settings.ttsModel.isEmpty)
-                }
-                BotVolumeSlider()
-            } header: {
-                Text("Voice (TTS)")
-            } footer: {
-                Text("RTF = wall-time-to-synth ÷ audio-duration (lower = faster). Chatterbox 8-bit is the fastest cloning model and the default. The HF model id field overrides the engine's built-in model so you can point to any compatible repo on the same engine (e.g. another chatterbox variant). All engines pick up the reference clone from `~/Library/Application Support/Rocky/voice/sample.wav` + `sample.txt`. Engine and model changes apply on next launch.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                LearnMoreFooter(
+                    summary: "Lower-case stored. Wake-phrase change applies on next launch.",
+                    detail: "STT-derived is the v0.1 path: WakeFilter pattern-matches the wake phrase in the final transcript. Porcupine slot is reserved for a future dedicated keyword spotter (97% accuracy, ~50 ms latency).\n\nWake-on-tap routes any loud sound (RMS > 0.03) into a wake. Off by default — the on-robot mic hears Rocky's own goodnight TTS and ambient noise, which immediately undoes a sleep command."
+                )
             }
         }
         .formStyle(.grouped)
@@ -624,54 +642,148 @@ private struct VoiceSettingsTab: View {
         }
     }
 
-    private var micSourceBinding: Binding<String> {
-        let store = services.settings
-        return Binding(get: { store.micSource },
-                       set: { store.micSource = $0 })
-    }
-
-    private var ttsBackendBinding: Binding<String> {
-        let store = services.settings
-        return Binding(get: { store.ttsBackend },
-                       set: { store.ttsBackend = $0 })
-    }
-
-    private var ttsModelBinding: Binding<String> {
-        let store = services.settings
-        return Binding(get: { store.ttsModel },
-                       set: { store.ttsModel = $0 })
-    }
-
-    private var vadEngineBinding: Binding<String> {
-        let store = services.settings
-        return Binding(get: { store.vadEngine },
-                       set: { store.vadEngine = $0 })
-    }
-
-    private var sttEngineBinding: Binding<String> {
-        let store = services.settings
-        return Binding(get: { store.sttEngine },
-                       set: { store.sttEngine = $0 })
-    }
-
-    private var wakeWordBinding: Binding<String> {
-        let store = services.settings
-        return Binding(
-            get: { store.wakeWord },
-            set: { store.wakeWord = $0.lowercased() }
+    /// Tiny adapter that runs `.lowercased()` on values written through
+    /// a String binding. Used by the wake-phrase field so the user can
+    /// type any case but the stored value stays normalised.
+    private func lowercasedBinding(_ source: Binding<String>) -> Binding<String> {
+        Binding(
+            get: { source.wrappedValue },
+            set: { source.wrappedValue = $0.lowercased() }
         )
     }
 
-    private var wakeOnPatBinding: Binding<Bool> {
-        let store = services.settings
-        return Binding(get: { store.wakeOnPat },
-                       set: { store.wakeOnPat = $0 })
+    @ViewBuilder
+    private var vadActiveBadge: some View {
+        // The VAD engine is resolved at Listen-toggle time, not exposed
+        // as a published name yet — fall back to inferring from the
+        // settings preference until AppServices surfaces it. (Future:
+        // publish `activeVADName` alongside sttBackendName.)
+        let pref = services.settings.vadEngine
+        let label: String = {
+            switch pref {
+            case "silero": "Silero (CoreML)"
+            case "energy": "Energy (RMS)"
+            default:       "Auto"
+            }
+        }()
+        StatusPill(intent: .ok, text: label)
     }
 
-    private var wakeEngineBinding: Binding<String> {
-        let store = services.settings
-        return Binding(get: { store.wakeEngine },
-                       set: { store.wakeEngine = $0 })
+    @ViewBuilder
+    private var sttActiveBadge: some View {
+        StatusPill(intent: .ok, text: services.sttBackendName)
+    }
+}
+
+// MARK: - Speak section
+
+/// Everything in the text → audio path: TTS engine, model override,
+/// reference clip, speaker volume. Was the bottom half of the old
+/// Voice tab.
+private struct SpeakSettingsTab: View {
+    @Environment(AppServices.self) private var services
+
+    var body: some View {
+        @Bindable var settings = services.settings
+        Form {
+            EnginePicker(
+                title: "Text-to-speech",
+                selection: $settings.ttsBackend,
+                options: [
+                    ("chatterbox", "Chatterbox 8-bit (fastest, 0.15× RTF) — recommended"),
+                    ("qwen3-tts",  "Qwen3-TTS-12Hz 1.7B (multilingual, 0.36× RTF in 8-bit)"),
+                    ("fish-audio", "Fish Audio S2 Pro (high-quality clone, ~1× RTF)"),
+                ],
+                activeBadge: { ttsActiveBadge },
+                footer: "RTF = wall-time-to-synth ÷ audio-duration. Lower = faster. Engine change applies on next launch.",
+                learnMore: "Chatterbox 8-bit is the fastest cloning model and the default. The HF model id field below overrides the engine's built-in model so you can point to any compatible repo on the same engine. All engines pick up the reference clone from `~/Library/Application Support/Rocky/voice/sample.wav` + `sample.txt`."
+            )
+
+            Section {
+                HStack {
+                    TextField("HF model id (blank = engine default)",
+                              text: $settings.ttsModel)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.body.monospaced())
+                        .help("Hugging Face repo id of the TTS model — e.g. mlx-community/chatterbox-8bit, mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16. Leave empty to use the engine's built-in default.")
+                    Button("Clear") {
+                        settings.ttsModel = ""
+                    }
+                    .disabled(settings.ttsModel.isEmpty)
+                }
+            } header: {
+                Text("Model override")
+            } footer: {
+                Text("Leave blank to use the engine's built-in default. Applies on next launch.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                BotVolumeSlider()
+            } header: {
+                Text("Robot speaker")
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    @ViewBuilder
+    private var ttsActiveBadge: some View {
+        // TTS sidecar doesn't surface a unified state field; show the
+        // user's preference as the active engine.
+        let label: String = {
+            switch services.settings.ttsBackend {
+            case "chatterbox": "Chatterbox"
+            case "qwen3-tts":  "Qwen3-TTS"
+            case "fish-audio": "Fish S2 Pro"
+            default:           services.settings.ttsBackend
+            }
+        }()
+        StatusPill(intent: .ok, text: label)
+    }
+}
+
+// MARK: - Display section
+
+/// Toggles that control what's shown in the cockpit/Activity tab.
+/// Used to live in the Brain tab — but they're about UI presentation,
+/// not brain config, so they get their own small section.
+private struct DisplaySettingsTab: View {
+    @Environment(AppServices.self) private var services
+
+    var body: some View {
+        @Bindable var settings = services.settings
+        Form {
+            Section {
+                Toggle("Show tool calls in chat",
+                       isOn: $settings.showToolCalls)
+            } header: {
+                Text("Conversation")
+            } footer: {
+                Text("When off, the small `⌘ → tool · args` and `⌘ ← tool (ok, Nms) · result` lines are hidden between bubbles. Tool activity is still recorded in the Activity tab and the log.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle("Profiling mode",
+                       isOn: Binding(
+                           get: { settings.profilingEnabled },
+                           set: { newValue in
+                               settings.profilingEnabled = newValue
+                               Task { await services.applySettings() }
+                           }
+                       ))
+            } header: {
+                Text("Profiling")
+            } footer: {
+                Text("Emits one end-to-end timing line per turn to the Logs view: VAD → STT → AddressFilter → brain → tools → TTS, so you can see exactly where the latency is.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
     }
 }
 
@@ -1101,22 +1213,49 @@ private struct MicSensitivityRow: View {
     @Environment(AppServices.self) private var services
     @Binding var calibrating: Bool
 
+    /// Rolling RMS history — 3 s at 30 fps = 90 samples. Pushed by
+    /// the TimelineView ticker below. Local @State so the buffer
+    /// survives view redraws but resets when the settings tab is
+    /// re-opened.
+    @State private var history: [Float] = Array(repeating: 0, count: 90)
+
+    private static let historyCapacity: Int = 90  // 3 s × 30 fps
+
     var body: some View {
         let threshold = services.settings.micVADThreshold
         let previous = services.settings.micVADThresholdPrevious
         let canRevert = abs(previous - threshold) > 0.0001
-        let live = Double(services.lastMicRMS)
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
-                SectionLabel(text: "VAD threshold")
+                Text("VAD threshold")
+                    .font(.callout)
                 Spacer()
                 Text(String(format: "%.4f", threshold))
                     .font(.caption.monospacedDigit().weight(.medium))
+                    .contentTransition(.numericText())
+                    .animation(.snappy(duration: 0.15), value: threshold)
                     .foregroundStyle(.primary)
-                Text(String(format: "live %.4f", live))
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(live >= threshold ? .green : .secondary)
             }
+
+            // Live VU meter. TimelineView drives the 30 fps tick;
+            // each tick pushes the current mic RMS into the rolling
+            // history and the Canvas inside `VUMeter` re-renders.
+            TimelineView(.periodic(from: .now, by: 1.0 / 30.0)) { _ in
+                MicVUMeter(
+                    current: services.lastMicRMS,
+                    threshold: Float(threshold),
+                    history: history
+                )
+                .onChange(of: services.lastMicRMS) { _, newValue in
+                    appendSample(newValue)
+                }
+                // First-tick sample so the meter doesn't sit flat
+                // for the first frame after appearance.
+                .task(id: services.lastMicRMS) {
+                    appendSample(services.lastMicRMS)
+                }
+            }
+
             Slider(
                 value: Binding(
                     get: { services.settings.micVADThreshold },
@@ -1137,8 +1276,9 @@ private struct MicSensitivityRow: View {
             } maximumValueLabel: {
                 Text("quiet").font(.caption2).foregroundStyle(.secondary)
             }
+
             HStack {
-                Text("Watch the \u{201C}live\u{201D} number while speaking — it should sit comfortably above the threshold for normal speech and drop below it during silence.")
+                Text("Speak normally — the live waveform should sit comfortably above the orange threshold line, then drop below it during silence.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 8)
@@ -1154,13 +1294,25 @@ private struct MicSensitivityRow: View {
                         Label("Revert", systemImage: "arrow.uturn.backward")
                     }
                     .help(String(format: "Restore previous threshold (%.4f)", previous))
+                    .transition(.scale.combined(with: .opacity))
                 }
                 Button { calibrating = true } label: {
                     Label("Calibrate…", systemImage: "mic.and.signal.meter")
                 }
             }
+            .animation(.snappy, value: canRevert)
         }
         .padding(.vertical, 4)
+    }
+
+    /// Push the latest RMS into the ring buffer. Drops the oldest
+    /// sample so `history.count` stays constant at `historyCapacity`
+    /// — preserves the bars' x-positions across redraws.
+    private func appendSample(_ rms: Float) {
+        var next = history
+        next.removeFirst()
+        next.append(rms)
+        history = next
     }
 }
 
@@ -1168,46 +1320,24 @@ private struct BotVolumeSlider: View {
     @Environment(AppServices.self) private var services
 
     var body: some View {
-        let value = services.settings.audioVolume
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .firstTextBaseline) {
-                SectionLabel(text: "Robot speaker volume")
-                Spacer()
-                Text("\(Int(value * 100))%")
-                    .font(.caption.monospacedDigit().weight(.medium))
-                    .foregroundStyle(value > 1.0 ? .orange : .primary)
-            }
-            Slider(
-                value: Binding(
-                    get: { services.settings.audioVolume },
-                    set: { newValue in
-                        services.settings.audioVolume = newValue
-                        Task { await services.robotTTS.setVolume(newValue) }
-                    }
-                ),
-                // 0–300% — anything above 100% applies a software
-                // gain boost (hard-clipped at int16 max) for the
-                // case where the reference clip was recorded
-                // quietly and the bot speaker is already fully open
-                // on its own alsamixer.
-                in: 0.0...3.0,
-                step: 0.05
-            ) {
-                Text("Volume")
-            } minimumValueLabel: {
-                Image(systemName: "speaker.fill")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            } maximumValueLabel: {
-                Image(systemName: "speaker.wave.3.fill")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-            Text("Applied to every TTS clip before it's uploaded to the robot. 100% = no scaling. Values above 100% hard-clip — useful when a quiet reference clip leaves the cloned voice too soft, but they introduce clipping distortion. If you need more, re-record the reference louder or raise the bot's on-device alsamixer PCM gain.")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-        }
-        .padding(.vertical, 4)
+        // 0–300% range — anything above 100% applies a software gain
+        // boost (hard-clipped at int16 max) for the case where the
+        // reference clip was recorded quietly and the bot speaker is
+        // already fully open on its own alsamixer.
+        LabeledSlider(
+            title: "Robot speaker volume",
+            value: Binding(
+                get: { services.settings.audioVolume },
+                set: { newValue in
+                    services.settings.audioVolume = newValue
+                    Task { await services.robotTTS.setVolume(newValue) }
+                }
+            ),
+            range: 0.0...3.0,
+            step: 0.05,
+            format: { v in "\(Int(v * 100))%" },
+            help: "Applied to every TTS clip before it's uploaded to the robot. 100% = no scaling. Above 100% hard-clips — useful when a quiet reference clip leaves the cloned voice too soft, but introduces clipping distortion. If you need more, re-record the reference louder or raise the bot's on-device alsamixer PCM gain."
+        )
     }
 }
 
@@ -1220,20 +1350,9 @@ private struct FaceMatchThresholdSlider: View {
     var body: some View {
         let threshold = services.settings.faceMatchThreshold
         let live = services.lastFaceDetection?.closestDistance
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .firstTextBaseline) {
-                SectionLabel(text: "Match threshold")
-                Spacer()
-                Text(String(format: "%.2f", threshold))
-                    .font(.caption.monospacedDigit().weight(.medium))
-                    .foregroundStyle(.primary)
-                if let liveD = live {
-                    Text(String(format: "live %.2f", liveD))
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(liveD <= threshold ? .green : .secondary)
-                }
-            }
-            Slider(
+        VStack(alignment: .leading, spacing: 4) {
+            LabeledSlider(
+                title: "Match threshold",
                 value: Binding(
                     get: { services.settings.faceMatchThreshold },
                     set: { newValue in
@@ -1241,18 +1360,21 @@ private struct FaceMatchThresholdSlider: View {
                         Task { await services.faceLibrary.setAcceptThreshold(newValue) }
                     }
                 ),
-                in: 0.4...1.5,
-                step: 0.05
-            ) {
-                Text("Threshold")
-            } minimumValueLabel: {
-                Text("strict").font(.caption2).foregroundStyle(.secondary)
-            } maximumValueLabel: {
-                Text("loose").font(.caption2).foregroundStyle(.secondary)
+                range: 0.4...1.5,
+                step: 0.05,
+                format: { v in String(format: "%.2f", Double(v)) },
+                minimumLabel: "strict",
+                maximumLabel: "loose",
+                help: "Lower = stricter; only very close matches accepted. Watch the \u{201C}live\u{201D} number while a face is on camera — set the threshold a touch higher than the distance you see for known people. Default 1.0."
+            )
+            if let liveD = live {
+                HStack {
+                    Spacer()
+                    Text(String(format: "live %.2f", liveD))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(liveD <= threshold ? .green : .secondary)
+                }
             }
-            Text("Lower = stricter; only very close matches accepted. Watch the \u{201C}live\u{201D} number while a face is on camera — set the threshold a touch higher than the distance you see for known people. Default 1.0.")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
         }
         .padding(.vertical, 4)
     }
@@ -1445,41 +1567,27 @@ private struct MemoryTopKSlider: View {
     @Environment(AppServices.self) private var services
 
     var body: some View {
-        let value = services.settings.memoryTopK
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .firstTextBaseline) {
-                SectionLabel(text: "Snippets per recall (top-K)")
-                Spacer()
-                Text("\(value)")
-                    .font(.caption.monospacedDigit().weight(.medium))
-            }
-            Slider(
-                value: Binding(
-                    get: { Double(services.settings.memoryTopK) },
-                    set: { newValue in
-                        let clamped = max(1, min(10, Int(newValue.rounded())))
-                        if clamped != services.settings.memoryTopK {
-                            services.settings.memoryTopK = clamped
-                            Task { await services.applySettings() }
-                        }
+        LabeledSlider(
+            title: "Snippets per recall (top-K)",
+            value: Binding(
+                get: { Double(services.settings.memoryTopK) },
+                set: { newValue in
+                    let clamped = max(1, min(10, Int(newValue.rounded())))
+                    if clamped != services.settings.memoryTopK {
+                        services.settings.memoryTopK = clamped
+                        Task { await services.applySettings() }
                     }
-                ),
-                in: 1...10,
-                step: 1
-            ) {
-                Text("Top-K")
-            } minimumValueLabel: {
-                Text("1").font(.caption2).foregroundStyle(.secondary)
-            } maximumValueLabel: {
-                Text("10").font(.caption2).foregroundStyle(.secondary)
-            }
-            Text("Lower keeps the prompt focused; higher gives more context at the cost of tokens and noise.")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-        }
+                }
+            ),
+            range: 1.0...10.0,
+            step: 1,
+            format: { v in "\(Int(v))" },
+            minimumLabel: "1",
+            maximumLabel: "10",
+            help: "Lower keeps the prompt focused; higher gives more context at the cost of tokens and noise."
+        )
         .disabled(!services.settings.memoryRecallEnabled)
         .opacity(services.settings.memoryRecallEnabled ? 1 : 0.45)
-        .padding(.vertical, 4)
     }
 }
 
