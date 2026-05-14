@@ -277,6 +277,16 @@ class Brain:
         self.processor = None
         self.vision_cache = None
         self.prompt_cache_state = None
+        # Warmup metrics — populated by load() + warm_up(), exposed
+        # via health() so the Mac can render Health → Think with real
+        # timings even if the LogBus log-event channel races and
+        # misses the phase emits during sidecar startup.
+        self.last_load_time_ms: int | None = None
+        self.last_warmup_ms: int | None = None
+        self.last_warmup_text_ms: int | None = None
+        self.last_warmup_vision_ms: int | None = None
+        self.last_warmup_tools_ms: int | None = None
+        self.last_warmup_failed: str | None = None
         self.default_max_tokens = int(
             os.environ.get("ROCKY_BRAIN_MAX_TOKENS", "768")
         )
@@ -296,17 +306,33 @@ class Brain:
         from mlx_vlm.vision_cache import VisionFeatureCache
         from mlx_vlm.generate import PromptCacheState
 
-        trace(f"loading model {self.model_id}")
+        # `model_id` can be either a Hugging Face repo id ("mlx-community/...")
+        # OR a local filesystem path. Expand ~ and resolve so the user
+        # can paste paths from anywhere. mlx_vlm.load handles both cases
+        # natively once the path is normalized.
+        resolved = self.model_id
+        if resolved.startswith("~") or resolved.startswith("/") or resolved.startswith("./"):
+            resolved = os.path.abspath(os.path.expanduser(resolved))
+        self.model_id = resolved
+        trace(f"loading model {resolved}")
+        emit_log(
+            "info",
+            "loading model",
+            phase="load_start",
+            model=resolved,
+        )
         started = time.monotonic()
-        self.model, self.processor = mlx_load(self.model_id)
+        self.model, self.processor = mlx_load(resolved)
         self.vision_cache = VisionFeatureCache()
         self.prompt_cache_state = PromptCacheState()
         elapsed_ms = int((time.monotonic() - started) * 1000)
+        self.last_load_time_ms = elapsed_ms
         trace(f"model loaded in {elapsed_ms} ms")
         emit_log(
             "info",
             "brain model loaded",
-            model=self.model_id,
+            phase="load_done",
+            model=resolved,
             load_time_ms=elapsed_ms,
         )
 
@@ -319,6 +345,205 @@ class Brain:
         self.vision_cache = None
         self.prompt_cache_state = None
         self.load()
+        self.warm_up()
+
+    def warm_up(self) -> None:
+        """Pre-pay every Metal-kernel JIT cost using a prompt shape
+        that **matches the user's first real query**: a multi-kilobyte
+        system prompt, a camera-resolution image, and a tool schema.
+
+        Why "shape-matching" matters: MLX selects specialized kernels
+        per tensor shape. A 5-token prompt + 32×32 image only JITs the
+        short-prefill / few-vision-tokens kernels. The user's first
+        real query carries ~2000 tokens of persona + ~640×480 camera
+        frame — different kernels, paid for again on turn 1. The
+        previous warmup measured ~6 s but the user still ate ~14 s of
+        cold-path JIT on their first question.
+
+        Three passes:
+          1. Text-only with a long system prompt → warms the
+             long-prefill language kernels.
+          2. With a 384×384 image → warms the vision encoder and
+             cross-attention at a realistic vision-token count.
+          3. With a tool schema attached → warms the tool-calling
+             template branch in the chat template + prefill.
+
+        Caches are reset after all passes so the user's first prompt
+        doesn't fight the "ok"-primed prefix.
+        """
+        if self.model is None or self.processor is None:
+            return
+        from mlx_vlm import stream_generate
+        from mlx_vlm.prompt_utils import apply_chat_template
+        from mlx_vlm.vision_cache import VisionFeatureCache
+        from mlx_vlm.generate import PromptCacheState
+
+        # ~2 KB filler approximating the persona's prefill cost. We
+        # don't have the persona at sidecar level (it lives in
+        # SettingsStore on the Mac), so we pad with neutral text that
+        # tokenises to roughly the same length. The model never sees
+        # this — it's discarded after warmup.
+        filler_lines = [
+            "Rocky is a small embodied robot. Talk in short clauses.",
+            "Drop articles. Use base-form verbs. Third-person speech.",
+            "Use tools for fresh data: weather, news, calendar, web.",
+            "Use training knowledge for facts and explanations.",
+            "Reserve 'Rocky not know' for genuinely unknown things.",
+            "Never speak the user's question back to them verbatim.",
+            "When uncertain, ask one short question, then move on.",
+            "Match expression to text meaning. Safety on shelf first.",
+        ] * 6  # ~3000 chars, in the ballpark of the real persona
+        filler_system = " ".join(filler_lines)
+
+        # A fake tool schema so apply_chat_template walks the
+        # tool-calling branch of the chat template. The contents
+        # don't matter — we just need the template to render the
+        # tools=... clause so prefill has the same prefix shape as
+        # the real chat call.
+        fake_tools = [{
+            "type": "function",
+            "function": {
+                "name": "noop",
+                "description": "Placeholder for warmup.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"x": {"type": "string"}},
+                },
+            },
+        }]
+
+        def _build_prompt(
+            num_images: int, with_tools: bool, with_filler: bool
+        ) -> str:
+            msgs: list[dict] = []
+            if with_filler:
+                msgs.append({"role": "system", "content": filler_system})
+            msgs.append({"role": "user", "content": "ok"})
+            messages = self._to_content_parts(msgs)
+            tools = fake_tools if with_tools else None
+            try:
+                return apply_chat_template(
+                    self.processor, self.model.config, messages,
+                    num_images=num_images,
+                    tools=tools,
+                    enable_thinking=self.enable_thinking,
+                )
+            except TypeError:
+                return apply_chat_template(
+                    self.processor, self.model.config, messages,
+                    num_images=num_images,
+                )
+
+        def _run(prompt: str, image_list: list[str] | None) -> None:
+            for _ in stream_generate(
+                self.model, self.processor, prompt,
+                image=image_list, max_tokens=1, temperature=0.0,
+                vision_cache=self.vision_cache,
+                prompt_cache_state=self.prompt_cache_state,
+            ):
+                break
+
+        # Synthetic 384×384 white JPEG. Matches the common vision-
+        # token grid used by Qwen3-VL / Gemma 4 / similar VLMs, so the
+        # patch-embed → vision-encoder → cross-attn path JITs at the
+        # right shape. Content irrelevant.
+        from io import BytesIO
+        from PIL import Image
+        import base64
+        buf = BytesIO()
+        Image.new("RGB", (384, 384), color="white").save(buf, format="JPEG")
+        image_uri = (
+            f"data:image/jpeg;base64,"
+            f"{base64.b64encode(buf.getvalue()).decode('ascii')}"
+        )
+
+        started = time.monotonic()
+        text_ms = 0
+        vision_ms = 0
+        tools_ms = 0
+        try:
+            # Pass 1: long-prompt, text-only. Warms long-prefill
+            # language kernels. ALWAYS runs (every model has these).
+            _run(
+                _build_prompt(
+                    num_images=0, with_tools=False, with_filler=True
+                ),
+                None,
+            )
+            text_ms = int((time.monotonic() - started) * 1000)
+
+            self.vision_cache = VisionFeatureCache()
+            self.prompt_cache_state = PromptCacheState()
+
+            # Pass 2: long-prompt + 384×384 image. Warms the vision
+            # encoder + cross-attention kernels at realistic shapes.
+            # Wrapped in try so a text-only model (no vision tower)
+            # falls through cleanly instead of failing the whole
+            # warmup — the caller decides whether to send images
+            # later anyway.
+            t_vision_start = time.monotonic()
+            try:
+                _run(
+                    _build_prompt(
+                        num_images=1, with_tools=False, with_filler=True
+                    ),
+                    [image_uri],
+                )
+                vision_ms = int((time.monotonic() - t_vision_start) * 1000)
+                self.vision_cache = VisionFeatureCache()
+                self.prompt_cache_state = PromptCacheState()
+            except Exception as exc:  # noqa: BLE001
+                trace(f"image warmup pass skipped: {exc!s}")
+                vision_ms = 0
+
+            # Pass 3: long-prompt + tools. Warms the tool-calling
+            # chat-template branch — without this, the first real
+            # query (which always carries the registry's tool
+            # schema) JITs a third kernel variant.
+            t_tools_start = time.monotonic()
+            _run(
+                _build_prompt(
+                    num_images=0, with_tools=True, with_filler=True
+                ),
+                None,
+            )
+            tools_ms = int((time.monotonic() - t_tools_start) * 1000)
+
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            self.last_warmup_ms = elapsed_ms
+            self.last_warmup_text_ms = text_ms
+            self.last_warmup_vision_ms = vision_ms
+            self.last_warmup_tools_ms = tools_ms
+            self.last_warmup_failed = None
+            trace(
+                f"model warmed in {elapsed_ms} ms "
+                f"(text {text_ms} ms + vision {vision_ms} ms + "
+                f"tools {tools_ms} ms)"
+            )
+            emit_log(
+                "info",
+                "brain model warmed",
+                phase="warm_done",
+                model=self.model_id,
+                warmup_ms=elapsed_ms,
+                warmup_text_ms=text_ms,
+                warmup_vision_ms=vision_ms,
+                warmup_tools_ms=tools_ms,
+            )
+        except Exception as e:  # noqa: BLE001
+            self.last_warmup_failed = str(e)
+            trace(f"warm_up FAILED: {e!s}")
+            emit_log(
+                "warn",
+                f"brain warm_up failed: {e!s}",
+                phase="warm_failed",
+                model=self.model_id,
+            )
+        finally:
+            # Final reset so the user's first real prompt starts on a
+            # clean cache, not the filler-primed prefix.
+            self.vision_cache = VisionFeatureCache()
+            self.prompt_cache_state = PromptCacheState()
 
     def health(self) -> dict[str, Any]:
         return {
@@ -326,11 +551,81 @@ class Brain:
             "model": self.model_id,
             "loaded": self.model is not None,
             "enable_thinking": self.enable_thinking,
+            # Warmup snapshot — pull-based source of truth for the
+            # Mac's Health view. The push-based log-event channel
+            # races against the Mac's LogBus subscription setup
+            # during cold startup; polling this RPC after the
+            # sidecar emits `ready` is deterministic.
+            "load_time_ms": self.last_load_time_ms,
+            "warmup_ms": self.last_warmup_ms,
+            "warmup_text_ms": self.last_warmup_text_ms,
+            "warmup_vision_ms": self.last_warmup_vision_ms,
+            "warmup_tools_ms": self.last_warmup_tools_ms,
+            "warmup_failed": self.last_warmup_failed,
+            "warm": (
+                self.model is not None
+                and self.last_warmup_ms is not None
+                and self.last_warmup_failed is None
+            ),
         }
 
     # ------------------------------------------------------------------
     # Chat
     # ------------------------------------------------------------------
+
+    def _is_qwen3(self) -> bool:
+        """True when the loaded model is in the Qwen3 family — used
+        to gate the `/no_think` directive that suppresses Qwen3's
+        default thinking mode. We match on the model_id string
+        (case-insensitive) rather than introspecting the model
+        config, because the same suppression heuristic applies to
+        all Qwen3 variants regardless of how mlx-vlm wires them
+        (Qwen3-VL, Qwen3.5, Qwen3-A3B, etc.)."""
+        name = (self.model_id or "").lower()
+        return ("qwen3" in name) or ("qwen-3" in name)
+
+    def _append_no_think_directive(self, messages: list[dict]) -> list[dict]:
+        """Append ` /no_think` to the LAST user message's text so
+        Qwen3 skips its `<think>...</think>` preamble. Mutates a
+        copy; original messages list is unchanged. Idempotent — if
+        `/no_think` is already present, returns messages as-is.
+
+        Operates on the parts representation: messages whose
+        content is a list of `{"type": "text", "text": "..."}`
+        get the directive appended to the last text part.
+        Tool/tool-call shaped messages are left untouched.
+        """
+        out = list(messages)
+        # Find the last index that's a regular user message with
+        # a text-bearing content list.
+        for i in range(len(out) - 1, -1, -1):
+            m = out[i]
+            if m.get("role") != "user":
+                continue
+            if "tool_calls" in m or "tool_call_id" in m:
+                continue
+            content = m.get("content")
+            if not isinstance(content, list):
+                continue
+            # Find the last text part.
+            text_idx = -1
+            for j in range(len(content) - 1, -1, -1):
+                if isinstance(content[j], dict) and content[j].get("type") == "text":
+                    text_idx = j
+                    break
+            if text_idx < 0:
+                continue
+            current = content[text_idx].get("text") or ""
+            if "/no_think" in current:
+                return out  # already there
+            new_parts = list(content)
+            new_parts[text_idx] = {
+                **content[text_idx],
+                "text": f"{current.rstrip()} /no_think",
+            }
+            out[i] = {**m, "content": new_parts}
+            return out
+        return out
 
     def _to_content_parts(self, messages: list[dict]) -> list[dict]:
         """Convert OpenAI-shape `{"role":..., "content": "..."}` messages
@@ -378,6 +673,19 @@ class Brain:
         )
 
         messages = self._to_content_parts(raw_messages)
+
+        # Qwen3.x ships with thinking mode ON by default — every reply
+        # gets prefixed with a `<think>...</think>` block, which adds
+        # 5–15 s of latency and pollutes the chat bubble. The
+        # documented way to disable thinking is to append `/no_think`
+        # to the user message; the model's chat template treats this
+        # as a sentinel and skips the reasoning preamble. `enable_thinking=False`
+        # in apply_chat_template isn't reliable across Qwen3 variants
+        # — this directive is. Other models (Gemma, Llama) ignore it
+        # as ordinary content, so it's safe to apply broadly when the
+        # loaded model is in the Qwen3 family.
+        if self._is_qwen3() and messages:
+            messages = self._append_no_think_directive(messages)
 
         # Image: pass as a data URI which mlx-vlm's `load_image`
         # decodes natively. Lists per the canonical chat.py.
@@ -442,38 +750,62 @@ class Brain:
                     tool_calls.append(tc)
                     emit({"id": request_id, "stream": {"tool_call": tc}})
 
-        try:
-            for chunk in stream_generate(
-                self.model,
-                self.processor,
-                prompt,
-                image=image_list,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                vision_cache=self.vision_cache,
-                prompt_cache_state=self.prompt_cache_state,
-            ):
-                chunks_seen += 1
-                if chunks_seen == 1:
-                    trace(
-                        f"first chunk type={type(chunk).__name__} "
-                        f"prompt_tokens={getattr(chunk, 'prompt_tokens', '?')} "
-                        f"prompt_tps={getattr(chunk, 'prompt_tps', 0):.1f}"
-                    )
-                delta = getattr(chunk, "text", "") if not isinstance(chunk, str) else chunk
-                if not delta:
-                    continue
-                clean_delta, blocks = stream_filter.feed(delta)
-                if clean_delta:
-                    text_buffer.append(clean_delta)
-                    emit({"id": request_id, "stream": {"delta": clean_delta}})
-                if blocks:
-                    emit_calls_from(blocks)
-        except Exception as e:  # noqa: BLE001
-            trace(f"stream_generate FAILED: {e!s}")
+        def _run_stream(use_image: bool, _prompt: str) -> bool:
+            """Drive `stream_generate` and pump deltas + tool calls
+            to the client. Returns True on success, False on failure
+            (caller decides whether to retry without image).
+            Captures into the enclosing buffers via closure.
+
+            Caches are passed FRESH per call. Reusing the warmup-
+            primed caches across model boundaries caused
+            `broadcast_shapes` errors on Qwen3-VL: the warmup
+            prefix (filler system + fake tools) doesn't match the
+            user's real prefix (persona + real tools), and
+            mlx-vlm's prefix-reuse path tried to broadcast cached
+            K/V tensors of one shape against new K/V tensors of
+            another shape. Fresh state per call sacrifices a small
+            prefix-reuse perf win for correctness.
+            """
+            nonlocal chunks_seen
+            from mlx_vlm.vision_cache import VisionFeatureCache as _VC
+            from mlx_vlm.generate import PromptCacheState as _PC
+            try:
+                for chunk in stream_generate(
+                    self.model,
+                    self.processor,
+                    _prompt,
+                    image=image_list if use_image else None,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    vision_cache=_VC(),
+                    prompt_cache_state=_PC(),
+                ):
+                    chunks_seen += 1
+                    if chunks_seen == 1:
+                        trace(
+                            f"first chunk type={type(chunk).__name__} "
+                            f"prompt_tokens={getattr(chunk, 'prompt_tokens', '?')} "
+                            f"prompt_tps={getattr(chunk, 'prompt_tps', 0):.1f}"
+                        )
+                    delta = getattr(chunk, "text", "") if not isinstance(chunk, str) else chunk
+                    if not delta:
+                        continue
+                    clean_delta, blocks = stream_filter.feed(delta)
+                    if clean_delta:
+                        text_buffer.append(clean_delta)
+                        emit({"id": request_id, "stream": {"delta": clean_delta}})
+                    if blocks:
+                        emit_calls_from(blocks)
+                return True
+            except Exception as e:  # noqa: BLE001
+                trace(f"stream_generate FAILED: {e!s}")
+                return False
+
+        success = _run_stream(use_image=image_list is not None, _prompt=prompt)
+        if not success:
             emit({
                 "id": request_id,
-                "error": {"code": 500, "message": f"generate failed: {e!s}"},
+                "error": {"code": 500, "message": "generate failed"},
             })
             return
 
@@ -529,6 +861,11 @@ def serve() -> None:
         brain.load()
     except Exception as e:  # noqa: BLE001
         emit_log("error", f"brain failed to load: {e!s}", model=model_id)
+    # Warm-up runs before `ready` so the first `chat_stream` call
+    # doesn't pay the ~5–15 s Metal-kernel JIT cost. Failure is
+    # logged but non-fatal: the user just falls back to today's
+    # cold-on-first-turn behaviour.
+    brain.warm_up()
     emit({"event": "ready", "payload": {"model": model_id}})
 
     for line in sys.stdin:

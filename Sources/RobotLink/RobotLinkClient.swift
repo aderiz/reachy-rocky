@@ -200,12 +200,41 @@ public actor RobotLinkClient {
     /// rejects the mode change transiently, the goto still attempts
     /// and the second `setMotorMode` re-asserts.
     public func wakeUp() async throws {
-        // Pre-seed: anchor the daemon's commanded pose to where the
-        // head physically is. Best-effort — if `state/full` fails
-        // we fall back to neutral, which at worst reproduces the old
-        // pop (never something worse). The 50 ms settle gives the
-        // daemon a tick to register the new target before we hand
-        // motors over.
+        // Orchestrated on the BOT now (`POST :8042/api/motion/wake_up`)
+        // so the on-bot MotionGuard can reset its slew baseline to
+        // the current physical pose BEFORE the pre-seed `setTarget`
+        // is sent. The previous Swift composite (setTarget → enable
+        // → goto) sent the pre-seed through slew limiters that
+        // clamped it against the prior face-tracker target — the
+        // motor enable then snapped the head from physical pose to
+        // the clamped target, which read as an aggressive wake. The
+        // on-bot path also bumps the goto duration from 2 s → 3.5 s
+        // by default for a calmer swing up.
+        let url = endpoint.motionURL("/api/motion/wake_up")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = "{}".data(using: .utf8)
+        let (data, status) = try await perform(req, label: "/api/motion/wake_up")
+        if status != 200 {
+            // Fall back to the legacy Swift composite if the bot's
+            // relay is pre-v0.2 (no `/api/motion/wake_up` yet). At
+            // that point the user can update the relay; until then
+            // they get the old behaviour.
+            await logBus.publish(.sidecarLog(
+                sidecar: "robot-link",
+                level: .warn,
+                message: "wake_up: on-bot endpoint returned \(status); falling back to Swift composite",
+                fields: ["body": String(data: data, encoding: .utf8) ?? ""]
+            ))
+            try await legacyWakeUpComposite()
+        }
+    }
+
+    /// Legacy three-step wake composite. Kept for the rare case the
+    /// on-bot relay is on an older build. New deployments should
+    /// reach the on-bot `/api/motion/wake_up` orchestrator above.
+    private func legacyWakeUpComposite() async throws {
         let anchor: RPYPose
         if let snapshot = try? await fullState() {
             anchor = snapshot.headPose
@@ -214,13 +243,11 @@ public actor RobotLinkClient {
         }
         try? await setTarget(MotionTarget(headPose: anchor))
         try? await Task.sleep(nanoseconds: 50_000_000)
-
         try? await setMotorMode(.enabled)
         try? await Task.sleep(nanoseconds: 150_000_000)
-
         try await goto(
             headPose: RPYPose(roll: 0, pitch: 0, yaw: 0),
-            durationS: 2.0,
+            durationS: 3.5,
             interpolation: .minjerk
         )
         try? await setMotorMode(.enabled)
@@ -273,11 +300,29 @@ public actor RobotLinkClient {
     }
 
     private func post(path: String, body: Data) async throws -> (Data, Int) {
-        var req = URLRequest(url: endpoint.apiURL(path))
+        // Motion-bearing endpoints get rewritten to the on-bot
+        // motion-guard at `:motionPort/api/motion/*` (if configured)
+        // so the bot enforces slew / velocity / duration / allowlist
+        // / yaw-delta limits before forwarding to the daemon. Other
+        // endpoints (state, daemon health) pass through unchanged.
+        let url = Self.isMotionPath(path)
+            ? endpoint.motionURL(path)
+            : endpoint.apiURL(path)
+        var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = body
         return try await perform(req, label: path)
+    }
+
+    private static func isMotionPath(_ path: String) -> Bool {
+        if path == "/api/move/set_target" { return true }
+        if path == "/api/move/goto" { return true }
+        if path == "/api/move/stop_move" { return true }
+        if path == "/api/move/stop" { return true }
+        if path.hasPrefix("/api/motors/set_mode/") { return true }
+        if path.hasPrefix("/api/move/play/") { return true }
+        return false
     }
 
     private func perform(_ req: URLRequest, label: String) async throws -> (Data, Int) {

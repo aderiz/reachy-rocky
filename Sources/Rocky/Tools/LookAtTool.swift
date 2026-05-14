@@ -44,21 +44,33 @@ import RobotLink
 /// (if enabled) doesn't fight the goto.
 enum LookAtTool {
 
-    /// Reachy Mini's IMX708 wide-angle horizontal FOV per
-    /// `docs/reference/hardware.md`. The vertical FOV is derived
-    /// from the input image's aspect ratio so 4:3 vs 16:9 sensor
-    /// crops compute correctly.
-    static let horizontalFOVRad: Double = 120.0 * .pi / 180.0
+    /// Effective horizontal FOV of the camera frame the brain
+    /// actually sees. This is NOT the raw camera spec (the IMX708
+    /// lens is wider) — it's the calibrated value `MacFaceTracker`
+    /// uses to convert image-pixel offsets into head-pose deltas,
+    /// validated against the live face-tracker behaviour. The
+    /// previous 120° value commanded ~2× too much rotation,
+    /// overshooting every target the brain asked for.
+    static let horizontalFOVRad: Double = 65.0 * .pi / 180.0
+
+    /// Effective vertical FOV, same source as the horizontal value.
+    /// (Don't derive from aspect ratio — the cropped/scaled frame
+    /// the brain sees doesn't have the same VFOV as a pure aspect
+    /// scaling of the raw sensor would imply.)
+    static let verticalFOVRad: Double = 39.0 * .pi / 180.0
 
     /// Default frame aspect ratio when the brain doesn't tell us
-    /// what it saw. The on-bot relay downscales to ~480 wide; the
-    /// camera native is 16:9 so this is the safe default.
+    /// what it saw. Kept for the tool's `aspect_ratio` parameter so
+    /// LLMs that pass it don't break — the value is now ignored in
+    /// favour of the calibrated VFOV constant above.
     static let defaultAspectRatio: Double = 16.0 / 9.0
 
-    /// Minjerk duration for the look-at goto. Fast enough to read
-    /// as immediate response to a verbal "look at that"; slow
-    /// enough that the motors don't slam.
-    static let durationS: Double = 0.7
+    /// Minjerk duration for the look-at goto. 1.5 s is long enough
+    /// for the body_yaw joint (slower dynamics than head) to actually
+    /// reach its commanded target — 0.7 s only got the body 40 % of
+    /// the way there in practice. Still feels responsive ("look at
+    /// that" → 1.5 s smooth swing is natural, not slow).
+    static let durationS: Double = 1.5
 
     static func register(
         in registry: ToolRegistry,
@@ -140,6 +152,21 @@ enum LookAtTool {
         )
     }
 
+    /// Comfortable head-yaw range — beyond this the rotation is
+    /// pushed onto the body so the neck doesn't crank to extremes.
+    /// Cap at 30° because anything more reads as a neck twist; the
+    /// body should be doing the bulk of large lateral looks.
+    static let headYawComfortableMax: Double = 30.0 * .pi / 180.0
+
+    /// Hard cap on the body-yaw output from a look-at command. The
+    /// hardware limit is ±160 ° (`SafetyLimits.bodyYawMax`) but that
+    /// was sized for one-shot recorded moves. For a look-at, ±90 °
+    /// is the most we ever want — beyond that, the user is almost
+    /// behind the bot and a `go_home` makes more sense than spinning
+    /// further. Without this cap, overflow from a giant head delta
+    /// was twisting the body to ±152 ° (nearly facing backwards).
+    static let bodyYawComfortableMax: Double = 90.0 * .pi / 180.0
+
     /// The actual goto. Pulled out into a static function so the
     /// tool handler closure stays readable + so tests can drive
     /// the math without the registry.
@@ -148,61 +175,125 @@ enum LookAtTool {
         description: String,
         services: AppServices
     ) async -> JSONValue {
-        // Vertical FOV from the input aspect ratio. A wider frame
-        // has a narrower VFOV for the same HFOV.
-        let vfov = Self.horizontalFOVRad / max(aspect, 0.1)
+        // Use the calibrated VFOV constant (matches MacFaceTracker).
+        // The `aspect` parameter is accepted from the brain for
+        // backward compat but ignored — the cropped/scaled frame's
+        // actual FOV doesn't follow simple aspect-ratio scaling of
+        // the raw sensor's HFOV.
+        _ = aspect
+        let vfov = Self.verticalFOVRad
 
-        // Image-space → angle deltas. `x=0.5, y=0.5` is the centre
-        // of the frame (no movement). y is positive **downward**
-        // in image space; Reachy Mini's head pitch is positive
-        // **downward** too (head tilts forward), so the sign is
-        // preserved verbatim.
-        let yawDelta = (x - 0.5) * Self.horizontalFOVRad
+        // Image-space → angle deltas.
+        //
+        // **Yaw sign**: an object at x=0.82 (right side of the
+        // image) needs the camera to turn RIGHT. The daemon's
+        // `head_pose.yaw` convention is "positive = left" (matches
+        // the `look_at` tool's documented sign), so turning RIGHT
+        // means DECREASING yaw — `yawDelta` must be NEGATIVE for
+        // positive x-offsets. The previous version used
+        // `(x - 0.5)` and was turning the head the wrong way (the
+        // `MacFaceTracker.swift:466` controller uses `-un * hfov/2`
+        // for the same reason — that one's been correct all along).
+        //
+        // **Pitch sign**: y is positive downward in image space;
+        // Reachy Mini's head pitch is positive downward too (head
+        // tilts forward), so the sign is preserved verbatim.
+        let yawDelta = -(x - 0.5) * Self.horizontalFOVRad
         let pitchDelta = (y - 0.5) * vfov
 
-        // Read the current head pose. Fall back to zero if the
-        // state stream hasn't delivered anything yet (cold start);
-        // in that case the move just commands the absolute angle.
-        let currentPose = await MainActor.run {
-            services.lastRobotState?.headPose
+        // Read current pose + body yaw. State-stream lag at cold
+        // start is the only failure mode; in that case we just
+        // command the absolute requested angle.
+        let (currentPose, currentBodyYaw) = await MainActor.run {
+            (services.lastRobotState?.headPose,
+             services.lastRobotState?.bodyYaw)
         }
         let baseYaw = currentPose?.yaw ?? 0
         let basePitch = currentPose?.pitch ?? 0
         let baseRoll = currentPose?.roll ?? 0
+        let baseBody = currentBodyYaw ?? 0
 
-        // Clamp to safety limits — head yaw ±180°, pitch ±40°.
-        // Going beyond these is unsafe and the daemon would
-        // reject anyway.
-        let yawTarget = SafetyLimits.clamp(
-            baseYaw + yawDelta, to: SafetyLimits.headYawMax
-        )
+        // **Head + body 50/50 split.** The user wants visible whole-
+        // body motion, not just a head twist. Reachy Mini can rotate
+        // both head (±180°) and body (±160°); splitting the camera-
+        // yaw delta equally between them gives a natural "Rocky
+        // turns toward the target" appearance rather than the
+        // floating-head-on-a-still-body look the previous 30 % body
+        // share produced. If the head's half would exceed its
+        // comfortable range (±headYawComfortableMax), the overflow
+        // is pushed to the body.
+        let desiredCameraYaw = (baseYaw + baseBody) + yawDelta
+        let halfDelta = yawDelta * 0.5
+        let headRequested = baseYaw + halfDelta
+        let bodyRequested = baseBody + halfDelta
+
+        let yawHeadTarget: Double
+        let yawBodyTarget: Double
+        if abs(headRequested) > Self.headYawComfortableMax {
+            // Head exceeds comfort cap — pin it to the cap, push
+            // overflow to body.
+            let cappedHead = headRequested > 0
+                ? Self.headYawComfortableMax
+                : -Self.headYawComfortableMax
+            let overflow = headRequested - cappedHead
+            yawHeadTarget = SafetyLimits.clamp(
+                cappedHead, to: Self.headYawComfortableMax
+            )
+            yawBodyTarget = SafetyLimits.clamp(
+                bodyRequested + overflow, to: Self.bodyYawComfortableMax
+            )
+        } else {
+            yawHeadTarget = SafetyLimits.clamp(
+                headRequested, to: Self.headYawComfortableMax
+            )
+            yawBodyTarget = SafetyLimits.clamp(
+                bodyRequested, to: Self.bodyYawComfortableMax
+            )
+        }
         let pitchTarget = SafetyLimits.clamp(
             basePitch + pitchDelta, to: SafetyLimits.headPitchMax
         )
 
-        let target = RPYPose(
-            roll: baseRoll, pitch: pitchTarget, yaw: yawTarget
+        let headTarget = RPYPose(
+            roll: baseRoll, pitch: pitchTarget, yaw: yawHeadTarget
         )
 
-        // Suppress the face-tracker streamer for the move duration
-        // + a small tail. Idempotent if the streamer is already
-        // gated (e.g. face tracking is off, transitioningUntil is
-        // unused). When face tracking is on, this stops the
-        // tracker from fighting the goto for the duration; when
-        // it expires, the tracker resumes (and will pull the head
-        // back to the user's face — accept that as the intended
-        // behaviour, because the user asked for an explicit one-
-        // shot look, not a permanent gaze).
+        // **Holding the look** requires THREE things, not just one:
+        //
+        //   1. Stop the face tracker pushing new targets:
+        //      `macFaceTracker.setEnabled(false)` flips `userEnabled`
+        //      false so the tracker's tick loop no longer calls
+        //      `streamer.update(...)`.
+        //   2. Overwrite the streamer's `latest` with the look-at
+        //      pose. THIS is the bug the previous patch missed —
+        //      `TargetStreamer.tick()` re-sends `latest` at 50 Hz
+        //      forever. The face tracker had stamped `latest = "look
+        //      at user"` before our goto; after the goto completes,
+        //      the streamer immediately re-pushes that stale target
+        //      and the head drifts back. Stamping `latest` with the
+        //      look-at pose makes the streamer hold the look.
+        //   3. Suppress the streamer briefly so the goto isn't
+        //      contested by simultaneous set_target updates (the
+        //      daemon ignores set_target during a goto anyway, but
+        //      keeping `transitioningUntil` set makes the intent
+        //      clear for downstream gates).
+        await services.macFaceTracker.setEnabled(false)
+        let holdTarget = MotionTarget(
+            headPose: headTarget,
+            antennas: nil,
+            bodyYaw: yawBodyTarget
+        )
+        await services.targetStreamer.update(holdTarget, source: .tool)
         await MainActor.run {
             services.transitioningUntil =
                 Date().addingTimeInterval(Self.durationS + 0.2)
         }
 
         do {
-            try await services.robotLink.goto(
-                headPose: target,
+            try await services.motionGuard.goto(
+                headPose: headTarget,
                 antennas: nil,
-                bodyYaw: nil,
+                bodyYaw: yawBodyTarget,
                 durationS: Self.durationS,
                 interpolation: .minjerk
             )
@@ -210,7 +301,8 @@ enum LookAtTool {
             return .object([
                 "ok": .bool(false),
                 "error": .string("\(error)"),
-                "yaw_target_rad": .number(yawTarget),
+                "head_yaw_target_rad": .number(yawHeadTarget),
+                "body_yaw_target_rad": .number(yawBodyTarget),
                 "pitch_target_rad": .number(pitchTarget),
             ])
         }
@@ -222,8 +314,10 @@ enum LookAtTool {
             "aspect_ratio": .number(aspect),
             "yaw_delta_rad": .number(yawDelta),
             "pitch_delta_rad": .number(pitchDelta),
-            "yaw_target_rad": .number(yawTarget),
+            "head_yaw_target_rad": .number(yawHeadTarget),
+            "body_yaw_target_rad": .number(yawBodyTarget),
             "pitch_target_rad": .number(pitchTarget),
+            "camera_world_yaw_rad": .number(desiredCameraYaw),
             "description": .string(description),
         ])
     }

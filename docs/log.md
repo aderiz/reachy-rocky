@@ -2,6 +2,51 @@
 
 Append-only chronological record. Each entry: `## [YYYY-MM-DD] <op> | <subject>`. Run `grep "^## \[" log.md | tail -20` for the recent timeline.
 
+## [2026-05-14] docs | Full-system architecture diagram
+
+New `docs/concepts/architecture-diagram.md`: one comprehensive mermaid covering every meaningful component — UI tree, AppServices + LogBus + SettingsStore, Cognition stack, Voice pipeline, Perception, Memory, Telemetry (LogBus → MomentFeed + TurnProfiler + ProfileStore), RobotLink with both MotionGuards, Mac sidecars, on-bot rocky_media_relay, daemon, hardware, and external services (LM Studio, Brave, HF). Includes the four key dataflows (speech → brain → TTS, camera → face tracker → motion, brain tool call, state read). Linked from `docs/index.md`. Existing `rocky-architecture.md` left intact — it's a different-altitude view.
+
+## [2026-05-13] code | On-bot MotionGuard — defence in depth on port 8042
+
+Extended `rocky_media_relay` with `/api/motion/*` endpoints that mirror the Mac-side `MotionGuard` (same five rules: slew, velocity, duration floor, single-in-flight, shelf-safe allowlist) plus the Pollen-documented 65° head-body yaw delta cap. Endpoints validate then forward to `http://127.0.0.1:8000/api/move/*` via httpx.
+
+Mac `RobotEndpoint` gained `motionPort: Int? = 8042`. `RobotLinkClient.post` detects motion-bearing paths and routes them through `endpoint.motionURL(path)` which rewrites `/api/move/*` → `:motionPort/api/motion/*`. State reads always stay on the daemon port. Settings → Robot has a "Route motion through on-bot guard (port 8042)" toggle for fallback if the bot's relay isn't on the v0.2 build yet.
+
+Files: new `OnBot/rocky_media_relay/rocky_media_relay/motion_guard.py`, motion endpoints added to `main.py`'s `run()`, `httpx` added to `pyproject.toml`. Mac side: `Sources/RobotLink/RobotEndpoint.swift` (motion-aware), `Sources/RobotLink/RobotLinkClient.swift` (post routes by path), `Sources/Rocky/SettingsStore.swift` (toggle field + Keys + init + save + `robotEndpoint()`), `Sources/Rocky/SettingsView.swift` (Robot tab toggle with footer).
+
+Docs: `docs/concepts/motion-guard.md` rewritten with a two-subgraph mermaid (Mac box + Bot box), defence-in-depth section, route table, firewall recipe. The user's prompt was: Mac-only guard can be bypassed by anything else that hits the daemon. The on-bot layer + a firewall closing :8000 to non-localhost makes the bot the true chokepoint.
+
+Deployment note: relay must be redeployed to the bot for the new endpoints to exist. Until then the Mac side will return 404s for motion calls — toggle the new setting OFF as the workaround.
+
+## [2026-05-13] code | MotionGuard — single chokepoint for every motion command
+
+After a series of escalating safety incidents (recorded emotion knocked Rocky off the desk shelf; `look_at_object` overshooting because of a wrong 120° HFOV that should have been the 65° calibrated value `MacFaceTracker` uses; face tracker spiralling to ±158° head yaw chasing a user off-axis), the user explicitly asked for a single guard layer that all motion routes through.
+
+New actor `MotionGuard` (`Sources/RobotLink/MotionGuard.swift`) wraps `RobotLinkClient` and enforces:
+
+1. Slew-rate limit on `setTarget` (max 0.05 rad per joint per call — at 50 Hz that's ~143 °/s, well above the face tracker's damper output so smooth inputs pass; sudden jumps from tool switching get flattened).
+2. Velocity clamp on `goto` for head, body AND antennas (the pre-existing `safeGotoDuration` only considered head pose).
+3. Duration floor on `goto` (0.4 s minimum — prevents 50 ms snap moves).
+4. Single-in-flight `goto` (overlapping calls await rather than interrupt — no more mid-trajectory transitions).
+5. Shelf-safe allowlist for recorded moves (`playRecordedMove(force:)` rejects anything outside `Config.shelfSafeMoves` — dance/rage/scared all blocked by default).
+
+Routed all motion call sites through `services.motionGuard` instead of `services.robotLink`:
+- `TargetStreamer.tick()` — 50 Hz set_target stream from face tracker + look-at + go-home now passes through slew limit
+- `playExpression`'s `step()` — head-gesture goto sequence (express tool) inherits via `let robot = motionGuard` at top
+- `playRecordedEmotion` — uses guard's allowlist (the dance3 shelf-tip path is now blocked)
+- `registerInitialTools` aliases `let robot = motionGuard`, so every tool closure (`look_at`, `look_at_object`, `go_home`, `play_emotion`, `express`, `go_to_sleep`, `set_motor_mode`, `stop_motion`, `get_state`) inherits the guarded path
+- `LookAtTool.performLook` — direct `services.motionGuard.goto`
+- `MicCalibrationView` — calibration `goto` + `setTarget` now guarded
+- `AppServices.sleepRobot` / `wakeRobot` / shutdown disable — the missed paths the user spotted ("still getting aggressive movement" was the wake_up + goToSleep bypass); now routed through the guard
+
+Pass-through methods added on guard for daemon-controlled sequences: `wakeUp`, `goToSleep`, `setMotorMode`, `stopMove`, `fullState`.
+
+Verification command: `grep -rn "robotLink\.\(goto\|setTarget\|playRecordedMove\|wakeUp\|goToSleep\|setMotorMode\|stopMove\)" Sources --include="*.swift" | grep -v MotionGuard.swift` — should return zero matches. It does.
+
+Memory: `feedback_motion_through_guard.md` makes the rule permanent ("never `services.robotLink.*` for motion — always `services.motionGuard.*`").
+
+Docs: new `docs/concepts/motion-guard.md` with mermaid diagram of every motion route through the system. Index updated.
+
 ## [2026-05-13] code | look_at_object tool — image-grounded head pointing
 
 New tool `look_at_object` in `Sources/Rocky/Tools/LookAtTool.swift`. Lets the user say "Rocky, look at the cup" when face tracking is off and have the head turn to the object.

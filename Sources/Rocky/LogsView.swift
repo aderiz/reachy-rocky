@@ -356,6 +356,22 @@ struct LogsView: View {
                 return (.brain,
                         String(format: "tool %@ → %dms", name, Int(ms)),
                         "args=\(args)\nresult=\(result)")
+            case .brainResponse(let firstChunkMs, let totalMs):
+                let tft = firstChunkMs.map { String(format: "TFT %.0fms ", $0) } ?? ""
+                return (.brain,
+                        String(format: "brain response %@total %.0fms", tft, totalMs),
+                        "")
+            case .audioPlaybackStarted(let filename, let sinceMs):
+                return (.voice,
+                        String(format: "audio playback started (+%.0f ms): %@",
+                               sinceMs, filename),
+                        "")
+            case .turnProfile(let summary, let fields):
+                let f = fields.isEmpty ? "" : "  " + fields
+                    .sorted { $0.key < $1.key }
+                    .map { "\($0)=\($1)" }
+                    .joined(separator: " ")
+                return (.brain, "PROFILE \(summary)", f)
             case .sidecarLog(let sidecar, let level, let message, let fields):
                 let f = fields.isEmpty ? "" : "  " + fields
                     .map { "\($0)=\($1)" }

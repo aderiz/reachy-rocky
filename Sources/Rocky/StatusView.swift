@@ -101,7 +101,7 @@ struct StatusView: View {
 
     private var headerRow: some View {
         HStack(alignment: .firstTextBaseline) {
-            Label("Health", systemImage: "heart.text.square")
+            Label("Health", systemImage: "heart.fill")
                 .font(.headline)
             Spacer()
             Text(summary)
@@ -433,6 +433,7 @@ struct StatusView: View {
             title: "MLX-VLM",
             icon: "brain",
             state: services.brainSidecarState,
+            phase: services.warmupPhases["brain"] ?? .idle,
             extra: shortModel
         )
     }
@@ -506,23 +507,32 @@ struct StatusView: View {
         // sidecar's own recovery attempts.
         let state: HealthState
         let subtitle: String
-        let isStreaming = services.lastCameraFrame != nil
-                       || services.lastCameraFrameAt != nil
-        if !isStreaming {
+        // Sleep gate first — when the bot is asleep the perception
+        // stack is dormant by design (face tracker paused via
+        // setSleeping). Showing "live · N frames" in that state
+        // misleads the user into thinking we're actively seeing.
+        if services.isAsleep {
             state = .unknown
-            subtitle = "not streaming"
-        } else if let last = services.lastCameraFrameAt,
-                  Date().timeIntervalSince(last) < 3 {
-            state = .ok
-            let fps = services.cameraFrameCount
-            subtitle = "live · \(fps) frames"
+            subtitle = "asleep"
         } else {
-            state = .warn
-            if let last = services.lastCameraFrameAt {
-                let s = Int(Date().timeIntervalSince(last))
-                subtitle = "stalled · last frame \(s)s ago"
+            let isStreaming = services.lastCameraFrame != nil
+                           || services.lastCameraFrameAt != nil
+            if !isStreaming {
+                state = .unknown
+                subtitle = "not streaming"
+            } else if let last = services.lastCameraFrameAt,
+                      Date().timeIntervalSince(last) < 3 {
+                state = .ok
+                let fps = services.cameraFrameCount
+                subtitle = "live · \(fps) frames"
             } else {
-                subtitle = "stalled · no frames yet"
+                state = .warn
+                if let last = services.lastCameraFrameAt {
+                    let s = Int(Date().timeIntervalSince(last))
+                    subtitle = "stalled · last frame \(s)s ago"
+                } else {
+                    subtitle = "stalled · no frames yet"
+                }
             }
         }
         return HealthRow(
@@ -549,9 +559,26 @@ struct StatusView: View {
         switch status {
         case .granted:
             state = .ok
-            subtitle = services.sttBackendName.contains("Apple Speech")
-                ? services.sttBackendName
-                : "Apple Speech"
+            // Show whichever STT engine is actually active — the
+            // previous code force-clamped this to "Apple Speech"
+            // unless the backend name already contained that string,
+            // so MLX-Whisper and WhisperKit (the user's real
+            // selections) were always mis-reported as Apple Speech.
+            // `sttBackendName` is the authoritative label maintained
+            // by `warmUpSTT` and the mic-source toggle.
+            // Append warmup timings when the mlx-stt sidecar is the
+            // active backend so cold-start latency is visible.
+            let base = services.sttBackendName
+            if base.contains("MLX-Whisper"),
+               case .ready(let l, let w) = services.warmupPhases["mlx-stt"] ?? .idle,
+               l != nil || w != nil {
+                var bits: [String] = [base]
+                if let l { bits.append("load \(StatusView.formatWarmupMs(l))") }
+                if let w { bits.append("JIT \(StatusView.formatWarmupMs(w))") }
+                subtitle = bits.joined(separator: " · ")
+            } else {
+                subtitle = base
+            }
         case .notDetermined:
             state = .warn
             subtitle = "permission pending"
@@ -590,7 +617,15 @@ struct StatusView: View {
     private var faceSidecarRow: HealthRow {
         let healthState: HealthState
         let subtitle: String
-        if !services.faceTrackingEnabled {
+        // Wake gate first — face tracker only runs when the bot is
+        // awake (AppServices' wake-state pump calls setSleeping(true)
+        // when isAsleep, which stops the tracker from ingesting
+        // frames + halts idle search). "watching" / "tracking" make
+        // no sense when the Vision pipeline is dormant.
+        if services.isAsleep {
+            healthState = .unknown
+            subtitle = "asleep"
+        } else if !services.faceTrackingEnabled {
             healthState = .unknown
             subtitle = "paused"
         } else if let last = services.lastFaceDetectionAt,
@@ -620,7 +655,8 @@ struct StatusView: View {
             id: "sidecar.tts",
             title: "TTS",
             icon: "speaker.wave.2",
-            state: services.ttsSidecarState
+            state: services.ttsSidecarState,
+            phase: services.warmupPhases["mlx-tts"] ?? .idle
         )
     }
 
@@ -634,26 +670,60 @@ struct StatusView: View {
             title: "Memory",
             icon: "tray.full",
             state: services.memorySidecarState,
+            phase: services.warmupPhases["mempalace"] ?? .idle,
             extra: extra
         )
     }
 
+    /// Combine the sidecar's lifecycle state with its warmup phase
+    /// into one user-facing row. SidecarState alone only swings
+    /// `.starting` → `.ready`; the warmup phase exposes the in-between
+    /// "weights loading" vs "first JIT pass" steps so heavy MLX
+    /// sidecars (brain on Gemma 4 26B-A4B, STT on whisper-large-v3)
+    /// don't sit silently at "starting…" for 20+ s. Phase wins for
+    /// .warn states (it has more detail); SidecarState wins for
+    /// failure modes (it knows why a sidecar crashed).
     private func sidecarRow(
         id: String,
         title: String,
         icon: String,
         state s: SidecarState,
+        phase p: AppServices.WarmupPhase = .idle,
         extra: String? = nil
     ) -> HealthRow {
         let healthState: HealthState
         let subtitle: String
         switch s {
         case .ready:
-            healthState = .ok
-            subtitle = ["ready", extra].compactMap { $0 }.joined(separator: " · ")
+            switch p {
+            case .loading:
+                // STT sidecar emits `ready` early then loads on first
+                // warm RPC — render the in-flight load even though
+                // the lifecycle says "ready".
+                healthState = .warn
+                subtitle = "loading model…"
+            case .warming:
+                healthState = .warn
+                subtitle = "warming…"
+            case .ready(let loadMs, let warmMs):
+                healthState = .ok
+                subtitle = warmupReadySubtitle(loadMs: loadMs, warmMs: warmMs,
+                                               extra: extra)
+            case .failed(let reason):
+                healthState = .warn
+                subtitle = "warmup failed: \(reason)"
+            case .idle:
+                healthState = .ok
+                subtitle = ["ready", extra].compactMap { $0 }.joined(separator: " · ")
+            }
         case .starting:
             healthState = .warn
-            subtitle = "starting…"
+            switch p {
+            case .loading:  subtitle = "loading model…"
+            case .warming:  subtitle = "warming…"
+            case .ready, .idle, .failed:
+                subtitle = "starting…"
+            }
         case .stopped:
             healthState = .unknown
             subtitle = "stopped"
@@ -668,6 +738,32 @@ struct StatusView: View {
         return HealthRow(id: id, title: title, subtitle: subtitle,
                          icon: icon, state: healthState, action: nil)
     }
+
+    private func warmupReadySubtitle(
+        loadMs: Int?, warmMs: Int?, extra: String?
+    ) -> String {
+        var parts: [String] = []
+        switch (loadMs, warmMs) {
+        case let (.some(l), .some(w)):
+            parts.append("warm · load \(formatMs(l)) + JIT \(formatMs(w))")
+        case let (.some(l), nil):
+            parts.append("loaded · \(formatMs(l))")
+        case let (nil, .some(w)):
+            parts.append("warm · \(formatMs(w))")
+        default:
+            parts.append("ready")
+        }
+        if let extra { parts.append(extra) }
+        return parts.joined(separator: " · ")
+    }
+
+    private func formatMs(_ ms: Int) -> String {
+        Self.formatWarmupMs(ms)
+    }
+
+    static func formatWarmupMs(_ ms: Int) -> String {
+        ms < 1000 ? "\(ms) ms" : String(format: "%.1f s", Double(ms) / 1000)
+    }
 }
 
 // MARK: - Subsystem tile
@@ -678,12 +774,43 @@ struct StatusView: View {
 private struct SubsystemTile: View {
     let entry: StatusView.HealthRow
 
+    /// True while the underlying capability is in warmup. The
+    /// promoted-from-warmup subtitles are "starting…", "loading
+    /// model…", "warming…" — when any of those is showing, overlay
+    /// a small ProgressView ring around the tile's circle and pulse
+    /// the fill so the user sees motion. As soon as the row resolves
+    /// to `.ok` the spinner disappears.
+    private var isWarming: Bool {
+        guard case .warn = entry.state else { return false }
+        let s = entry.subtitle.lowercased()
+        return s.hasPrefix("starting") || s.hasPrefix("loading")
+            || s.hasPrefix("warming")
+    }
+
     var body: some View {
         VStack(spacing: 6) {
             ZStack {
                 Circle()
                     .fill(entry.state.color.opacity(0.16))
                     .frame(width: 38, height: 38)
+                    .opacity(isWarming ? 0.7 : 1.0)
+                    .animation(
+                        isWarming
+                            ? .easeInOut(duration: 0.9).repeatForever(autoreverses: true)
+                            : .default,
+                        value: isWarming
+                    )
+                if isWarming {
+                    Circle()
+                        .stroke(entry.state.color.opacity(0.55), lineWidth: 1.5)
+                        .frame(width: 38, height: 38)
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .controlSize(.small)
+                        .tint(entry.state.color)
+                        .frame(width: 18, height: 18)
+                        .offset(x: 14, y: -14)
+                }
                 Image(systemName: entry.icon)
                     .font(.title3.weight(.semibold))
                     .foregroundStyle(entry.state.color)

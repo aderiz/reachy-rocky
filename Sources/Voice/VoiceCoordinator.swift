@@ -373,11 +373,19 @@ public actor VoiceCoordinator {
     ) async {
         if Task.isCancelled { sttTask = nil; return }
         do {
+            // Inference-only timing. `started` was set to `segmentStart`
+            // (when speech began) — measuring from there conflates the
+            // speech duration into "STT cost" and was producing
+            // 2000–23000 ms values in profiles. Anchor here, just before
+            // the transcribe call, so `totalMs` reflects only the engine
+            // work the user is actually waiting on.
+            let inferenceStart = Date()
             let transcript = try await stt.transcribe(
                 samples: segment, at: config.sampleRate
             )
             if Task.isCancelled { sttTask = nil; return }
-            let totalMs = Date().timeIntervalSince(started) * 1000
+            let totalMs = Date().timeIntervalSince(inferenceStart) * 1000
+            _ = started // kept for parity with previous signature; not used in totalMs
             await logBus.publish(.sttFinal(text: transcript.text, totalMs: totalMs))
             await dispatchFinal(
                 transcript.text,

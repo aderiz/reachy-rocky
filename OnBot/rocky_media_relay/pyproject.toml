@@ -13,6 +13,7 @@ dependencies = [
     "reachy-mini",
     "numpy",
     "pillow",
+    "httpx",
 ]
 keywords = ["reachy-mini-app"]
 

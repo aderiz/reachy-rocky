@@ -241,6 +241,14 @@ class Runner:
         )
         self.language = os.environ.get("ROCKY_STT_LANGUAGE") or "en"
         self._loaded = False
+        # Cached warmup metrics for the Mac's pull-based health
+        # snapshot — mirrors the brain runner's `last_*` fields so
+        # the Mac's Health view can render real timings via the
+        # `health` RPC (the push-based log channel races vs.
+        # subscriber setup during cold startup).
+        self.last_load_time_ms: int | None = None
+        self.last_warmup_ms: int | None = None
+        self.last_warmup_failed: str | None = None
         _stderr(f"runner constructed, model={self.model_id} lang={self.language}")
 
     def _ensure_loaded(self) -> None:
@@ -289,10 +297,16 @@ class Runner:
             path_or_hf_repo=self.model_id,
             language=language,
             # Whisper-large-v3 is prone to repetition hallucinations
-            # on short utterances. Use the official OpenAI ladder
-            # so the model retries at higher temperatures when its
-            # `compression_ratio_threshold` fires.
-            temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+            # on short utterances. Keep a SHORT fallback ladder so a
+            # genuine first-pass stumble (logprob/compression-ratio
+            # threshold trips) can recover via a higher-temperature
+            # retry — but cap at 2 attempts so ambient-noise segments
+            # can't burn 15 s walking the full OpenAI ladder of
+            # `(0.0, 0.2, 0.4, 0.6, 0.8, 1.0)`. The dropped-frame
+            # rows in TurnProfiler's CSV used to show 12–17 s here
+            # purely from temperature retries on noise; this caps
+            # worst case at ~5 s.
+            temperature=(0.0, 0.4),
             # 2.4 is the upstream default but lets through "X. X. X."
             # 3-4 times before flagging. 1.8 catches milder cases
             # too — false-positive rate is low for natural speech.
@@ -305,14 +319,21 @@ class Runner:
             # the next call — compounds repetition errors across
             # consecutive utterances in a conversation.
             condition_on_previous_text=False,
-            # Bias the language prior toward a conversation register.
-            # Whisper was trained heavily on YouTube subtitles which
-            # end with "thanks for watching" / "please subscribe" /
-            # "subtitles by the Amara.org community" boilerplate. On
-            # silent or low-energy audio it loves to spit these out.
-            # The initial_prompt sets a conversation context so the
-            # model leans away from video-credit hallucinations.
-            initial_prompt="A short conversation between a person and a robot named Rocky.",
+            # No `initial_prompt`. The previous version primed the
+            # decoder with "A short conversation between a person and
+            # a robot named Rocky." — that worked AS DESIGNED
+            # (steering away from "thanks for watching" YouTube
+            # boilerplate) but had a worse side-effect: on silent or
+            # noisy segments Whisper free-associates around the seed
+            # tokens in the prompt and emits text like
+            #   "The robot is now in the process of learning how to
+            #    operate the robot. Thank you."
+            # i.e. plausible robot-themed sentences that pass every
+            # downstream gate because they don't look like junk. The
+            # only safe seed is no seed. Generic YouTube-end
+            # hallucinations are caught downstream by
+            # `_is_hallucinated` + the AddressFilter's junk-phrase
+            # deny-list; the robot-themed ones had no defence.
             verbose=False,
         )
         duration_ms = (time.perf_counter() - t0) * 1000
@@ -355,8 +376,20 @@ class Runner:
         # Run a tiny synthetic transcribe so weights are fully loaded
         # AND the codec / tokenizer state is realised. Without this the
         # first real transcribe pays the entire ~5 s load cost.
+        log(
+            "info", "loading model",
+            phase="load_start", model=self.model_id,
+        )
         t0 = time.perf_counter()
         self._ensure_loaded()
+        load_ms = int((time.perf_counter() - t0) * 1000)
+        self.last_load_time_ms = load_ms
+        log(
+            "info", "stt model loaded",
+            phase="load_done", model=self.model_id,
+            load_time_ms=load_ms,
+        )
+        warm_started = time.perf_counter()
         try:
             import mlx_whisper
             silence = np.zeros(16_000, dtype=np.float32)  # 1 s of silence
@@ -367,9 +400,37 @@ class Runner:
                 temperature=0.0,
                 verbose=False,
             )
+            warm_ms = int((time.perf_counter() - warm_started) * 1000)
+            self.last_warmup_ms = warm_ms
+            self.last_warmup_failed = None
+            log(
+                "info", "stt model warmed",
+                phase="warm_done", model=self.model_id,
+                warmup_ms=warm_ms,
+            )
         except Exception as exc:  # noqa: BLE001
+            self.last_warmup_failed = str(exc)
             _stderr(f"warm_up transcribe failed (non-fatal): {exc}")
+            log(
+                "warn", f"stt warm_up failed: {exc}",
+                phase="warm_failed", model=self.model_id,
+            )
         return {"ms": (time.perf_counter() - t0) * 1000}
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "model": self.model_id,
+            "loaded": self._loaded,
+            "language": self.language,
+            "load_time_ms": self.last_load_time_ms,
+            "warmup_ms": self.last_warmup_ms,
+            "warmup_failed": self.last_warmup_failed,
+            "warm": (
+                self._loaded
+                and self.last_warmup_ms is not None
+                and self.last_warmup_failed is None
+            ),
+        }
 
     # ------------------------------------------------------------------
     # Dispatch
@@ -387,11 +448,7 @@ class Runner:
             elif method == "warm_up":
                 respond(rid, self.warm_up())
             elif method == "health":
-                respond(rid, {
-                    "model": self.model_id,
-                    "loaded": self._loaded,
-                    "language": self.language,
-                })
+                respond(rid, self.health())
             else:
                 respond_error(rid, 404, f"unknown method: {method}")
         except Exception as exc:  # noqa: BLE001
@@ -403,6 +460,15 @@ class Runner:
 def main() -> None:
     _stderr("starting")
     runner = Runner()
+    # Warm up BEFORE emitting `ready`, mirroring the brain sidecar
+    # contract: when the Mac sees "ready" the model is genuinely
+    # hot, not just instantiated. Without this, the user's first
+    # transcribe (typically their first wake word) pays the full
+    # ~3–5 s load+JIT cost on top of speech latency.
+    try:
+        runner.warm_up()
+    except Exception as exc:  # noqa: BLE001
+        _stderr(f"warm_up at boot failed (non-fatal): {exc}")
     emit({"event": "ready"})
     _stderr("ready emitted")
     for line in sys.stdin:

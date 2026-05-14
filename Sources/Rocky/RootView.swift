@@ -39,8 +39,23 @@ struct RootView: View {
                         .transition(.opacity)
                 }
             }
+            .overlay {
+                // Bot-connecting overlay — only shown post-first-run
+                // (FirstRunOverlay's `connect` step handles the same
+                // signal during onboarding). Reads `daemonReachability`
+                // and stays up until the daemon is online OR the user
+                // dismisses with "Use offline" (session-sticky via
+                // BotConnectingOverlay's internal @State).
+                if services.settings.firstRunCompleted,
+                   services.daemonReachability != .online {
+                    BotConnectingOverlay()
+                        .transition(.opacity)
+                }
+            }
             .animation(.easeInOut(duration: 0.25),
                        value: services.settings.firstRunCompleted)
+            .animation(.easeInOut(duration: 0.3),
+                       value: services.daemonReachability)
             .sheet(isPresented: $bindable.commandPaletteOpen) { CommandPalette() }
     }
 

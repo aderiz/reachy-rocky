@@ -177,7 +177,8 @@ public actor MomentFeed {
         case .motorCommand, .motorState, .stateStream, .daemonStatus,
              .robotLink, .faceTarget, .vadSegment, .sttPartial,
              .conversationWindow, .ttsRequest, .ttsChunk,
-             .sidecarLog, .addressFilterAccept, .addressFilterDrop:
+             .sidecarLog, .addressFilterAccept, .addressFilterDrop,
+             .brainResponse, .turnProfile, .audioPlaybackStarted:
             return
         }
     }

@@ -174,6 +174,30 @@ public actor CognitionEngine {
                     continuation.yield(.assistantFinal(
                         reply, latencyMs: latencyMs, firstChunkMs: latencyMs
                     ))
+                    // CRITICAL: fast-path replies are plain text. They
+                    // bypass the brain loop entirely, which means none
+                    // of the brain-side auto-say exit paths fire — the
+                    // chat bubble would show but no audio would play.
+                    // Manually invoke the `say` tool here so the
+                    // reply is spoken. This is the systematic fix for
+                    // the "weather replies never speak" bug: every
+                    // intent registered via fastPath.register
+                    // (weather, time, calendar, search, memory) hit
+                    // the same dead end before this.
+                    struct SayArgs: Encodable { let text: String }
+                    let argsJSON = (try? JSONEncoder().encode(SayArgs(text: reply)))
+                        .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+                    let sayResult = await registry.invoke(
+                        name: "say",
+                        argumentsJSON: argsJSON,
+                        llmMessageId: "fast-path-say"
+                    )
+                    continuation.yield(.toolCallDispatched(
+                        name: "say",
+                        argumentsJSON: argsJSON,
+                        id: "fast-path-say"
+                    ))
+                    continuation.yield(.toolCallResult(sayResult))
                     await logBus.publish(.sidecarLog(
                         sidecar: "cognition",
                         level: .info,
@@ -229,6 +253,14 @@ public actor CognitionEngine {
         // text and no `say`, auto-dispatch the text so the user
         // actually hears Rocky.
         var spokeThisTurn = false
+        // Most recent non-empty assistant text seen across rounds.
+        // The auto-say at the no-tool-calls branch only fires on
+        // text emitted in *that* round, so when the model emits its
+        // answer text + a data tool (e.g. `get_weather`) in round 1
+        // and then nothing in round 2, the text was visible in chat
+        // but silent — round 2's auto-say had no input. Carry the
+        // latest text forward and let every exit path consult it.
+        var latestText = ""
 
         while rounds < config.maxToolRounds {
             rounds += 1
@@ -253,6 +285,18 @@ public actor CognitionEngine {
                 image: image
             )
 
+            // Repetition trap detector. Some models (notably Gemma 4
+            // in Harmony thought-channel mode) lock into a loop
+            // emitting `<thought>call:</call><|channel|>thought` over
+            // and over without ever producing a real response. Without
+            // a guard, this burns the full `max_tokens` budget (~30 s
+            // of wasted decode) before the stream ends naturally.
+            // We watch the tail of `assistantText`: if the last
+            // RepetitionWindow chars contain the same RepetitionSlice
+            // sequence more than RepetitionThreshold times in a row,
+            // the stream is stuck and we break out early.
+            var repetitionAborted = false
+
             for try await chunk in stream {
                 if firstChunkMs == nil {
                     firstChunkMs = Date().timeIntervalSince(started) * 1000
@@ -260,6 +304,20 @@ public actor CognitionEngine {
                 if let delta = chunk.contentDelta, !delta.isEmpty {
                     assistantText += delta
                     continuation.yield(.assistantDelta(delta))
+                    // Check for repetition every few chunks (cheap —
+                    // operates on the last ~600 chars). If detected,
+                    // log + break out of the stream loop early.
+                    if assistantText.count > 240,
+                       Self.detectRepetitionTrap(in: assistantText) {
+                        repetitionAborted = true
+                        await logBus.publish(.sidecarLog(
+                            sidecar: "cognition",
+                            level: .warn,
+                            message: "repetition trap detected; aborting stream",
+                            fields: ["tail": String(assistantText.suffix(160))]
+                        ))
+                        break
+                    }
                 }
                 for tc in chunk.toolCallDeltas {
                     sawToolCalls = true
@@ -270,36 +328,99 @@ public actor CognitionEngine {
                     }
                 }
             }
+            // If we aborted the stream due to repetition, scrub the
+            // junk tail from assistantText so it doesn't pollute
+            // latestText or the chat bubble. The text leading up
+            // to the trap (if any) is preserved.
+            if repetitionAborted {
+                assistantText = Self.scrubRepetitionTail(from: assistantText)
+            }
+            // Cache the cleaned text from this round (after the
+            // fenced-tool-call strip below would have run) so any
+            // later exit path can recover the spoken answer if the
+            // model never wrapped it in `say`. We use the raw
+            // assistantText here because cleanupForTTS is also
+            // applied at the auto-say site.
+            if !assistantText.isEmpty {
+                latestText = assistantText
+            }
 
             if !sawToolCalls {
                 // Defensive parse: some models (Gemma 4 etc.) don't emit
                 // OpenAI `tool_calls` reliably. They sometimes embed tool
-                // invocations inside a ```json``` fence. Try to recover.
+                // invocations inside a ```json``` fence. Try fenced
+                // recovery first, then bare-call recovery as a fallback.
                 let toolNames = await registry.names
-                let extractedCalls = Self.extractFencedToolCalls(
+                var extractedCalls = Self.extractFencedToolCalls(
                     in: assistantText, knownTools: toolNames
                 )
+                var prefix = "fenced"
+                if extractedCalls.isEmpty {
+                    // Bare-call recovery: model emitted tool-call syntax
+                    // as plain content, e.g.
+                    //     express({"name": "curious", "text": "..."})
+                    extractedCalls = Self.extractBareCallToolCalls(
+                        in: assistantText, knownTools: toolNames
+                    )
+                    if !extractedCalls.isEmpty { prefix = "bare" }
+                }
+                if extractedCalls.isEmpty {
+                    // Tag-style recovery: model emitted XML-tag
+                    // shape, e.g. `<say>{text: Bye bye.}</say>` or
+                    // `<express>{name: curious, text: "..."}</express>`.
+                    // Inner is JSON-or-pseudo-JSON-or-plain — the
+                    // normaliser handles all three.
+                    extractedCalls = Self.extractTagStyleToolCalls(
+                        in: assistantText, knownTools: toolNames
+                    )
+                    if !extractedCalls.isEmpty { prefix = "tag" }
+                }
                 if !extractedCalls.isEmpty {
                     sawToolCalls = true
                     for (index, call) in extractedCalls.enumerated() {
                         toolNamesByIndex[index] = call.name
                         toolArgsByIndex[index] = call.argumentsJSON
-                        toolIdsByIndex[index] = "fenced_\(index)"
+                        toolIdsByIndex[index] = "\(prefix)_\(index)"
                     }
-                    // Strip fenced blocks from the assistant message we
-                    // commit to the transcript so we don't keep the JSON
-                    // visible in the chat.
+                    // Strip every recognised syntax shape so the
+                    // transcript doesn't keep raw markers visible:
+                    // fenced JSON blocks, bare `name({...})` calls,
+                    // tag-style `<name>...</name>` blocks, Harmony
+                    // thought-channel tags, and stray non-Latin
+                    // glitch text (Gemma sometimes prefixes with
+                    // Chinese/Cyrillic characters).
                     assistantText = Self.stripFencedJSONBlocks(from: assistantText)
+                    assistantText = Self.stripBareCallBlocks(
+                        from: assistantText, knownTools: toolNames
+                    )
+                    assistantText = Self.stripTagStyleBlocks(
+                        from: assistantText, knownTools: toolNames
+                    )
+                    assistantText = Self.stripThoughtMarkers(assistantText)
+                    assistantText = Self.stripNonLatinNoise(assistantText)
                     continuation.yield(.assistantDelta(
                         "\u{2009}"  // hairspace marker, no-op visually
                     ))
+                    await logBus.publish(.sidecarLog(
+                        sidecar: "cognition",
+                        level: .info,
+                        message: "recovered tool calls from text content",
+                        fields: [
+                            "shape": prefix,
+                            "count": "\(extractedCalls.count)",
+                        ]
+                    ))
                 } else {
-                    // Clean up cosmetic quote-wrapping for both the
-                    // chat and TTS — the persona prompt forbids it
-                    // but small models keep doing it. Strip at the
-                    // boundary so the transcript and the spoken
-                    // audio agree.
-                    let cleanedText = Self.cleanupForTTS(assistantText)
+                    // Full scrub chain for the no-tool-calls path.
+                    // Both the chat bubble and the auto-say input
+                    // come from `cleanedText`, so doing this once
+                    // at the boundary keeps them in sync.
+                    var scrubbed = Self.stripTagStyleBlocks(
+                        from: assistantText, knownTools: toolNames
+                    )
+                    scrubbed = Self.stripThoughtMarkers(scrubbed)
+                    scrubbed = Self.stripNonLatinNoise(scrubbed)
+                    let cleanedText = Self.cleanupForTTS(scrubbed)
                     let totalMs = Date().timeIntervalSince(started) * 1000
                     continuation.yield(.assistantFinal(
                         cleanedText, latencyMs: totalMs, firstChunkMs: firstChunkMs
@@ -312,29 +433,16 @@ public actor CognitionEngine {
                     // the assistant message instead of calling the
                     // tool, leaving Rocky silent while the chat shows
                     // text.
-                    // Auto-say only when the cleaned text contains
-                    // actual letters. The strip passes above can
-                    // leave punctuation residue (`. ,` etc.) when
-                    // the model emitted nothing but tool-code
-                    // artifacts; saying that aloud is worse than
-                    // saying nothing.
-                    let toSpeak = cleanedText
-                    let hasLetters = toSpeak.contains(where: \.isLetter)
-                    if !spokeThisTurn, !toSpeak.isEmpty, hasLetters {
-                        struct SayArgs: Encodable { let text: String }
-                        let args = (try? JSONEncoder().encode(SayArgs(text: toSpeak)))
-                            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-                        let result = await registry.invoke(
-                            name: "say",
-                            argumentsJSON: args,
-                            llmMessageId: "auto-say"
+                    let preferred = cleanedText.isEmpty
+                        ? Self.cleanupForTTS(latestText)
+                        : cleanedText
+                    if !spokeThisTurn {
+                        await maybeAutoSay(
+                            text: preferred,
+                            registry: registry,
+                            continuation: continuation,
+                            spokeThisTurn: &spokeThisTurn
                         )
-                        continuation.yield(.toolCallDispatched(
-                            name: "say",
-                            argumentsJSON: args,
-                            id: "auto-say"
-                        ))
-                        continuation.yield(.toolCallResult(result))
                     }
                     // Post-turn write — fire-and-forget. Same helper
                     // every other turn-exit path uses, so the write
@@ -357,7 +465,7 @@ public actor CognitionEngine {
 
             // The model emitted tool calls. Append the assistant message
             // (with the tool_calls), then run each, then loop.
-            let calls: [ToolCall] = toolNamesByIndex.keys.sorted().map { idx in
+            let rawCalls: [ToolCall] = toolNamesByIndex.keys.sorted().map { idx in
                 ToolCall(
                     id: toolIdsByIndex[idx] ?? "call_\(idx)",
                     type: "function",
@@ -367,9 +475,79 @@ public actor CognitionEngine {
                     )
                 )
             }
+            // **Speech deduplication.** `say`, `express`, and
+            // `play_emotion` all produce robot audio. The persona
+            // forbids emitting more than one per turn, but Gemma
+            // occasionally emits two (`express` + `say` with nearly
+            // identical text), which makes Rocky speak the answer
+            // twice. Keep only the FIRST speech tool in this round;
+            // every other tool (data tools, motion tools) passes
+            // through unchanged. This is the minimum-impact fix —
+            // it doesn't defer or reorder anything, so the brain's
+            // intended turn structure (data tools + one speech in
+            // the same response) keeps working.
+            let speechToolNames: Set<String> = ["say", "express", "play_emotion"]
+            var seenSpeech = false
+            let calls: [ToolCall] = rawCalls.filter { call in
+                if speechToolNames.contains(call.function.name) {
+                    if seenSpeech { return false }
+                    seenSpeech = true
+                }
+                return true
+            }
+            if calls.count != rawCalls.count {
+                await logBus.publish(.sidecarLog(
+                    sidecar: "cognition",
+                    level: .warn,
+                    message: "dropped duplicate speech tool(s) in single round",
+                    fields: [
+                        "raw_count": "\(rawCalls.count)",
+                        "kept_count": "\(calls.count)",
+                        "raw_names": rawCalls.map(\.function.name).joined(separator: ","),
+                    ]
+                ))
+            }
+            // Sanitize the content text before committing it to
+            // the transcript AND yielding a final replacement to
+            // the chat bubble. The model sometimes emits a tool
+            // call AS a real `tool_calls` field AND duplicates the
+            // same call in content (`express({...})` written out
+            // as prose). Without this strip, the bubble shows the
+            // raw JSON syntax. Order matters:
+            //   1. Drop fenced JSON blocks (already accounted for
+            //      as proper calls upstream).
+            //   2. Drop bare-call syntax (same — those would have
+            //      been duplicates of the calls we're about to
+            //      dispatch).
+            //   3. Drop Harmony thought-channel markers so any
+            //      `<thought>call:</call>` wrappers don't leak.
+            //   4. Apply standard TTS cleanup so the bubble + the
+            //      transcript see the same surface text.
+            let toolNamesForStrip = await registry.names
+            var sanitizedText = Self.stripFencedJSONBlocks(from: assistantText)
+            sanitizedText = Self.stripBareCallBlocks(
+                from: sanitizedText, knownTools: toolNamesForStrip
+            )
+            sanitizedText = Self.stripTagStyleBlocks(
+                from: sanitizedText, knownTools: toolNamesForStrip
+            )
+            sanitizedText = Self.stripThoughtMarkers(sanitizedText)
+            sanitizedText = Self.stripNonLatinNoise(sanitizedText)
+            sanitizedText = Self.cleanupForTTS(sanitizedText)
+            // Yield a final-replacement event so the chat bubble
+            // updates from the raw delta stream to the clean text.
+            // AppServices' consumer treats `assistantFinal`'s first
+            // argument as the authoritative bubble content (see the
+            // updated handler).
+            if sanitizedText != assistantText {
+                let totalMs = Date().timeIntervalSince(started) * 1000
+                continuation.yield(.assistantFinal(
+                    sanitizedText, latencyMs: totalMs, firstChunkMs: firstChunkMs
+                ))
+            }
             let assistantMsg = ChatMessage(
                 role: .assistant,
-                content: assistantText.isEmpty ? nil : assistantText,
+                content: sanitizedText.isEmpty ? nil : sanitizedText,
                 toolCalls: calls
             )
             transcript.append(assistantMsg)
@@ -400,13 +578,21 @@ public actor CognitionEngine {
                     name: call.function.name,
                     toolCallId: call.id
                 ))
-                if call.function.name == "say" {
+                if speechToolNames.contains(call.function.name) {
                     spokeThisTurn = true
                 }
             }
             for sig in signatures { dispatchedSignatures.insert(sig) }
 
             if allRepeats {
+                if !spokeThisTurn {
+                    await maybeAutoSay(
+                        text: Self.cleanupForTTS(latestText),
+                        registry: registry,
+                        continuation: continuation,
+                        spokeThisTurn: &spokeThisTurn
+                    )
+                }
                 continuation.yield(.error(
                     "model repeated identical tool calls; ending turn"
                 ))
@@ -415,12 +601,19 @@ public actor CognitionEngine {
                 )
                 return
             }
-            // End the turn once `say` has fired. After Rocky has
-            // spoken, looping back to the brain causes the model to
-            // chatter on (a different sentence than what was spoken)
-            // and that follow-up text becomes the chat bubble — so
-            // the chat and TTS diverge. The semantic contract is
-            // "say IS the response"; nothing more is expected.
+            // End the turn the moment `say` fires. The preamble +
+            // tool pattern was tried (with a `nonSayCalls.isEmpty`
+            // carve-out that let `say` + a data tool batch loop back
+            // for an answer round) and it caused two problems:
+            //  1. Doubled the user's wait by playing filler audio
+            //     before the real answer.
+            //  2. Brain round 2 hung past the 60 s drain timeout
+            //     on Gemma 4 26B-A4B, leaving the user with only
+            //     the preamble and a "brain timeout" message.
+            // The persona prompt now forbids preamble speaking calls
+            // (data tools run first, then ONE speaking tool with the
+            // full answer). With that guidance + this strict
+            // end-on-say, every turn is a single brain round.
             if spokeThisTurn {
                 // CRITICAL: previously the post-turn memory write
                 // lived ONLY in the no-tools branch above, so every
@@ -440,8 +633,86 @@ public actor CognitionEngine {
         // Hit max rounds — surface a soft warning rather than hanging.
         // Still record the exchange so the next session has the
         // user's turn at least.
+        if !spokeThisTurn {
+            await maybeAutoSay(
+                text: Self.cleanupForTTS(latestText),
+                registry: registry,
+                continuation: continuation,
+                spokeThisTurn: &spokeThisTurn
+            )
+        }
         Self.writeTurnToMemory(memory: memory, userText: userText, calls: [])
         continuation.yield(.error("hit max tool rounds (\(config.maxToolRounds))"))
+    }
+
+    /// Auto-dispatch text content to `say` when the model emitted
+    /// natural-language prose but forgot to wrap it in the speech
+    /// tool. Small LLMs (Gemma 4 in particular) routinely do this
+    /// after a data-tool round, leaving Rocky silent while the chat
+    /// shows the answer.
+    ///
+    /// Only fires when the text contains real letters — strip
+    /// passes occasionally leave punctuation residue and saying
+    /// "..." aloud is worse than saying nothing.
+    private func maybeAutoSay(
+        text: String,
+        registry: ToolRegistry,
+        continuation: AsyncThrowingStream<Output, Error>.Continuation,
+        spokeThisTurn: inout Bool
+    ) async {
+        // DEFENSE: never speak text that still looks like a tool call.
+        // The brain occasionally emits `say({"text": "..."})` or
+        // `express({"name": "curious", ...})` as plain content
+        // instead of as a real tool call; the bare-call recovery
+        // upstream should have caught those and dispatched them as
+        // real calls, but if recovery fails (malformed JSON, etc.)
+        // we MUST NOT pass the raw syntax to the say tool — TTS
+        // will literally pronounce the JSON aloud, which is what
+        // the user saw on screen as the chat bubble.
+        let toolNames = await registry.names
+        var sanitized = Self.stripBareCallBlocks(
+            from: text, knownTools: toolNames
+        )
+        sanitized = Self.stripTagStyleBlocks(
+            from: sanitized, knownTools: toolNames
+        )
+        sanitized = Self.stripThoughtMarkers(sanitized)
+        sanitized = Self.stripNonLatinNoise(sanitized)
+        sanitized = sanitized.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // If stripping bare-call patterns removed too much of the
+        // text, the WHOLE message was tool-call syntax. Refuse to
+        // speak anything rather than speak a fragment ripped from
+        // an args dict.
+        let original = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if Self.looksLikeToolCall(original, knownTools: toolNames) {
+            await logBus.publish(.sidecarLog(
+                sidecar: "cognition",
+                level: .warn,
+                message: "auto-say refused: text looks like tool-call syntax",
+                fields: ["preview": String(original.prefix(80))]
+            ))
+            return
+        }
+
+        guard !sanitized.isEmpty,
+              sanitized.contains(where: \.isLetter)
+        else { return }
+        struct SayArgs: Encodable { let text: String }
+        let args = (try? JSONEncoder().encode(SayArgs(text: sanitized)))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        let result = await registry.invoke(
+            name: "say",
+            argumentsJSON: args,
+            llmMessageId: "auto-say"
+        )
+        continuation.yield(.toolCallDispatched(
+            name: "say",
+            argumentsJSON: args,
+            id: "auto-say"
+        ))
+        continuation.yield(.toolCallResult(result))
+        spokeThisTurn = true
     }
 
     /// Append the user's turn + Rocky's spoken text (extracted from
@@ -594,10 +865,31 @@ public actor CognitionEngine {
     private static func injectRecall(
         envelope: ChatMessage?, into transcript: [ChatMessage]
     ) -> [ChatMessage] {
-        guard let envelope else { return transcript }
+        guard let envelope, let body = envelope.content, !body.isEmpty else {
+            return transcript
+        }
+        // Merge the recall envelope INTO the existing system message
+        // rather than inserting a second one. Qwen3.5's chat template
+        // (and a couple of other strict-template models) rejects
+        // transcripts with more than one system message — the error
+        // surfaces as `prompt template failed: System message must
+        // ...`. Concatenating keeps the transcript shape templated
+        // models accept while still giving the LLM the recalled
+        // context. Models that DO tolerate multiple system messages
+        // (Gemma, Llama) are unaffected — they just see a slightly
+        // longer system prompt.
         var msgs = transcript
-        let insertAt = msgs.first?.role == .system ? 1 : 0
-        msgs.insert(envelope, at: insertAt)
+        if let firstRole = msgs.first?.role, firstRole == .system {
+            let existing = msgs[0].content ?? ""
+            let joined = existing.isEmpty
+                ? body
+                : "\(existing)\n\n\(body)"
+            msgs[0] = .init(role: .system, content: joined)
+        } else {
+            // No system prompt up front (unusual) — fall back to
+            // prepending the envelope as the new system message.
+            msgs.insert(.init(role: .system, content: body), at: 0)
+        }
         return msgs
     }
 
@@ -636,6 +928,411 @@ public actor CognitionEngine {
             }
         }
         return found
+    }
+
+    /// Scan plain text for tag-style tool invocations like
+    ///     <say>{"text": "Hello."}</say>
+    ///     <say>{text: Bye bye. Come back soon, question?}</say>
+    ///     <express>{name: curious, text: "Apple legend."}</express>
+    ///     <say>Hello.</say>
+    ///
+    /// Some Gemma 4 variants emit this shape instead of native
+    /// `tool_calls` or bare `name({...})`. Inner content is parsed
+    /// best-effort: real JSON first, then a relaxed grab of common
+    /// key/value pairs (`text:`, `name:`) when the model emitted
+    /// pseudo-JSON with unquoted keys.
+    public static func extractTagStyleToolCalls(
+        in text: String, knownTools: [String]
+    ) -> [(name: String, argumentsJSON: String)] {
+        guard !text.isEmpty else { return [] }
+        let allowed = Set(knownTools)
+        var found: [(String, String)] = []
+        for tool in knownTools.sorted(by: { $0.count > $1.count }) {
+            guard allowed.contains(tool) else { continue }
+            let open = "<\(tool)>"
+            let close = "</\(tool)>"
+            var searchRange = text.startIndex..<text.endIndex
+            while let openRange = text.range(of: open, range: searchRange),
+                  let closeRange = text.range(
+                    of: close,
+                    range: openRange.upperBound..<text.endIndex
+                  )
+            {
+                let inner = String(
+                    text[openRange.upperBound..<closeRange.lowerBound]
+                ).trimmingCharacters(in: .whitespacesAndNewlines)
+                let argsJSON = normaliseTagInner(inner)
+                found.append((tool, argsJSON))
+                searchRange = closeRange.upperBound..<text.endIndex
+            }
+        }
+        return found
+    }
+
+    /// Take the raw inner string of a `<toolName>...</toolName>` tag
+    /// and produce a valid JSON object string suitable for the tool
+    /// registry. Tries:
+    ///   1. Parse as JSON object directly.
+    ///   2. Relaxed pseudo-JSON: capture `key: value` pairs
+    ///      (unquoted keys, freeform values up to comma / closing brace).
+    ///   3. Fallback — wrap the whole inner as `{"text": "<inner>"}`
+    ///      since `say` and `express` both take a `text` field.
+    private static func normaliseTagInner(_ raw: String) -> String {
+        // 1. Direct JSON.
+        if raw.hasPrefix("{"),
+           let data = raw.data(using: .utf8),
+           let _ = try? JSONSerialization.jsonObject(with: data)
+        {
+            return raw
+        }
+        // 2. Pseudo-JSON: `{text: Bye bye. Hello, question?}`
+        if raw.hasPrefix("{"), raw.hasSuffix("}") {
+            let body = String(raw.dropFirst().dropLast())
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if let parsed = relaxedKeyValueParse(body) {
+                return parsed
+            }
+        }
+        // 3. Bare inner — treat as the `text` payload.
+        let encoded = jsonEscape(raw)
+        return "{\"text\": \"\(encoded)\"}"
+    }
+
+    /// Parse a comma-and-colon-separated string of `key: value`
+    /// pairs into a JSON object. Permissive on quoting: keys may
+    /// be unquoted bare identifiers (`text`, `name`); values are
+    /// taken as the text up to the next top-level comma, then
+    /// JSON-escaped.
+    private static func relaxedKeyValueParse(_ body: String) -> String? {
+        // Split on top-level commas (ignore commas inside `[]` / `{}`
+        // / quoted strings).
+        var depth = 0
+        var inString = false
+        var escape = false
+        var parts: [String] = []
+        var current = ""
+        for c in body {
+            if escape { escape = false; current.append(c); continue }
+            if inString {
+                if c == "\\" { escape = true }
+                if c == "\"" { inString = false }
+                current.append(c)
+                continue
+            }
+            switch c {
+            case "\"":
+                inString = true; current.append(c)
+            case "{", "[":
+                depth += 1; current.append(c)
+            case "}", "]":
+                depth -= 1; current.append(c)
+            case ",":
+                if depth == 0 {
+                    parts.append(current); current = ""
+                } else {
+                    current.append(c)
+                }
+            default:
+                current.append(c)
+            }
+        }
+        if !current.trimmingCharacters(in: .whitespaces).isEmpty {
+            parts.append(current)
+        }
+        var dict: [String: String] = [:]
+        for part in parts {
+            // Split on FIRST colon.
+            guard let colon = part.firstIndex(of: ":") else { continue }
+            let key = part[..<colon]
+                .trimmingCharacters(in: CharacterSet.whitespaces.union(.init(charactersIn: "\"")))
+            let value = part[part.index(after: colon)...]
+                .trimmingCharacters(in: CharacterSet.whitespaces.union(.init(charactersIn: "\"")))
+            guard !key.isEmpty else { continue }
+            dict[String(key)] = String(value)
+        }
+        guard !dict.isEmpty else { return nil }
+        // Re-emit as proper JSON, JSON-escaping each value.
+        var out = "{"
+        for (i, kv) in dict.enumerated() {
+            if i > 0 { out += ", " }
+            out += "\"\(jsonEscape(kv.key))\": \"\(jsonEscape(kv.value))\""
+        }
+        out += "}"
+        return out
+    }
+
+    private static func jsonEscape(_ s: String) -> String {
+        var out = ""
+        out.reserveCapacity(s.count)
+        for c in s {
+            switch c {
+            case "\\": out.append("\\\\")
+            case "\"": out.append("\\\"")
+            case "\n": out.append("\\n")
+            case "\r": out.append("\\r")
+            case "\t": out.append("\\t")
+            default:   out.append(c)
+            }
+        }
+        return out
+    }
+
+    /// Remove `<toolName>...</toolName>` tag spans from `text` — used
+    /// alongside `stripBareCallBlocks` to scrub the chat bubble and
+    /// TTS input after the calls have been routed.
+    public static func stripTagStyleBlocks(
+        from text: String, knownTools: [String]
+    ) -> String {
+        var result = text
+        for tool in knownTools.sorted(by: { $0.count > $1.count }) {
+            let open = "<\(tool)>"
+            let close = "</\(tool)>"
+            while let openRange = result.range(of: open) {
+                if let closeRange = result.range(
+                    of: close,
+                    range: openRange.upperBound..<result.endIndex
+                ) {
+                    result.replaceSubrange(
+                        openRange.lowerBound..<closeRange.upperBound, with: ""
+                    )
+                } else {
+                    // Unmatched opener — drop everything from open
+                    // to end-of-text (truncated stream).
+                    result.replaceSubrange(
+                        openRange.lowerBound..<result.endIndex, with: ""
+                    )
+                    break
+                }
+            }
+        }
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Drop the runs of non-Latin script characters Gemma 4 sometimes
+    /// emits as preamble (Chinese, Cyrillic, Arabic, etc.) — these
+    /// aren't English content, they're model glitches that the user
+    /// definitely doesn't want spoken or displayed. We keep
+    /// punctuation, digits, and the Latin alphabet; everything else
+    /// in the Unicode scalar ranges of common non-Latin scripts is
+    /// stripped.
+    ///
+    /// Pragmatic threshold: only strips clearly-non-Latin runs of
+    /// length ≥ 1. We don't try to detect "this whole sentence is
+    /// Spanish" because legitimate user speech might include
+    /// non-Latin names; the goal is to scrub random glitches like
+    /// "驱动 <say>...".
+    public static func stripNonLatinNoise(_ text: String) -> String {
+        var out = String.UnicodeScalarView()
+        for scalar in text.unicodeScalars {
+            // CJK Unified Ideographs, Hangul, Hiragana, Katakana,
+            // Cyrillic, Arabic — common Gemma glitch scripts.
+            let v = scalar.value
+            let isCJK     = (0x4E00...0x9FFF).contains(v)
+                         || (0x3400...0x4DBF).contains(v)
+                         || (0x20000...0x2A6DF).contains(v)
+            let isHangul  = (0xAC00...0xD7AF).contains(v)
+                         || (0x1100...0x11FF).contains(v)
+            let isKana    = (0x3040...0x30FF).contains(v)
+            let isCyrillic = (0x0400...0x04FF).contains(v)
+            let isArabic  = (0x0600...0x06FF).contains(v)
+            if isCJK || isHangul || isKana || isCyrillic || isArabic {
+                continue
+            }
+            out.append(scalar)
+        }
+        return String(out)
+            // Collapse any whitespace that remained after stripping.
+            .replacingOccurrences(of: "  ", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Scan plain text for bare-call tool invocations like
+    ///     say({"text": "Hello."})
+    ///     express({"name": "curious", "text": "..."})
+    /// emitted by the model into the assistant content stream
+    /// instead of as real tool_calls. Returns matched name+args
+    /// pairs in document order.
+    ///
+    /// Why this exists: smaller LLMs (Gemma 4 in particular) routinely
+    /// emit tool-call syntax as plain text. Without recovery, the
+    /// auto-say at the end of the no-tool branch would pass that
+    /// raw `say({...})` string to the say tool, and TTS would
+    /// pronounce the JSON aloud — heard on-device as "say open
+    /// brace text colon quote rocky..." This guard catches that
+    /// shape and routes it as a real call.
+    ///
+    /// Parser strategy: scan for each known tool name as a prefix,
+    /// then walk forward through whitespace looking for `(`, then
+    /// extract balanced `{...}` JSON via `(` / `)` depth tracking.
+    /// Only accept matches whose extracted JSON parses successfully.
+    public static func extractBareCallToolCalls(
+        in text: String,
+        knownTools: [String]
+    ) -> [(name: String, argumentsJSON: String)] {
+        guard !text.isEmpty else { return [] }
+        let allowed = Set(knownTools)
+        // Match longer names first so "look_at_object" wins over "look".
+        let byLength = knownTools.sorted { $0.count > $1.count }
+        let chars = Array(text)
+        var found: [(name: String, argumentsJSON: String)] = []
+        var i = 0
+        while i < chars.count {
+            var matched: (name: String, nextIndex: Int, args: String)? = nil
+            for name in byLength {
+                let nameChars = Array(name)
+                guard i + nameChars.count <= chars.count else { continue }
+                // Compare prefix.
+                var ok = true
+                for k in 0..<nameChars.count {
+                    if chars[i + k] != nameChars[k] { ok = false; break }
+                }
+                guard ok else { continue }
+                // Word boundary at left edge — don't match `display(`
+                // as `play(`. Allow start-of-string or non-word char.
+                if i > 0 {
+                    let prev = chars[i - 1]
+                    let isWord = prev.isLetter || prev.isNumber || prev == "_"
+                    if isWord { continue }
+                }
+                // Walk forward through whitespace to find `(`.
+                var j = i + nameChars.count
+                while j < chars.count, chars[j].isWhitespace { j += 1 }
+                guard j < chars.count, chars[j] == "(" else { continue }
+                // Find balanced closing `)` while tracking braces+parens
+                // and skipping string contents (so a `)` inside a JSON
+                // string doesn't terminate the call early).
+                var depth = 1
+                var k = j + 1
+                var inString = false
+                var escape = false
+                while k < chars.count {
+                    let c = chars[k]
+                    if escape {
+                        escape = false
+                    } else if inString {
+                        if c == "\\" { escape = true }
+                        else if c == "\"" { inString = false }
+                    } else {
+                        if c == "\"" { inString = true }
+                        else if c == "(" { depth += 1 }
+                        else if c == ")" {
+                            depth -= 1
+                            if depth == 0 { break }
+                        }
+                    }
+                    k += 1
+                }
+                guard k < chars.count, depth == 0 else { continue }
+                // Args span: text between `(` and `)`, trimmed.
+                let argsRaw = String(chars[(j + 1)..<k])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                // The args must be a valid JSON object. Reject calls
+                // whose interior won't parse — keeps us from
+                // misclassifying random prose like "say (well)".
+                guard let data = argsRaw.data(using: .utf8),
+                      let _ = try? JSONSerialization.jsonObject(with: data)
+                            as? [String: Any]
+                else { continue }
+                matched = (name: name, nextIndex: k + 1, args: argsRaw)
+                break
+            }
+            if let m = matched, allowed.contains(m.name) {
+                found.append((m.name, m.args))
+                i = m.nextIndex
+            } else {
+                i += 1
+            }
+        }
+        return found
+    }
+
+    /// Remove bare-call patterns from `text`. Used to scrub the
+    /// transcript and TTS input after the calls have been routed
+    /// through the registry, so the raw syntax doesn't leak into
+    /// the chat bubble or speech.
+    public static func stripBareCallBlocks(
+        from text: String,
+        knownTools: [String]
+    ) -> String {
+        guard !text.isEmpty else { return text }
+        let byLength = knownTools.sorted { $0.count > $1.count }
+        let chars = Array(text)
+        var out: [Character] = []
+        out.reserveCapacity(chars.count)
+        var i = 0
+        while i < chars.count {
+            var stripTo: Int? = nil
+            for name in byLength {
+                let nameChars = Array(name)
+                guard i + nameChars.count <= chars.count else { continue }
+                var ok = true
+                for k in 0..<nameChars.count {
+                    if chars[i + k] != nameChars[k] { ok = false; break }
+                }
+                guard ok else { continue }
+                if i > 0 {
+                    let prev = chars[i - 1]
+                    let isWord = prev.isLetter || prev.isNumber || prev == "_"
+                    if isWord { continue }
+                }
+                var j = i + nameChars.count
+                while j < chars.count, chars[j].isWhitespace { j += 1 }
+                guard j < chars.count, chars[j] == "(" else { continue }
+                var depth = 1
+                var k = j + 1
+                var inString = false
+                var escape = false
+                while k < chars.count {
+                    let c = chars[k]
+                    if escape { escape = false }
+                    else if inString {
+                        if c == "\\" { escape = true }
+                        else if c == "\"" { inString = false }
+                    } else {
+                        if c == "\"" { inString = true }
+                        else if c == "(" { depth += 1 }
+                        else if c == ")" {
+                            depth -= 1
+                            if depth == 0 { break }
+                        }
+                    }
+                    k += 1
+                }
+                guard k < chars.count, depth == 0 else { continue }
+                // Accept the strip even if the inside doesn't parse —
+                // we'd rather scrub a malformed `say({...})` than
+                // pronounce it.
+                stripTo = k + 1
+                break
+            }
+            if let next = stripTo {
+                i = next
+            } else {
+                out.append(chars[i])
+                i += 1
+            }
+        }
+        return String(out).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Returns true when `text` is mostly composed of tool-call
+    /// syntax in any shape — bare `name({...})`, tag `<name>...
+    /// </name>`, or thought-channel markers. Stripping all
+    /// recognised shapes leaves <30 % of the original (whitespace
+    /// excluded). Used by `maybeAutoSay` to refuse speaking text
+    /// the model emitted as syntax-only.
+    public static func looksLikeToolCall(
+        _ text: String,
+        knownTools: [String]
+    ) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        var stripped = stripBareCallBlocks(from: trimmed, knownTools: knownTools)
+        stripped = stripTagStyleBlocks(from: stripped, knownTools: knownTools)
+        stripped = stripThoughtMarkers(stripped)
+        if stripped.isEmpty { return true }
+        let ratio = Double(stripped.count) / Double(max(1, trimmed.count))
+        return ratio < 0.30
     }
 
     /// Parse a single tool-call object across the half-dozen shapes the
@@ -703,6 +1400,121 @@ public actor CognitionEngine {
     /// The persona prompt also instructs the model to use spoken
     /// form natively, but small models forget; cleanup at the
     /// boundary is the reliable fix.
+    /// Strip Harmony / Gemma 4 thought-channel markers from text so
+    /// they don't show up in the chat bubble or get pronounced by
+    /// TTS. Examples seen in production:
+    ///
+    ///   <thought>call:say({"text": "..."})</call>
+    ///   <thought>call:</call><|channel|>thought<channel|>
+    ///   <|channel|>thought<channel|>some prose</channel|>
+    ///
+    /// Strategy: remove fully-enclosed `<thought>...</thought>` and
+    /// `<call>...</call>` blocks (their interiors are model-internal
+    /// reasoning, not user-facing output — and the bare-call
+    /// recovery already extracted any embedded tool calls), then
+    /// drop the orphan channel-marker tokens that the closing
+    /// tag-pair strip leaves behind.
+    public static func stripThoughtMarkers(_ text: String) -> String {
+        guard !text.isEmpty else { return text }
+        var result = text
+        // Enclosed blocks — remove the entire span.
+        result = removeBlockSpan(in: result, open: "<thought>", close: "</thought>")
+        result = removeBlockSpan(in: result, open: "<call>", close: "</call>")
+        result = removeBlockSpan(in: result, open: "<|channel|>", close: "<|/channel|>")
+        // Orphan markers — any of these remaining as bare tokens
+        // means a tag-pair lost its mate (truncated stream, etc.).
+        // Strip the literal token; whatever prose surrounded it
+        // survives.
+        let orphans = [
+            "<thought>", "</thought>", "<thought",
+            "<call>", "</call>", "<call",
+            "<|channel|>", "<|/channel|>",
+            "<channel|>", "</channel|>", "<channel",
+            "<|tool_call|>", "<|/tool_call|>",
+            "<|start|>", "<|end|>",
+        ]
+        for token in orphans {
+            result = result.replacingOccurrences(of: token, with: "")
+        }
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Remove every `[open...close]` span from `text`. Greedy
+    /// left-to-right; nested spans are not supported (the inner
+    /// pair's close terminates the outer too, which is fine for
+    /// thought markers since they don't nest in observed traces).
+    private static func removeBlockSpan(
+        in text: String, open: String, close: String
+    ) -> String {
+        var result = text
+        while let openRange = result.range(of: open) {
+            // Find the matching close after the open. If missing,
+            // drop everything from `open` to end-of-text — partial
+            // truncation, no useful content past it.
+            let searchStart = openRange.upperBound
+            if let closeRange = result.range(of: close, range: searchStart..<result.endIndex) {
+                result.replaceSubrange(openRange.lowerBound..<closeRange.upperBound, with: "")
+            } else {
+                result.replaceSubrange(openRange.lowerBound..<result.endIndex, with: "")
+                break
+            }
+        }
+        return result
+    }
+
+    /// Returns true when the tail of `text` is locked in a repeating
+    /// pattern — used to short-circuit the brain's chunk-receive
+    /// loop before the full `max_tokens` budget burns away on a
+    /// stuck stream (Gemma 4 in Harmony thought-channel mode
+    /// produces this failure mode reliably).
+    ///
+    /// Algorithm: try a few candidate slice lengths and check
+    /// whether the last `len * count` chars are `count` exact
+    /// copies of the trailing `len` chars. A 24-char slice
+    /// repeating 5 times in a row (= 120 chars of monoculture
+    /// at the tail) is a clear trap.
+    public static func detectRepetitionTrap(in text: String) -> Bool {
+        let chars = Array(text)
+        guard chars.count >= 120 else { return false }
+        // Candidate slice sizes. Most observed traps are 20-40 chars
+        // ("<thought>call:</call><|channel|>...") so the sweep covers
+        // that range plus shorter token loops.
+        let sliceSizes = [12, 16, 20, 24, 32, 40]
+        let repeats = 4
+        for size in sliceSizes {
+            let window = size * repeats
+            guard chars.count >= window else { continue }
+            let tail = chars.suffix(window)
+            let pieces = stride(from: 0, to: window, by: size).map { offset -> [Character] in
+                Array(tail.dropFirst(offset).prefix(size))
+            }
+            // All pieces equal? → trap.
+            if pieces.count == repeats,
+               pieces.dropFirst().allSatisfy({ $0 == pieces[0] }) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// When `detectRepetitionTrap` fires, the assistantText is the
+    /// useful prefix + a junk tail. Trim the tail by re-running
+    /// the detector backwards: walk the trailing region in chunks
+    /// and drop anything that's still repetitive.
+    public static func scrubRepetitionTail(from text: String) -> String {
+        let chars = Array(text)
+        guard chars.count >= 120 else { return text }
+        // Binary-search-ish trim: lop progressively larger
+        // suffixes until the residual no longer looks repetitive.
+        var end = chars.count
+        while end > 80 {
+            let candidate = String(chars[0..<end])
+            if !detectRepetitionTrap(in: candidate) { break }
+            end -= 40
+        }
+        return String(chars[0..<end]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     public static func cleanupForTTS(_ text: String) -> String {
         var out = text
 

@@ -34,12 +34,32 @@ public enum TelemetryEvent: Sendable {
     case addressFilterDrop(text: String, score: Double, reasons: [String])
     case ttsRequest(text: String, voiceRefId: String, firstChunkMs: Double?)
     case ttsChunk(index: Int, sinceStartMs: Double, bytes: Int)
+    /// First `play_sound` for this speak invocation has been issued —
+    /// the robot speaker is producing audio NOW (the daemon's
+    /// `play_sound` is non-blocking, so this fires within ~10 ms of
+    /// the call returning). This is the closest signal to "Rocky
+    /// started talking" the user perceives. Critical for profiling
+    /// end-to-end latency. `sinceSpeakStartMs` = wall time from the
+    /// `RobotTTS.speak`/`speakStreaming` entry to this point.
+    case audioPlaybackStarted(filename: String, sinceSpeakStartMs: Double)
 
     // Cognition
     case llmRequest(messageCount: Int, toolCount: Int)
     case llmChunk(sinceRequestMs: Double, contentDelta: String?, toolCallDelta: String?)
     case llmToolCall(name: String, args: String, id: String)
     case toolInvocation(name: String, args: String, result: String, latencyMs: Double, llmMessageId: String)
+    /// Brain stream completion. Mirrors `CognitionEngine.assistantFinal`
+    /// onto LogBus so `TurnProfiler` (and anything else subscribing to
+    /// the bus) can see brain TFT and total wall time without having
+    /// to consume the cognition stream directly. Published once per
+    /// turn-exit by `AppServices.drainBrainStream`.
+    case brainResponse(firstChunkMs: Double?, totalMs: Double)
+    /// One end-to-end profiling summary per turn from `TurnProfiler`.
+    /// Carries every stage timing as structured fields so the Logs
+    /// view (and any future archive consumer) can render the
+    /// breakdown without re-parsing the summary string. Only emitted
+    /// when `SettingsStore.profilingEnabled` is true.
+    case turnProfile(summary: String, fields: [String: String])
 
     // Sidecars
     case sidecarLog(sidecar: String, level: LogLevel, message: String, fields: [String: String])

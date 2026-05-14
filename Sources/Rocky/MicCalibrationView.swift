@@ -721,9 +721,9 @@ struct MicCalibrationView: View {
             // Return to neutral and restore the suppressed signals.
             // Goto blocks until the move completes so we don't hand
             // control back to face tracking mid-arc.
-            try? await services.robotLink.goto(
+            try? await services.motionGuard.goto(
                 headPose: RPYPose(roll: 0, pitch: 0, yaw: 0),
-                antennas: nil, bodyYaw: 0, durationS: 1.0
+                antennas: nil as Antennas?, bodyYaw: 0, durationS: 1.0
             )
             await services.targetStreamer.setPrimaryMoveActive(false)
             await services.setFaceTrackingEnabled(wasFaceTracking)
@@ -860,7 +860,7 @@ struct MicCalibrationView: View {
             // suppressed). Each call is fire-and-forget; daemon
             // overwrites the active target on receipt and the
             // motor control loop interpolates smoothly.
-            try? await services.robotLink.setTarget(
+            try? await services.motionGuard.setTarget(
                 MotionTarget(headPose: pose, antennas: nil, bodyYaw: 0)
             )
             try? await Task.sleep(nanoseconds: tickIntervalNs)

@@ -33,7 +33,29 @@ class Runner:
     def __init__(self) -> None:
         self.backend = make_backend()
         self.voice_ref_id: str | None = None
+        # Cached warmup metrics for the Mac's pull-based health
+        # snapshot (mirrors brain + STT runners).
+        self.last_warmup_ms: int | None = None
+        self.last_warmup_failed: str | None = None
         log("info", "tts backend ready", backend=self.backend.name)
+
+    def warm_up_at_boot(self) -> None:
+        """Wrapper called from main() that times the backend warmup
+        and caches the result for `health` to surface. Backend-level
+        `warm_up()` itself is too varied (some load weights, some
+        prime caches, some are no-ops) to time uniformly elsewhere."""
+        t0 = time.monotonic()
+        try:
+            self.backend.warm_up()
+            self.last_warmup_ms = int((time.monotonic() - t0) * 1000)
+            self.last_warmup_failed = None
+            log("info", "tts backend warmed",
+                phase="warm_done", backend=self.backend.name,
+                warmup_ms=self.last_warmup_ms)
+        except Exception as exc:  # noqa: BLE001
+            self.last_warmup_failed = str(exc)
+            log("warn", f"tts warm_up failed: {exc}",
+                phase="warm_failed", backend=self.backend.name)
 
     def handle(self, req: dict[str, Any]) -> None:
         rid = req.get("id")
@@ -120,6 +142,12 @@ class Runner:
                     "backend": self.backend.name,
                     "voice_ref_id": self.voice_ref_id,
                     "streams": bool(getattr(self.backend, "supports_streaming", False)),
+                    "warmup_ms": self.last_warmup_ms,
+                    "warmup_failed": self.last_warmup_failed,
+                    "warm": (
+                        self.last_warmup_ms is not None
+                        and self.last_warmup_failed is None
+                    ),
                 })
             elif method == "warm_up":
                 t0 = time.monotonic()
@@ -135,6 +163,12 @@ class Runner:
 
 def main() -> None:
     runner = Runner()
+    # Warm up BEFORE emitting `ready`. Same contract as the brain
+    # and STT sidecars: when the Mac sees `ready` the TTS engine
+    # is hot. First synthesis after wake otherwise pays the full
+    # ~5–10 s model-load cost on top of the user's response
+    # latency — felt as a long silence before Rocky finally talks.
+    runner.warm_up_at_boot()
     emit({"event": "ready"})
     for line in sys.stdin:
         line = line.strip()

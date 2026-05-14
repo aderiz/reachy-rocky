@@ -33,6 +33,15 @@ struct PortraitView: View {
             ZStack(alignment: .topLeading) {
                 head
                     .padding(.horizontal, 12)
+                // Sleeping Z's float above the head while asleep.
+                // Sits BETWEEN head and the chips so the chips
+                // remain visible/tappable. `.allowsHitTesting(false)`
+                // inside SleepingZs keeps the Canvas non-interactive.
+                if services.isAsleep {
+                    SleepingZs()
+                        .padding(.horizontal, 12)
+                        .transition(.opacity.combined(with: .scale(scale: 0.85)))
+                }
                 SensesChip()
                     .padding(.horizontal, 16)
                     .padding(.top, 14)
@@ -45,6 +54,7 @@ struct PortraitView: View {
                     .padding(.horizontal, 16)
                     .padding(.top, 14)
             }
+            .animation(.easeInOut(duration: 0.45), value: services.isAsleep)
             Spacer(minLength: 0)
             namePlate
                 .padding(.horizontal, 24)
@@ -341,6 +351,20 @@ private struct SensesChip: View {
     @State private var size: CGSize = .init(width: 240, height: 150)
     @State private var samples: [Float] = Array(repeating: 0, count: 50)
     @State private var hovering: Bool = false
+    /// When the asleep→awake edge was observed. While non-nil, the
+    /// video chip animates a "waking eye" sequence: shutter opens
+    /// from above, a few bleary blinks, blur radius eases from 18
+    /// to 0 (frames sharpen). Cleared by the .task that auto-fires
+    /// after the wake animation duration elapses.
+    @State private var wakeStartedAt: Date? = nil
+    /// Total duration of the waking sequence (s). Paced for a slow,
+    /// heavy wake: the lids barely move for the first second
+    /// (eyes-still-shut hold), then begin to crack, blink several
+    /// times during the head's movement, and continue to focus
+    /// well after the head has arrived. Blur clears across the
+    /// whole window, so the picture is still slightly soft at the
+    /// end of the sequence.
+    private static let wakeDurationS: TimeInterval = 6.0
 
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
@@ -381,6 +405,23 @@ private struct SensesChip: View {
             size = CGSize(width: services.settings.visionChipWidth,
                           height: services.settings.visionChipHeight)
         }
+        // Detect asleep→awake edge so we can play the waking-eye
+        // sequence. The edge fires once per wake; if the user
+        // toggles wake/sleep rapidly the animation simply restarts.
+        .onChange(of: services.isAsleep, initial: false) { wasAsleep, isAsleep in
+            if wasAsleep, !isAsleep {
+                wakeStartedAt = Date()
+            }
+        }
+        // Auto-clear the wake animation after its duration. Bound
+        // to wakeStartedAt as the task id so a fresh wake during an
+        // in-flight animation restarts cleanly.
+        .task(id: wakeStartedAt) {
+            guard wakeStartedAt != nil else { return }
+            try? await Task.sleep(nanoseconds:
+                UInt64(Self.wakeDurationS * 1_000_000_000))
+            await MainActor.run { wakeStartedAt = nil }
+        }
         .accessibilityElement()
         .accessibilityLabel(accessibilityText)
         .help("What Rocky sees and hears. Hover to reveal the resize grip.")
@@ -401,6 +442,25 @@ private struct SensesChip: View {
 
     @ViewBuilder
     private var videoLayer: some View {
+        // Three states:
+        //   1. asleep → solid black (no frame, no chrome).
+        //   2. waking → the eye-opening sequence: shutter rises from
+        //      above, two bleary blinks, blur eases from 18 → 0.
+        //   3. awake (normal) → frame at full sharpness.
+        if services.isAsleep {
+            Rectangle()
+                .fill(Color.black)
+                .frame(width: size.width, height: size.height)
+        } else if let start = wakeStartedAt {
+            wakingVideoLayer(start: start)
+        } else {
+            normalVideoLayer
+        }
+    }
+
+    /// Normal awake state — sharp camera frame or placeholder.
+    @ViewBuilder
+    private var normalVideoLayer: some View {
         if services.visionEnabled,
            let frame = services.lastCameraFrame,
            let nsImage = NSImage(data: frame.jpeg) {
@@ -419,6 +479,185 @@ private struct SensesChip: View {
             }
             .frame(width: size.width, height: size.height)
         }
+    }
+
+    /// Eye-opening waking sequence. Driven by a TimelineView so
+    /// shutter + blur stay frame-locked together (using
+    /// withAnimation across two different effects produces visible
+    /// drift between them). The frame underneath is the live
+    /// camera image; two black eyelid bars — one descending from
+    /// the top, one rising from the bottom — meet at the centre
+    /// when closed and retract to the edges when open. Reads as
+    /// a person cracking their eyes open, blinking against the
+    /// light, and gradually focusing while their head settles
+    /// into position.
+    @ViewBuilder
+    private func wakingVideoLayer(start: Date) -> some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: false)) { context in
+            let elapsed = max(0, context.date.timeIntervalSince(start))
+            let openness = Self.shutterOpenness(elapsed: elapsed)
+            let blurRadius = Self.blurAmount(elapsed: elapsed)
+            let brightnessLift = Self.brightnessLift(elapsed: elapsed)
+            // Each lid covers half the frame when fully closed.
+            let lidHeight = max(0, size.height * 0.5 * (1 - openness))
+
+            ZStack {
+                // Behind the shutter: the frame (or placeholder),
+                // blurred + slightly desaturated + brightened.
+                // Saturation eases back to 1.0 over the first 60 %
+                // of the window so colour returns as the eye
+                // settles.
+                normalVideoLayer
+                    .blur(radius: blurRadius)
+                    // Saturation drop lingers through 75 % of the
+                    // window — colour returns slowly, mirroring the
+                    // brightness lift curve. The 0.40 maximum drop
+                    // (vs. 0.35 before) makes the early haze read as
+                    // more drained.
+                    .saturation(
+                        1.0 - 0.40 * max(0, 1.0 - elapsed / (Self.wakeDurationS * 0.80))
+                    )
+                    .brightness(brightnessLift)
+                    .frame(width: size.width, height: size.height)
+                    .clipped()
+
+                // Top eyelid: anchored to the top edge, descends
+                // toward the centre. Soft shadow at its leading
+                // (bottom) edge so it reads as an eyelid rather
+                // than a hard rectangle.
+                VStack(spacing: 0) {
+                    Rectangle()
+                        .fill(Color.black)
+                        .frame(width: size.width, height: lidHeight)
+                        .overlay(alignment: .bottom) {
+                            LinearGradient(
+                                colors: [
+                                    .black.opacity(0.0),
+                                    .black.opacity(0.55),
+                                ],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                            .frame(height: 14)
+                            .blur(radius: 3)
+                            .offset(y: 0)
+                        }
+                    Spacer(minLength: 0)
+                }
+
+                // Bottom eyelid: mirrored — anchored to the bottom
+                // edge, rises toward the centre.
+                VStack(spacing: 0) {
+                    Spacer(minLength: 0)
+                    Rectangle()
+                        .fill(Color.black)
+                        .frame(width: size.width, height: lidHeight)
+                        .overlay(alignment: .top) {
+                            LinearGradient(
+                                colors: [
+                                    .black.opacity(0.55),
+                                    .black.opacity(0.0),
+                                ],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                            .frame(height: 14)
+                            .blur(radius: 3)
+                        }
+                }
+            }
+            .frame(width: size.width, height: size.height)
+        }
+    }
+
+    // MARK: - Waking curves
+    //
+    // All curves are pure functions of elapsed time since the wake
+    // edge. Timeline (6.0 s total) is paced for a deliberately
+    // heavy wake — long "still-asleep" hold before the first
+    // crack, slow blink rhythm, blur clearing across the whole
+    // window:
+    //
+    //   0.00–1.00 s : lids 0 → 10 %          (deep-sleep hold)
+    //   1.00–1.40 s : lids 10 → 30 %         (first slow crack)
+    //   1.40–1.80 s : lids 30 → 12 %         (first slow blink)
+    //   1.80–2.60 s : lids 12 → 55 %         (long opening hold)
+    //   2.60–3.00 s : lids 55 → 35 %         (second slow blink)
+    //   3.00–3.90 s : lids 35 → 80 %         (continued opening)
+    //   3.90–4.25 s : lids 80 → 65 %         (third blink)
+    //   4.25–5.20 s : lids 65 → 100 %        (final opening)
+    //   5.20–6.00 s : lids 100 %             (long focus settle tail)
+    //
+    // The first second is intentionally near-static — eyes almost
+    // shut, the user reads "Rocky is still waking up." Blinks
+    // through 4.25 s; final opening completes at 5.2 s; the last
+    // 0.8 s holds the picture stable so the user has time to
+    // perceive it as "ready."
+
+    private static func shutterOpenness(elapsed: TimeInterval) -> Double {
+        switch elapsed {
+        case ..<1.00:
+            // Very slow initial crack — barely visible movement.
+            let t = easeOutCubic(elapsed / 1.00)
+            return 0.10 * t                  // 0 → 0.10
+        case 1.00..<1.40:
+            let t = easeOutCubic((elapsed - 1.00) / 0.40)
+            return 0.10 + 0.20 * t           // 0.10 → 0.30
+        case 1.40..<1.80:
+            let t = (elapsed - 1.40) / 0.40
+            return 0.30 - 0.18 * t           // 0.30 → 0.12 (slow blink down)
+        case 1.80..<2.60:
+            let t = easeOutCubic((elapsed - 1.80) / 0.80)
+            return 0.12 + 0.43 * t           // 0.12 → 0.55
+        case 2.60..<3.00:
+            let t = (elapsed - 2.60) / 0.40
+            return 0.55 - 0.20 * t           // 0.55 → 0.35
+        case 3.00..<3.90:
+            let t = easeOutCubic((elapsed - 3.00) / 0.90)
+            return 0.35 + 0.45 * t           // 0.35 → 0.80
+        case 3.90..<4.25:
+            let t = (elapsed - 3.90) / 0.35
+            return 0.80 - 0.15 * t           // 0.80 → 0.65 (gentle)
+        case 4.25..<5.20:
+            let t = easeOutCubic((elapsed - 4.25) / 0.95)
+            return 0.65 + 0.35 * t           // 0.65 → 1.00
+        default:
+            return 1.0
+        }
+    }
+
+    private static func blurAmount(elapsed: TimeInterval) -> CGFloat {
+        // Blur clears across the FULL window with a sine ease —
+        // even at 4.0 s the picture is still noticeably soft, only
+        // crisping in the final stretch. This is "the world is
+        // coming into focus slowly", not "blur snaps off."
+        guard elapsed < wakeDurationS else { return 0 }
+        let t = elapsed / wakeDurationS
+        // Sine ease: very slow start (heavy blur held), gentle
+        // through the middle, slow finish too. Pairs with the
+        // shutter so the blur is still significant during blinks.
+        let eased = (cos(t * .pi) + 1) / 2  // 1 → 0 along a half-cosine
+        return 26.0 * CGFloat(eased)
+    }
+
+    private static func brightnessLift(elapsed: TimeInterval) -> Double {
+        // Linger through 80 % of the window — washed-out look
+        // stays through both blink phases and into the final
+        // opening, fading just before the settle tail.
+        let span = wakeDurationS * 0.80
+        guard elapsed < span else { return 0 }
+        let t = elapsed / span
+        return 0.14 * (1.0 - easeOutQuart(t))
+    }
+
+    private static func easeOutCubic(_ t: Double) -> Double {
+        let clamped = max(0.0, min(1.0, t))
+        return 1.0 - pow(1.0 - clamped, 3)
+    }
+
+    private static func easeOutQuart(_ t: Double) -> Double {
+        let clamped = max(0.0, min(1.0, t))
+        return 1.0 - pow(1.0 - clamped, 4)
     }
 
     /// Linear gradient scrim from transparent (top) → ~50 % black
@@ -670,6 +909,168 @@ private struct SensesChip: View {
         // compiler can't prove that, so return a sensible fallback.
         let s = rmsStops.last!
         return Color(red: s.r, green: s.g, blue: s.b)
+    }
+}
+
+// MARK: - Sleeping Z's overlay
+
+/// Floating "Z" particles drifting above Rocky's 3D head while
+/// `services.isAsleep`. The cockpit communicates dormancy through
+/// the avatar itself (slumped head, drooping antennas via the
+/// existing `RockyState`-driven rig) plus this comic-book sleep
+/// glyph sitting just above and to the side of the head.
+///
+/// Design intent — "high quality" means:
+///   • Smooth continuous motion (a `TimelineView` driving a
+///     `Canvas` so the animation is frame-accurate and survives
+///     SwiftUI's diffing — no `withAnimation` stutter).
+///   • Each Z is its own particle with independent birth, motion,
+///     and death — not three views sharing a single timeline.
+///   • Organic drift: each Z rises on a slight rightward arc, not
+///     a straight line, with a sinusoidal sway. The font scales
+///     subtly as it rises, and rotation eases off-axis.
+///   • Glow: a wider blurred underlayer behind each Z produces a
+///     soft halo that reads as "dreamy."
+///   • Easing: opacity follows a cubic-Hermite curve (fast fade-in,
+///     long visible mid, fast fade-out) instead of a raw sin so the
+///     Z's feel like they exist briefly and then vanish.
+struct SleepingZs: View {
+    /// Stable particle definitions — birth phase + size class. The
+    /// `TimelineView` then renders each particle's current state
+    /// against the global clock. Three particles staggered evenly
+    /// around the unit cycle keep one always in view.
+    private struct Particle {
+        let birthPhase: Double  // 0..1, when this particle starts its cycle
+        let fontSize: CGFloat
+        let weight: Font.Weight
+        let amplitude: CGFloat  // horizontal sway amplitude (px)
+        let driftRight: CGFloat // net rightward drift over a cycle (px)
+    }
+
+    private let particles: [Particle] = [
+        .init(birthPhase: 0.00, fontSize: 56, weight: .heavy,    amplitude: 10, driftRight: 38),
+        .init(birthPhase: 0.33, fontSize: 38, weight: .bold,     amplitude:  8, driftRight: 30),
+        .init(birthPhase: 0.66, fontSize: 26, weight: .semibold, amplitude:  6, driftRight: 22),
+    ]
+
+    /// One full cycle for a single Z, in seconds. Slow enough to
+    /// feel restful — fast Z's read as anxious.
+    private let cycleSeconds: Double = 3.8
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: false)) { context in
+            let elapsed = context.date.timeIntervalSinceReferenceDate
+            Canvas { ctx, size in
+                for p in particles {
+                    drawParticle(ctx: &ctx, size: size, particle: p, elapsed: elapsed)
+                }
+            }
+        }
+        .allowsHitTesting(false)
+    }
+
+    private func drawParticle(
+        ctx: inout GraphicsContext,
+        size: CGSize,
+        particle p: Particle,
+        elapsed: TimeInterval
+    ) {
+        // Phase in [0, 1) for this particle right now.
+        let raw = (elapsed / cycleSeconds + p.birthPhase)
+        let phase = raw - floor(raw)
+
+        // --- Easing curves --------------------------------------------------
+        // Cubic-Hermite "soft pulse" for opacity: short fade-in,
+        // long visible mid, short fade-out. `t * t * (3 - 2*t)`
+        // is the standard smoothstep; we mirror it around 0.5.
+        let pulseT = phase < 0.5 ? phase * 2 : (1 - phase) * 2
+        let smoothPulse = pulseT * pulseT * (3 - 2 * pulseT)
+        let opacity = smoothPulse * 0.85
+
+        // Eased upward rise — ease-out so motion is fastest at
+        // birth and slows as the Z floats away.
+        let easedRise = 1 - pow(1 - phase, 2)
+
+        // --- Position -------------------------------------------------------
+        // Origin: slightly to the upper right of the head's
+        // crown. The PortraitView column is roughly square so
+        // anchoring at (0.55, 0.30) puts the spawn point near the
+        // top of the head where antennas would be.
+        let originX = size.width  * 0.58
+        let originY = size.height * 0.32
+
+        // Rise of ~130 px over the column's height, scaled by the
+        // available height so the layout adapts to window resize.
+        let totalRise = min(size.height * 0.35, 160)
+        let dy = -CGFloat(easedRise) * totalRise
+
+        // Rightward drift + sinusoidal sway.
+        let dx = CGFloat(easedRise) * p.driftRight
+              + sin(phase * 2 * .pi) * p.amplitude
+
+        // Subtle scale grow as the Z rises (Z's appear closer as
+        // they "float up" — gentle but visible).
+        let scale = 0.85 + CGFloat(easedRise) * 0.30
+
+        // Slight off-axis rotation, easing through 0.
+        let rotation = sin(phase * 2 * .pi) * 8 // ±8°
+
+        // --- Render ---------------------------------------------------------
+        // Soft glow underlayer: same Z, blurred + tinted. Sharp pass
+        // crisp white on top. Colour is baked into the Text via
+        // foregroundStyle BEFORE resolving (Canvas resolves once,
+        // mutating shading post-resolve isn't supported on Text).
+        let glowText = Text("Z")
+            .font(.system(size: p.fontSize, weight: p.weight, design: .rounded))
+            .italic()
+            .foregroundStyle(Color(red: 0.65, green: 0.78, blue: 1.0))
+
+        let sharpText = Text("Z")
+            .font(.system(size: p.fontSize, weight: p.weight, design: .rounded))
+            .italic()
+            .foregroundStyle(Color.white.opacity(0.92))
+
+        let resolvedGlow = ctx.resolve(glowText)
+        let resolvedSharp = ctx.resolve(sharpText)
+        let glowSize = resolvedGlow.measure(in: size)
+        let sharpSize = resolvedSharp.measure(in: size)
+
+        let centre = CGPoint(x: originX + dx, y: originY + dy)
+
+        // Translate-rotate-scale matrix applied to a sub-context
+        // so the rotation/scale composes correctly with the
+        // particle's centre.
+        var sub = ctx
+        sub.translateBy(x: centre.x, y: centre.y)
+        sub.rotate(by: .degrees(rotation))
+        sub.scaleBy(x: scale, y: scale)
+
+        // Glow pass: heavily blurred + low alpha for dreamy halo.
+        var glowCtx = sub
+        glowCtx.addFilter(.blur(radius: 12))
+        glowCtx.opacity = opacity * 0.55
+        glowCtx.draw(
+            resolvedGlow,
+            in: CGRect(
+                x: -glowSize.width / 2,
+                y: -glowSize.height / 2,
+                width: glowSize.width,
+                height: glowSize.height
+            )
+        )
+
+        // Sharp pass.
+        var sharpCtx = sub
+        sharpCtx.opacity = opacity
+        sharpCtx.draw(
+            resolvedSharp,
+            in: CGRect(
+                x: -sharpSize.width / 2,
+                y: -sharpSize.height / 2,
+                width: sharpSize.width,
+                height: sharpSize.height
+            )
+        )
     }
 }
 

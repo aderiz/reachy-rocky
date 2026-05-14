@@ -15,6 +15,8 @@ The catalog of every page in the wiki.
 - [Sidecar convention](concepts/sidecar-convention.md) — wire protocol, manifest, lifecycle.
 - [Architecture](concepts/architecture.md) — daemon/SDK split, where code runs, REST + WebRTC transports.
 - [Motion philosophy](concepts/motion-philosophy.md) — `goto_target` for gestures, `set_target` in a control loop.
+- [Motion Guard](concepts/motion-guard.md) — single chokepoint every motion command routes through; slew limit, velocity clamp, duration floor, single-in-flight, shelf-safe allowlist; mermaid diagram of all motion routes.
+- [Architecture diagram — full system](concepts/architecture-diagram.md) — one big mermaid of every component (UI, orchestration, cognition, voice, perception, telemetry, motion, sidecars, on-bot relay, daemon, external services) with the four key data flows.
 - [Coordinate frames](concepts/coordinate-frames.md) — head frame, world frame, units (mm, deg, rad).
 - [Safety limits](concepts/safety-limits.md) — joint ranges, head/body yaw delta, auto-clamping.
 - [Media architecture](concepts/media-architecture.md) — `local`/`webrtc`/`no_media` backends, GStreamer/IPC.

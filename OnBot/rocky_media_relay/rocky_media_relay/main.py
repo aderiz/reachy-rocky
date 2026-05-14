@@ -61,6 +61,8 @@ import numpy as np
 from fastapi import WebSocket, WebSocketDisconnect
 from reachy_mini import ReachyMini, ReachyMiniApp
 
+from rocky_media_relay.motion_guard import MotionGuard
+
 
 logger = logging.getLogger("rocky-media-relay")
 logger.setLevel(logging.INFO)
@@ -131,6 +133,9 @@ class RelayState:
         # Track first-frame logging per producer cycle.
         self.logged_first_audio = False
         self.logged_first_video = False
+        # On-bot motion guard (instantiated when the FastAPI sub-app
+        # comes up so the asyncio HTTP client binds to the right loop).
+        self.motion_guard: Optional[MotionGuard] = None
 
     def add_audio(self, ch: ClientChannel) -> None:
         with self.lock:
@@ -590,6 +595,101 @@ class RockyMediaRelay(ReachyMiniApp):
         def stop_recording():
             state.recording = False
             return {"recording": False}
+
+        # --------------------------------------------------------------
+        # Motion endpoints (on-bot defence-in-depth guard).
+        #
+        # Mac talks to these instead of hitting the daemon directly so
+        # the safety logic (slew, velocity, duration floor,
+        # single-in-flight, shelf-safe allowlist, yaw-delta cap) is
+        # enforced ON THE BOT itself — not just in the Mac app. Any
+        # future client (third-party app, debug curl) that wants to
+        # move the bot must come through here.
+        #
+        # Each endpoint validates / reshapes, then forwards to
+        # http://127.0.0.1:8000/api/move/* via httpx. The daemon's
+        # responses pass back unchanged so Mac code that decoded
+        # daemon responses still works.
+        # --------------------------------------------------------------
+        guard = MotionGuard()
+        state.motion_guard = guard
+
+        def _passthrough_response(resp) -> dict:
+            try:
+                return resp.json()
+            except Exception:  # noqa: BLE001
+                return {"ok": resp.status_code == 200, "body": resp.text}
+
+        @self.settings_app.post("/api/motion/set_target")
+        async def motion_set_target(target: dict):
+            resp = await guard.set_target(target)
+            return _passthrough_response(resp)
+
+        @self.settings_app.post("/api/motion/goto")
+        async def motion_goto(body: dict):
+            resp = await guard.goto(body)
+            return _passthrough_response(resp)
+
+        @self.settings_app.post("/api/motion/play/{move_path:path}")
+        async def motion_play(move_path: str, body: dict | None = None):
+            """Catch-all play route. `move_path` is everything after
+            `/api/motion/play/`. The last `/`-separated segment is the
+            move; everything before is the dataset (empty for built-in
+            moves like wake_up / goto_sleep). This handles HF dataset
+            ids that themselves contain slashes (e.g.
+            `pollen-robotics/reachy-mini-emotions-library/sad1`).
+            """
+            force = bool((body or {}).get("force", False))
+            parts = move_path.split("/")
+            if len(parts) == 1:
+                dataset = ""
+                move = parts[0]
+            else:
+                dataset = "/".join(parts[:-1])
+                move = parts[-1]
+            resp = await guard.play_recorded_move(
+                dataset=dataset, move=move, force=force
+            )
+            return _passthrough_response(resp)
+
+        @self.settings_app.post("/api/motion/set_motor_mode/{mode}")
+        async def motion_set_motor_mode(mode: str):
+            """Match the daemon's URL shape (no body). Mode in the
+            path: enabled / disabled / gravity_compensation."""
+            resp = await guard.set_motor_mode(mode)
+            return _passthrough_response(resp)
+
+        @self.settings_app.post("/api/motion/stop_move")
+        async def motion_stop_move():
+            resp = await guard.stop_move()
+            return _passthrough_response(resp)
+
+        @self.settings_app.post("/api/motion/wake_up")
+        async def motion_wake_up(body: dict | None = None):
+            """One-shot wake sequence orchestrated on the bot so the
+            on-bot guard's slew baseline gets reset BEFORE the pre-
+            seed setTarget (otherwise the pre-seed gets slew-clamped
+            and motor enable snaps the head from physical-pose to
+            the clamped target — aggressive wake). Body may include
+            `goto_duration_s` to dial the swing-up speed.
+            """
+            duration = float((body or {}).get("goto_duration_s", 3.5))
+            return await guard.wake_up(goto_duration_s=duration)
+
+        @self.settings_app.get("/api/motion/health")
+        async def motion_health():
+            return {
+                "ok": True,
+                "guard": "on-bot",
+                "build": "rocky-media-relay/0.2",
+                "config": {
+                    "max_set_target_slew_rad": guard.config.max_set_target_slew_rad,
+                    "min_goto_duration_s": guard.config.min_goto_duration_s,
+                    "max_goto_velocity_rad_per_s": guard.config.max_goto_velocity_rad_per_s,
+                    "max_head_body_yaw_delta_rad": guard.config.max_head_body_yaw_delta_rad,
+                    "shelf_safe_moves": sorted(guard.config.shelf_safe_moves),
+                },
+            }
 
         @self.settings_app.websocket("/ws/audio")
         async def audio_ws(ws: WebSocket):

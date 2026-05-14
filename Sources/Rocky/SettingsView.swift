@@ -92,6 +92,21 @@ private struct RobotSettingsTab: View {
                 }
             }
 
+            Section {
+                Toggle(isOn: Binding(
+                    get: { services.settings.onBotMotionGuardEnabled },
+                    set: { services.settings.onBotMotionGuardEnabled = $0 }
+                )) {
+                    Text("Route motion through on-bot guard (port 8042)")
+                }
+            } header: {
+                Text("Motion safety")
+            } footer: {
+                Text("When ON, all motion commands (set_target, goto, play_emotion, wake_up, sleep, set_motor_mode, stop) are sent to the on-bot relay's `/api/motion/*` endpoints — the relay enforces slew, velocity, duration floor, single-in-flight, shelf-safe allowlist, and the 65° head-body yaw delta cap BEFORE forwarding to the daemon. Defence-in-depth alongside the Mac-side MotionGuard. Turn OFF only if running against an older bot whose relay doesn't yet have the v0.2 motion endpoints. Applies at next launch.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
             applyRow
         }
         .formStyle(.grouped)
@@ -247,17 +262,20 @@ private struct BrainSettingsTab: View {
                 ForEach(Self.mlxModelOptions, id: \.id) { opt in
                     Text(opt.label).tag(opt.id)
                 }
-                Text("Other (custom HF model id)").tag("__custom__")
+                Text("Other (HF model id or local path)").tag("__custom__")
             }
 
             if showingCustomMlxField {
                 HStack {
                     TextField(
-                        "HF model id",
+                        "HF id or local path",
                         text: $customMlxModelDraft,
-                        prompt: Text("mlx-community/your-vlm-here")
+                        prompt: Text("mlx-community/… or /Users/you/Models/…")
                     )
+                    .font(.body.monospaced())
                     .onSubmit { commitCustomMlxModel() }
+                    Button("Choose folder…") { chooseMlxModelFolder() }
+                        .help("Pick a local directory containing the mlx-vlm model files (config.json, weights, processor, etc.). The path is sent to the brain sidecar via ROCKY_BRAIN_MODEL.")
                     Button("Apply") { commitCustomMlxModel() }
                         .disabled(
                             customMlxModelDraft.trimmingCharacters(in: .whitespaces).isEmpty
@@ -279,7 +297,7 @@ private struct BrainSettingsTab: View {
         } header: {
             Text("MLX-VLM")
         } footer: {
-            Text("First run downloads ~2.5 GB of weights into ~/.cache/huggingface/. Switching models hot-swaps the sidecar — the next chat uses the new model. Restart Brain manually if the sidecar got into a bad state.")
+            Text("Custom field accepts EITHER a Hugging Face repo id (`mlx-community/…`) OR a local filesystem path (e.g. `/Users/you/Models/Qwen3-VL-4B`, or `~/Models/…`). Use **Choose folder…** to browse for a local directory. HF-id first-run downloads ~2.5 GB of weights into ~/.cache/huggingface/. Switching models hot-swaps the sidecar — the next chat uses the new model. Restart Brain manually if the sidecar got into a bad state.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
@@ -366,12 +384,23 @@ private struct BrainSettingsTab: View {
                        get: { services.settings.showToolCalls },
                        set: { services.settings.showToolCalls = $0 }
                    ))
+            Toggle("Profiling mode",
+                   isOn: Binding(
+                       get: { services.settings.profilingEnabled },
+                       set: { newValue in
+                           services.settings.profilingEnabled = newValue
+                           Task { await services.applySettings() }
+                       }
+                   ))
         } header: {
             Text("Conversation")
         } footer: {
-            Text("When off, the small `⌘ → tool · args` and `⌘ ← tool (ok, Nms) · result` lines are hidden between bubbles. Tool activity is still recorded in the Activity tab and the log.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("When off, the small `⌘ → tool · args` and `⌘ ← tool (ok, Nms) · result` lines are hidden between bubbles. Tool activity is still recorded in the Activity tab and the log.")
+                Text("Profiling mode emits one end-to-end timing line per turn to the Logs view: VAD → STT → AddressFilter → brain → tools → TTS, so you can see exactly where the latency is.")
+            }
+            .font(.footnote)
+            .foregroundStyle(.secondary)
         }
     }
 
@@ -454,6 +483,32 @@ private struct BrainSettingsTab: View {
               trimmed != services.settings.brainModel else { return }
         services.settings.brainModel = trimmed
         Task { await services.applyBrainBackend() }
+    }
+
+    /// Show an `NSOpenPanel` to pick a local directory containing the
+    /// mlx-vlm model files. The directory's absolute path goes into
+    /// the model field — the sidecar (`runner.py`) will detect a path
+    /// prefix and call `mlx_vlm.load` with the resolved local path
+    /// instead of trying to hit Hugging Face.
+    private func chooseMlxModelFolder() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose MLX-VLM model folder"
+        panel.message = "Pick the folder that contains config.json, the model weights, and the processor files."
+        panel.prompt = "Select model"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        if let cur = URL(string: customMlxModelDraft),
+           cur.isFileURL,
+           FileManager.default.fileExists(atPath: cur.path)
+        {
+            panel.directoryURL = cur.deletingLastPathComponent()
+        }
+        if panel.runModal() == .OK, let url = panel.url {
+            customMlxModelDraft = url.path
+            commitCustomMlxModel()
+        }
     }
 }
 
@@ -542,11 +597,22 @@ private struct VoiceSettingsTab: View {
                     Text("Fish Audio S2 Pro (high-quality clone, ~1× RTF)")
                         .tag("fish-audio")
                 }
+                HStack {
+                    TextField("HF model id (blank = engine default)",
+                              text: ttsModelBinding)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.body.monospaced())
+                        .help("Hugging Face repo id of the TTS model — e.g. mlx-community/chatterbox-8bit, mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16. Leave empty to use the engine's built-in default.")
+                    Button("Clear") {
+                        services.settings.ttsModel = ""
+                    }
+                    .disabled(services.settings.ttsModel.isEmpty)
+                }
                 BotVolumeSlider()
             } header: {
                 Text("Voice (TTS)")
             } footer: {
-                Text("RTF = wall-time-to-synth ÷ audio-duration (lower = faster, < 1.0× is faster than real-time). Chatterbox 8-bit is the fastest cloning model in the venv and what Rocky uses by default. Switch to Qwen3-TTS for multilingual / different timbre, or Fish for the strongest clone fidelity. All three pick up the reference from `~/Library/Application Support/Rocky/voice/sample.wav` + `sample.txt`. Engine change applies on next launch.")
+                Text("RTF = wall-time-to-synth ÷ audio-duration (lower = faster). Chatterbox 8-bit is the fastest cloning model and the default. The HF model id field overrides the engine's built-in model so you can point to any compatible repo on the same engine (e.g. another chatterbox variant). All engines pick up the reference clone from `~/Library/Application Support/Rocky/voice/sample.wav` + `sample.txt`. Engine and model changes apply on next launch.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -568,6 +634,12 @@ private struct VoiceSettingsTab: View {
         let store = services.settings
         return Binding(get: { store.ttsBackend },
                        set: { store.ttsBackend = $0 })
+    }
+
+    private var ttsModelBinding: Binding<String> {
+        let store = services.settings
+        return Binding(get: { store.ttsModel },
+                       set: { store.ttsModel = $0 })
     }
 
     private var vadEngineBinding: Binding<String> {

@@ -20,6 +20,11 @@ final class AppServices {
     let logBus: LogBus
     let robotEndpoint: RobotEndpoint
     let robotLink: RobotLinkClient
+    /// Single chokepoint for every motion command. Wraps `robotLink`
+    /// with slew-rate, velocity, duration-floor, single-in-flight,
+    /// and shelf-safety guards. NEW callsites must go through this,
+    /// not `robotLink` directly — the latter bypasses all safety.
+    let motionGuard: MotionGuard
     let supervisor: SidecarSupervisor
     let targetStreamer: TargetStreamer
     let robotCamera: RobotCameraService
@@ -42,6 +47,14 @@ final class AppServices {
     /// M6 streaming TTS player. Receives PCM chunks from
     /// Qwen3-TTS-12Hz and plays them via `AVAudioEngine`.
     let streamingTTS: StreamingTTS
+
+    /// End-to-end turn profiler. Subscribes to LogBus, builds a
+    /// per-turn `TurnProfile`, pushes it to `profileStore` and emits
+    /// a `.turnProfile` log event. Off by default — flip in Settings.
+    let turnProfiler: TurnProfiler
+    /// Rolling buffer of recent `TurnProfile`s for the Inspector →
+    /// Profile tab to render as a waterfall.
+    let profileStore: ProfileStore
 
     // Voice
     let audioBuffer: AudioRingBuffer
@@ -199,6 +212,28 @@ final class AppServices {
     var ttsSidecarState: SidecarState = .stopped
     var memorySidecarState: SidecarState = .stopped
     var brainSidecarState: SidecarState = .stopped
+
+    /// Per-sidecar warmup progress. SidecarState only swings between
+    /// `.starting` and `.ready`, but on heavy MLX models there's a
+    /// 5–30 s gap between "process spawned" and "first inference is
+    /// fast", broken into two phases the user cares about: weights
+    /// loading from disk, then the first JIT pass. We collect this
+    /// per sidecar so StatusView can render a progress cue ("loading
+    /// model…" → "warming…" → "warm · 6.3 s") instead of a static
+    /// "starting…" for the whole interval. Phase strings come from
+    /// the runners' `emit_log(...phase=...)` field, decoded in
+    /// `pumpWarmupPhases()`.
+    enum WarmupPhase: Equatable, Sendable {
+        case idle
+        case loading            // model weights deserializing
+        case warming            // weights loaded; first JIT pass in flight
+        case ready(loadMs: Int?, warmMs: Int?)
+        case failed(reason: String)
+    }
+    var warmupPhases: [String: WarmupPhase] = [
+        "brain": .idle, "mlx-stt": .idle,
+        "mlx-tts": .idle, "mempalace": .idle,
+    ]
 
     /// Total drawers in Rocky's palace. Polled lazily — see
     /// `refreshMemoryCount()`. `-1` means "haven't asked yet" so the
@@ -466,6 +501,7 @@ final class AppServices {
         self.logBus = bus
         self.robotEndpoint = endpoint
         self.robotLink = RobotLinkClient(endpoint: endpoint, logBus: bus)
+        self.motionGuard = MotionGuard(client: self.robotLink, logBus: bus)
         self.supervisor = SidecarSupervisor(logBus: bus)
         self.stateSubscriber = StateSubscriber(endpoint: endpoint, logBus: bus)
         // Battery polls the on-bot media relay on port 8042, not the
@@ -479,7 +515,7 @@ final class AppServices {
         // 50 Hz set_target streamer. Targets come from `MacFaceTracker`
         // (Apple Vision face detection on `robot-camera` JPEG frames);
         // the streamer is suppressed during recorded primary moves.
-        self.targetStreamer = TargetStreamer(client: self.robotLink, logBus: bus)
+        self.targetStreamer = TargetStreamer(client: self.motionGuard, logBus: bus)
 
         // Robot-camera sidecar. Streams JPEG frames over the wire.
         let cameraManifest = Self.devRobotCameraManifest()
@@ -580,7 +616,10 @@ final class AppServices {
         // `FT_EXTRAS=mlx ./Sidecars/mlx-tts/setup.sh` and runs Chatterbox
         // Turbo FP16 with the user's voice reference.
         self.mediaClient = MediaClient(endpoint: endpoint, logBus: bus)
-        let ttsManifest = Self.devTTSManifest(backend: settings.ttsBackend)
+        let ttsManifest = Self.devTTSManifest(
+            backend: settings.ttsBackend,
+            model: settings.ttsModel
+        )
         let ttsDir = Self.locateSidecarDir(named: "mlx-tts")
             ?? URL(fileURLWithPath: "/")
         let ttsResolver = ManifestPathResolver(
@@ -596,6 +635,12 @@ final class AppServices {
         // path when the sidecar reports `streams: true` in health
         // — Qwen3-TTS-12Hz does, Chatterbox doesn't.
         self.streamingTTS = StreamingTTS(logBus: bus)
+
+        // End-to-end profiler. Always instantiated so the toggle in
+        // Settings can flip it without restarting; gated by
+        // `SettingsStore.profilingEnabled` via `applyProfiling()`.
+        self.profileStore = ProfileStore(capacity: 50)
+        self.turnProfiler = TurnProfiler(logBus: bus, store: self.profileStore)
 
         // Memory sidecar (mempalace). Verbatim conversation drawers +
         // semantic recall — gives Rocky a persistent memory across
@@ -712,6 +757,62 @@ final class AppServices {
     /// Spin up long-lived services. Idempotent enough to be safe to call once
     /// from `RockyApp.task { ... }`.
     func start() async {
+        // LogBus pumps must subscribe BEFORE any sidecar boots —
+        // `LogBus.subscribe()` does not replay events to late
+        // subscribers, so a pump set up after `applyBrainBackend()`
+        // misses every `phase=load_start|load_done|warm_done` event
+        // the brain runner emits during its load+warmup window.
+        // That's why Health used to show a bare "ready · <model>"
+        // with no spinner — the phase dictionary stayed at `.idle`
+        // the whole time. Setting up here guarantees the
+        // visualization tracks the actual lifecycle.
+        let bus = self.logBus
+        let feed = self.momentFeed
+
+        // Pump 1: warmup-phase events. Decodes the `phase` field on
+        // sidecar log lines and updates `warmupPhases` so StatusView
+        // can render a phase-aware subtitle + pulsing spinner.
+        Task { [weak self] in
+            for await stamped in await bus.subscribe() {
+                guard let self else { break }
+                if case .sidecarLog(let name, _, _, let fields) = stamped.event,
+                   let phase = fields["phase"] {
+                    let loadMs = fields["load_time_ms"].flatMap(Int.init)
+                    let warmMs = fields["warmup_ms"].flatMap(Int.init)
+                    let reason = fields["error"]
+                    await MainActor.run {
+                        self.applyWarmupPhase(
+                            sidecar: name, phase: phase,
+                            loadMs: loadMs, warmMs: warmMs,
+                            reason: reason
+                        )
+                    }
+                }
+                if Task.isCancelled { break }
+            }
+        }
+
+        // Pump 2: MomentFeed ingest + the `recentMoments` mirror.
+        // Both pumps run on independent tasks because each
+        // `bus.subscribe()` returns its own channel — sharing one
+        // would couple feed-ingest cadence to phase-update cadence.
+        Task { [weak self] in
+            for await event in await bus.subscribe() {
+                await feed.ingest(event)
+                if Task.isCancelled { break }
+                _ = self
+            }
+        }
+        let momentsStream = await momentFeed.subscribe()
+        Task { [weak self] in
+            for await _ in momentsStream {
+                guard let self else { return }
+                let snapshot = await feed.recent(limit: 50)
+                await MainActor.run { self.recentMoments = snapshot }
+                if Task.isCancelled { break }
+            }
+        }
+
         // Memory sidecar is best-effort: if the venv hasn't been built
         // (Sidecars/mempalace/setup.sh not run), the start fails cleanly
         // and CognitionEngine just skips recall + record on subsequent
@@ -757,67 +858,82 @@ final class AppServices {
         // to hot-swap without restarting Rocky.
         await applyBrainBackend()
 
-        // Brain pre-warm. Forces the model into memory + primes the
-        // KV cache with a one-token dummy turn so the user's first
-        // real question doesn't pay the cold-start cost (~500–
-        // 1000 ms for MLX-VLM 4B). Detached + short-circuited on
-        // success — no awaited wait on user-facing startup, but
-        // the model is loaded by the time the user finishes their
-        // first sentence. Failures are non-fatal; the first real
-        // turn just pays the warmup cost itself.
+        // Brain pre-warm. The MLX-VLM sidecar runs its own three-pass
+        // warmup inside `Brain.load()` BEFORE emitting `ready`, using
+        // a long synthetic prompt + 384×384 image + tool schema to
+        // shape-match the user's real first query. By the time
+        // `applyBrainBackend()` returned above, kernels for the
+        // long-prefill + vision + tool path should all be JIT'd.
+        //
+        // This Swift-side probe finishes the job with the *actual*
+        // persona, tool schemas, and (if vision is on) the latest
+        // camera frame — exactly the path `CognitionEngine.runStream`
+        // takes for the user's first query. Any shape the sidecar's
+        // synthetic warmup missed gets paid here, on the
+        // wallclock-tolerant startup path instead of on turn 1.
+        //
+        // `.userInitiated` so the scheduler doesn't starve it behind
+        // the user's first dispatch (a `.utility` detached task lost
+        // that race in production).
         let warmBrain = await cognition.brain
         let warmBus = logBus
-        Task.detached(priority: .utility) {
+        let warmPersona = settings.persona
+        let warmTools = await toolRegistry.schemas
+        let warmImage: BrainImage? = await MainActor.run {
+            guard self.visionEnabled, let frame = self.lastCameraFrame
+            else { return nil }
+            return BrainImage(jpegData: frame.jpeg)
+        }
+        Task.detached(priority: .userInitiated) {
             let started = Date()
-            let probe = ChatMessage(role: .user, content: "ok")
+            // Mirror the shape `CognitionEngine.runStream` builds:
+            // system persona, then a short user message. We don't
+            // hand-roll the recall envelope or tool-result messages —
+            // those only appear on subsequent rounds, and the
+            // dominant cost is prefill of the system + tools tokens
+            // plus encoding the image, both of which are present
+            // here.
+            let messages: [ChatMessage] = [
+                .init(role: .system, content: warmPersona),
+                .init(role: .user, content: "Rocky, status check."),
+            ]
             let stream = warmBrain.chatStream(
-                messages: [probe], tools: nil, image: nil
+                messages: messages,
+                tools: warmTools.isEmpty ? nil : warmTools,
+                image: warmImage
             )
             do {
                 for try await _ in stream {
                     // Read one token to confirm prefill+decode hot,
-                    // then bail. We don't care about the response
-                    // content.
+                    // then bail. The response content is discarded.
                     break
                 }
                 let ms = Date().timeIntervalSince(started) * 1000
                 await warmBus.publish(.sidecarLog(
                     sidecar: "brain", level: .info,
-                    message: String(format: "model warm in %.0f ms", ms),
-                    fields: [:]
+                    message: String(
+                        format: "shape-matched warm in %.0f ms (image=%@ tools=%d)",
+                        ms,
+                        warmImage == nil ? "no" : "yes",
+                        warmTools.count
+                    ),
+                    fields: [
+                        "phase": "warm_done_swift",
+                        "warmup_ms": "\(Int(ms))",
+                    ]
                 ))
             } catch {
                 await warmBus.publish(.sidecarLog(
                     sidecar: "brain", level: .warn,
-                    message: "warm-up failed: \(error)",
+                    message: "shape-matched warm failed: \(error)",
                     fields: [:]
                 ))
             }
         }
 
-        // Pump LogBus events into MomentFeed and mirror new moments
-        // back into the @Observable `recentMoments` slice for SwiftUI.
-        // The two pumps run on detached Tasks so they survive any
-        // restart of `start()`.
-        let bus = self.logBus
-        let feed = self.momentFeed
-        Task { [weak self] in
-            for await event in await bus.subscribe() {
-                await feed.ingest(event)
-                if Task.isCancelled { break }
-                _ = self  // keep the closure capturing self for the
-                          // weak guard above
-            }
-        }
-        let momentsStream = await momentFeed.subscribe()
-        Task { [weak self] in
-            for await _ in momentsStream {
-                guard let self else { return }
-                let snapshot = await feed.recent(limit: 50)
-                await MainActor.run { self.recentMoments = snapshot }
-                if Task.isCancelled { break }
-            }
-        }
+        // (LogBus pumps for warmup-phase + MomentFeed were set up at
+        // the top of start() to catch sidecar events from the very
+        // first emit. See the comment block there.)
 
         // Mac-side face tracker is the source of truth for set_target now;
         // the synthetic Python detector emits useless Lissajous targets, so
@@ -885,28 +1001,45 @@ final class AppServices {
             }
         }
 
-        // Watch the rockyState transition: pause MacFaceTracker's pushes
-        // to TargetStreamer while a wake_up / goto_sleep recorded move
-        // is playing — otherwise the streamer fights the primary animation.
+        // Watch the rockyState transition and propagate wake state to
+        // the face tracker. Two distinct gates with the same source:
+        //
+        //   • `setStreamerSuppressed(true)` — block 50 Hz set_target
+        //     pushes so the streamer doesn't fight a primary animation
+        //     mid-wake/sleep or generate targets while motors are off.
+        //   • `setSleeping(true)` — stop frame ingestion + idle search
+        //     so the Vision pipeline isn't burning CPU producing
+        //     detections that the (sleeping) motors will never act on.
+        //
+        // The user constraint: face tracker is only active when the
+        // bot is awake. `isAsleep` is the canonical wake-state flag;
+        // it covers both explicit sleepRobot() calls and the boot
+        // case where the robot was already powered-down before app
+        // launch. `transitioningUntil` and `controlMode != .enabled`
+        // are extra reasons to suppress the streamer specifically
+        // (motors transitioning or compliant) — they don't imply
+        // "stop Vision compute," so they only affect the streamer
+        // gate.
         Task { [weak self] in
             var lastSuppressed: Bool? = nil
+            var lastSleeping: Bool? = nil
             while true {
                 guard let self else { return }
-                let suppress = await MainActor.run { () -> Bool in
-                    if let until = self.transitioningUntil, Date() < until {
-                        return true
-                    }
-                    if self.isAsleep { return true }
-                    if let mode = self.lastRobotState?.controlMode,
-                       mode != .enabled {
-                        return true
-                    }
-                    return false
+                let (sleeping, suppress) = await MainActor.run { () -> (Bool, Bool) in
+                    let asleep = self.isAsleep
+                    let transitioning = (self.transitioningUntil.map { Date() < $0 }) ?? false
+                    let modeBlock = (self.lastRobotState?.controlMode).map { $0 != .enabled } ?? false
+                    let suppress = asleep || transitioning || modeBlock
+                    return (asleep, suppress)
                 }
                 if suppress != lastSuppressed {
                     await self.macFaceTracker.setStreamerSuppressed(suppress)
                     await self.targetStreamer.setPrimaryMoveActive(suppress)
                     lastSuppressed = suppress
+                }
+                if sleeping != lastSleeping {
+                    await self.macFaceTracker.setSleeping(sleeping)
+                    lastSleeping = sleeping
                 }
                 try? await Task.sleep(nanoseconds: 200_000_000)
             }
@@ -998,19 +1131,28 @@ final class AppServices {
             }
         }
         // Mirror StreamingTTS.isSpeakingStream into ttsBusyUntil so the
-        // echo gate has a ground-truth busy signal (no more wordCount
-        // × 0.4 + 1.5 s heuristic — the player tells us exactly when
-        // it starts and stops).
+        // echo gate has a ground-truth busy signal.
+        //
+        // Critical: when `isSpeaking` flips false, we DON'T clear
+        // `ttsBusyUntil` to nil — we stamp it `Date() + 1.5 s` instead.
+        // AddressFilter's `ttsActive` check is
+        //   `now < ttsBusyUntil.addingTimeInterval(1.5)`
+        // which returns `false` for a nil `ttsBusyUntil` — meaning the
+        // grace window collapses to zero the instant the audio
+        // duration timer fires. STT segments captured while Rocky was
+        // talking finalize ~500 ms later and end up dispatched as
+        // "user input" (echo hallucinations: "One of Rocky's love
+        // love love…"). Keeping `ttsBusyUntil` 1.5 s in the future +
+        // AddressFilter's own 1.5 s grace = 3 s of post-Rocky echo
+        // suppression, matching the v0.1 explicit-stamp behaviour.
         let speakingStream = streamingTTS.isSpeakingStream
         Task { [weak self] in
             for await speaking in speakingStream {
                 await MainActor.run {
                     if speaking {
-                        // Open-ended busy window; the false event below
-                        // closes it.
                         self?.ttsBusyUntil = Date.distantFuture
                     } else {
-                        self?.ttsBusyUntil = nil
+                        self?.ttsBusyUntil = Date().addingTimeInterval(1.5)
                     }
                 }
             }
@@ -1018,10 +1160,19 @@ final class AppServices {
 
         // Mirror sidecar state into Observable so the Status panel can read it.
         let ttsEvents = robotTTS.sidecar.events
+        let ttsSidecar = robotTTS.sidecar
         Task { [weak self] in
             for await event in ttsEvents {
                 if case .state(let s) = event {
-                    await MainActor.run { self?.ttsSidecarState = s }
+                    await MainActor.run {
+                        self?.ttsSidecarState = s
+                        self?.reconcileWarmupOnStateChange(sidecar: "mlx-tts", state: s)
+                    }
+                    if case .ready = s, let self {
+                        await self.refreshWarmupFromHealth(
+                            name: "mlx-tts", sidecar: ttsSidecar
+                        )
+                    }
                 }
             }
         }
@@ -1031,6 +1182,7 @@ final class AppServices {
                 if case .state(let s) = event {
                     await MainActor.run {
                         self?.memorySidecarState = s
+                        self?.reconcileWarmupOnStateChange(sidecar: "mempalace", state: s)
                         // Refresh the count whenever the sidecar
                         // transitions to ready so the status panel
                         // catches up automatically.
@@ -1049,7 +1201,41 @@ final class AppServices {
             Task { [weak self] in
                 for await event in brainEvents {
                     if case .state(let s) = event {
-                        await MainActor.run { self?.brainSidecarState = s }
+                        await MainActor.run {
+                            self?.brainSidecarState = s
+                            self?.reconcileWarmupOnStateChange(sidecar: "brain", state: s)
+                        }
+                        // Pull-based warmup snapshot — bypasses the
+                        // log-event race. When the sidecar
+                        // transitions to .ready, call `health` to
+                        // fetch the load + warmup timings the
+                        // runner cached during its load+warm_up
+                        // sequence. The Health view's "warm · load
+                        // Xs + JIT Ys" cue then renders from this
+                        // deterministic round-trip instead of from
+                        // log lines that may or may not have
+                        // reached LogBus subscribers in time.
+                        if case .ready = s, let self {
+                            await self.refreshBrainWarmupFromHealth()
+                        }
+                    }
+                }
+            }
+        }
+        if let mlxSTTSidecar {
+            let sttEvents = mlxSTTSidecar.events
+            let sttSidecar = mlxSTTSidecar
+            Task { [weak self] in
+                for await event in sttEvents {
+                    if case .state(let s) = event {
+                        await MainActor.run {
+                            self?.reconcileWarmupOnStateChange(sidecar: "mlx-stt", state: s)
+                        }
+                        if case .ready = s, let self {
+                            await self.refreshWarmupFromHealth(
+                                name: "mlx-stt", sidecar: sttSidecar
+                            )
+                        }
                     }
                 }
             }
@@ -1176,6 +1362,13 @@ final class AppServices {
 
         // Speech recognition authorization.
         Task { [weak self] in await self?.warmUpSTT() }
+
+        // TurnProfiler: bring up the LogBus subscription if the saved
+        // `profilingEnabled` setting is true. Without this, a user who
+        // flipped the toggle in a prior session would launch with the
+        // setting persisted as `true` but the profiler dormant — no
+        // PROFILE lines until they flip the toggle again.
+        await turnProfiler.setEnabled(settings.profilingEnabled)
     }
 
     /// Refresh the STT backend label without ever showing a TCC prompt
@@ -1188,6 +1381,120 @@ final class AppServices {
     /// subsequent `requestAuthorization()` calls return
     /// synchronously without re-prompting — so for non-`.notDetermined`
     /// statuses we still call through to update labels.
+    /// Pull warmup timings from a sidecar's `health` RPC and update
+    /// `warmupPhases[name]` accordingly. Called once per sidecar
+    /// when its lifecycle transitions to `.ready` so Health renders
+    /// real "warm · load Xs + JIT Ys" timings even if the LogBus
+    /// log-event channel raced against the pump's subscription
+    /// during sidecar startup. Pull-based source of truth.
+    fileprivate func refreshWarmupFromHealth(
+        name: String, sidecar: any Sidecar
+    ) async {
+        struct Empty: Encodable, Sendable {}
+        struct Health: Decodable, Sendable {
+            let loaded: Bool?
+            let warm: Bool?
+            let load_time_ms: Int?
+            let warmup_ms: Int?
+            let warmup_failed: String?
+        }
+        do {
+            let h: Health = try await sidecar.send(
+                method: "health", params: Empty()
+            )
+            let next: WarmupPhase
+            if let reason = h.warmup_failed {
+                next = .failed(reason: reason)
+            } else if h.warm == true {
+                next = .ready(loadMs: h.load_time_ms, warmMs: h.warmup_ms)
+            } else if h.loaded == true {
+                next = .warming
+            } else {
+                // Sidecar reports `loaded: false` but its lifecycle
+                // hit `.ready` — that's the historical lazy-load
+                // pattern (STT/TTS deferred load to first RPC).
+                // Treat as ready-with-unknown-timings rather than
+                // perpetually-loading.
+                next = .ready(loadMs: h.load_time_ms, warmMs: h.warmup_ms)
+            }
+            warmupPhases[name] = next
+            await logBus.publish(.sidecarLog(
+                sidecar: name, level: .info,
+                message: "warmup health snapshot",
+                fields: [
+                    "load_time_ms": h.load_time_ms.map(String.init) ?? "nil",
+                    "warmup_ms": h.warmup_ms.map(String.init) ?? "nil",
+                    "warm": String(h.warm ?? false),
+                ]
+            ))
+        } catch {
+            await logBus.publish(.sidecarLog(
+                sidecar: name, level: .warn,
+                message: "warmup health fetch failed: \(error)",
+                fields: [:]
+            ))
+        }
+    }
+
+    /// Brain-specific shim — keeps the existing call site readable.
+    fileprivate func refreshBrainWarmupFromHealth() async {
+        guard let brainSidecar else { return }
+        await refreshWarmupFromHealth(name: "brain", sidecar: brainSidecar)
+    }
+
+    /// Decode a `phase` field from a sidecar log line into a
+    /// `WarmupPhase` mutation. Called from the LogBus pump on
+    /// `.sidecarLog` events that carry a `phase=` field. Other log
+    /// lines are ignored.
+    fileprivate func applyWarmupPhase(
+        sidecar: String, phase: String,
+        loadMs: Int?, warmMs: Int?, reason: String?
+    ) {
+        let next: WarmupPhase
+        switch phase {
+        case "load_start":
+            next = .loading
+        case "load_done":
+            // Brain runs warm_up directly after load, so the next
+            // state is .warming. mlx-stt also runs warm immediately
+            // after its lazy import. Sidecars that don't do an
+            // automatic warmup will overwrite this to .ready when
+            // their warm_done fires; for ones that never warm, the
+            // process never leaves .warming — which is correct
+            // because the first inference IS still slow.
+            next = .warming
+        case "warm_done":
+            next = .ready(loadMs: loadMs, warmMs: warmMs)
+        case "warm_failed", "load_failed":
+            next = .failed(reason: reason ?? phase)
+        default:
+            return  // unknown phase: leave state unchanged
+        }
+        warmupPhases[sidecar] = next
+    }
+
+    /// When a sidecar's lifecycle transitions, reset/finalize the
+    /// warmup phase so the StatusView doesn't show stale data.
+    ///   - `.starting`: process just spawned — clear to .idle so a
+    ///     restart of a previously-warm sidecar shows fresh warmup
+    ///     progress, not a stale "warm · 3.2 s".
+    ///   - `.stopped`, `.failing`, `.circuitOpen`: clear too.
+    ///   - `.ready`: leave alone — the log-driven path is the
+    ///     authoritative source of `warmMs`. For sidecars that
+    ///     don't emit phase logs (mlx-tts, mempalace today),
+    ///     promote .idle to .ready so the UI shows a useful state
+    ///     instead of permanent "idle".
+    fileprivate func reconcileWarmupOnStateChange(sidecar: String, state: SidecarState) {
+        switch state {
+        case .stopped, .starting, .failing, .circuitOpen:
+            warmupPhases[sidecar] = .idle
+        case .ready:
+            if case .idle = warmupPhases[sidecar] ?? .idle {
+                warmupPhases[sidecar] = .ready(loadMs: nil, warmMs: nil)
+            }
+        }
+    }
+
     private func warmUpSTT() async {
         // Apple Speech authorisation: keep this even when WhisperKit
         // is the active engine. Apple Speech is the M0 fallback if
@@ -1313,8 +1620,8 @@ final class AppServices {
         await targetStreamer.stop()
         do {
             try await withThrowingTaskGroup(of: Void.self) { group in
-                group.addTask { [robotLink] in
-                    try await robotLink.goToSleep()
+                group.addTask { [motionGuard] in
+                    try await motionGuard.goToSleep()
                 }
                 group.addTask {
                     try await Task.sleep(nanoseconds: 4_000_000_000)
@@ -1329,7 +1636,7 @@ final class AppServices {
             // the last commanded pose. If the daemon is reachable
             // but the move fails, this still puts motors at rest;
             // if the daemon is unreachable, both calls no-op.
-            try? await robotLink.setMotorMode(.disabled)
+            try? await motionGuard.setMotorMode(.disabled)
         }
         await stop()
     }
@@ -1619,6 +1926,13 @@ final class AppServices {
                 // bubble when the result returns.
                 var pendingSayText: String? = nil
                 let started = Date()
+                // Track whether we've already pushed a `.brainResponse`
+                // to LogBus for this drain. `assistantFinal` only fires
+                // in the no-tool-calls exit branch — for turns that
+                // emit tool calls (the common case), we have to
+                // publish ourselves at end-of-stream so the profiler
+                // sees brain timing.
+                var brainResponsePublished = false
                 do {
                     for try await output in stream {
                         if Task.isCancelled { break }
@@ -1644,23 +1958,52 @@ final class AppServices {
                                 return turn.id
                             }
                             assistantTurnId = newId
-                        case .assistantFinal(_, let totalMs, let firstMs):
+                        case .assistantFinal(let finalText, let totalMs, let firstMs):
+                            // The engine's final text is authoritative
+                            // — it's already been through tool-call
+                            // recovery, thought-marker stripping, and
+                            // TTS cleanup. If it differs from the
+                            // raw delta buffer (e.g. the model emitted
+                            // `express({...})` as content and we
+                            // stripped it), REPLACE the bubble's
+                            // content with the clean version rather
+                            // than preserving the raw deltas. The
+                            // buffer is also reset so subsequent rounds
+                            // don't re-append the cleaned text on top
+                            // of a stale delta tail.
                             let id = assistantTurnId
-                            let buf = assistantBuffer
+                            let displayText = finalText
+                            assistantBuffer = displayText
                             await MainActor.run { [weak self] in
                                 guard let self else { return }
                                 if let id, let idx = self.brainTurns.firstIndex(where: { $0.id == id }) {
-                                    self.brainTurns[idx].content = buf
+                                    self.brainTurns[idx].content = displayText
                                     self.brainTurns[idx].totalMs = totalMs
                                     self.brainTurns[idx].firstChunkMs = firstMs
-                                } else if !buf.isEmpty {
-                                    var t = BrainTurn(role: "assistant", content: buf)
+                                } else if !displayText.isEmpty {
+                                    var t = BrainTurn(role: "assistant", content: displayText)
                                     t.totalMs = totalMs
                                     t.firstChunkMs = firstMs
                                     self.brainTurns.append(t)
                                 }
                             }
+                            // Mirror brain timings onto LogBus so the
+                            // TurnProfiler (and anything else subscribing)
+                            // can attribute brain TFT + total without
+                            // having to consume the cognition stream.
+                            await self.logBus.publish(.brainResponse(
+                                firstChunkMs: firstMs,
+                                totalMs: totalMs
+                            ))
+                            brainResponsePublished = true
                         case .toolCallDispatched(let name, let argumentsJSON, _):
+                            // Tool dispatch is also a valid "first
+                            // chunk" signal — many models emit tool
+                            // calls without any content text, in which
+                            // case `assistantDelta` never fires.
+                            if firstChunkMs == nil {
+                                firstChunkMs = Date().timeIntervalSince(started) * 1000
+                            }
                             let detail = argumentsJSON
                             // Stash the say text so we can mirror it into
                             // an assistant bubble after the tool returns;
@@ -1712,6 +2055,19 @@ final class AppServices {
                         self?.llmStatus = .offline(reason: "\(error)")
                     }
                 }
+                // Catch-all brain timing publish. The `assistantFinal`
+                // exit branch already pushes `.brainResponse` — but
+                // tool-using turns (the common case: say+search_web+
+                // say) never reach that branch, they return after the
+                // final say lands. Without this, profiler brain
+                // columns are always empty for the interesting turns.
+                if !brainResponsePublished, let self {
+                    let totalMs = Date().timeIntervalSince(started) * 1000
+                    await self.logBus.publish(.brainResponse(
+                        firstChunkMs: firstChunkMs,
+                        totalMs: totalMs
+                    ))
+                }
                 return false  // completed normally / errored — NOT timeout
             }
             // Timer task — fires `true` after the timeout, racing the
@@ -1759,7 +2115,9 @@ final class AppServices {
     /// AND an explicit `Task.sleep` of the same length so the motion
     /// actually completes before the next one starts.
     func playExpression(_ name: String) async throws {
-        let robot = robotLink
+        // Route through MotionGuard — slew + velocity + duration
+        // floor guards apply to every step of the expression.
+        let robot = motionGuard
         let neutral = RPYPose(roll: 0, pitch: 0, yaw: 0)
 
         /// Issue a goto and wait for the motion to actually complete
@@ -1791,6 +2149,27 @@ final class AppServices {
         }
         defer {
             Task { @MainActor in self.transitioningUntil = nil }
+            // Reset the TargetStreamer's `latest` to neutral so the
+            // streamer doesn't resume by pushing the stale face-
+            // tracking target it held BEFORE the expression began
+            // (the suppression during transition prevented the
+            // face tracker from updating it). Without this, the
+            // head settles to wherever the streamer's stale target
+            // points — observed as "stuck looking down" after a
+            // curious gesture finishes. With this, the head returns
+            // to neutral, and the face tracker takes over normally
+            // on its next tick if a face is in view.
+            // Antenna rest pose is ±0.1745 rad (10°) — they shake
+            // mechanically at 0, so the safe rest is the off-vertical
+            // pair the Pollen firmware ships with.
+            let neutralTarget = MotionTarget(
+                headPose: neutral,
+                antennas: Antennas(rightRad: -0.1745, leftRad: 0.1745),
+                bodyYaw: 0
+            )
+            Task { [weak self] in
+                await self?.targetStreamer.update(neutralTarget, source: .tool)
+            }
         }
 
         switch name {
@@ -1892,7 +2271,10 @@ final class AppServices {
         await macFaceTracker.setEnabled(false)
         defer { Task { await macFaceTracker.setEnabled(true) } }
 
-        try await robotLink.playRecordedMove(dataset: dataset, move: name)
+        // Route through MotionGuard so the shelf-safe allowlist gates
+        // dangerous moves (dance, rage, etc.) by default. Force=true
+        // is reserved for an explicit user opt-in path (not wired yet).
+        try await motionGuard.playRecordedMove(dataset: dataset, move: name)
 
         // Velocity watchdog + completion / cap loop. Sample the
         // mirrored state every 50 ms (≈20 Hz) and:
@@ -2031,7 +2413,7 @@ final class AppServices {
             }
         }
         do {
-            try await robotLink.wakeUp()
+            try await motionGuard.wakeUp()
             await MainActor.run { self.transitioningUntil = nil }
         } catch {
             await MainActor.run { self.transitioningUntil = nil }
@@ -2061,7 +2443,7 @@ final class AppServices {
         // camera frames (no point — motors are off). This also
         // disables the idle look-around if it was enabled.
         await macFaceTracker.setSleeping(true)
-        do { try await robotLink.goToSleep() }
+        do { try await motionGuard.goToSleep() }
         catch {
             await MainActor.run { self.transitioningUntil = nil }
             await logBus.publish(.error(
@@ -2287,6 +2669,7 @@ final class AppServices {
         await faceLibrary.setAcceptThreshold(settings.faceMatchThreshold)
         await robotTTS.setVolume(settings.audioVolume)
         await voice.setVADThreshold(Float(settings.micVADThreshold))
+        await turnProfiler.setEnabled(settings.profilingEnabled)
         await probeLMStudio()
     }
 
@@ -2482,7 +2865,12 @@ final class AppServices {
     // MARK: - Tools
 
     private func registerInitialTools() async {
-        let robot = robotLink
+        // Every motion command from a registered tool routes through
+        // MotionGuard — that's the chokepoint for slew, velocity,
+        // duration-floor, single-in-flight, and shelf-safety guards.
+        // Direct `robotLink.*` motion calls in tool handlers are
+        // forbidden (they bypass safety).
+        let robot = motionGuard
         let bus = logBus
 
         // Image-grounded variant — call this when the user asks to
@@ -2523,6 +2911,47 @@ final class AppServices {
                     "yaw_rad": .number(yaw),
                     "pitch_rad": .number(pitch),
                 ])
+            }
+        )
+
+        // `go_home` — return Rocky to the wake-up pose. EXACTLY mirrors
+        // `RobotLinkClient.wakeUp`'s terminal goto: head identity
+        // (roll/pitch/yaw = 0), 2 s minjerk, no antenna or body-yaw
+        // command (the wake move doesn't touch them, so neither does
+        // this — preserves whatever state antennas/body are in).
+        // Face tracking is paused for the duration so the 50 Hz
+        // streamer can't fight the smooth interpolated goto. The
+        // built-in velocity guard rail in robot.goto will stretch
+        // duration further if any joint delta would exceed the cap.
+        let faceTrackerForHome = macFaceTracker
+        let streamerForHome = targetStreamer
+        await toolRegistry.register(
+            name: "go_home",
+            description: "Return Rocky to home position — the same pose Rocky lands in when waking up (head looking straight forward: roll, pitch, and yaw all zero). Slow, calm 2-second move. Antennas and body are NOT moved. Use whenever the user says 'go home', 'home position', 'rest position', 'reset', 'centre', 'recentre', 'reset pose', 'look at me', 'come back', or 'follow me again' (also re-enables face tracking).",
+            handler: { _ in
+                let home = RPYPose(roll: 0, pitch: 0, yaw: 0)
+                let homeTarget = MotionTarget(
+                    headPose: home,
+                    antennas: nil,
+                    bodyYaw: 0
+                )
+                // Stop the face tracker pushing new targets, AND
+                // overwrite the streamer's latest with the home pose.
+                // Without the second step, the streamer keeps re-
+                // sending whatever was last commanded (e.g. the
+                // whiteboard pose from a previous `look_at_object`),
+                // and the head twitches back to that pose the
+                // moment the goto finishes.
+                await faceTrackerForHome.setEnabled(false)
+                await streamerForHome.update(homeTarget, source: .tool)
+                defer { Task { await faceTrackerForHome.setEnabled(true) } }
+                try await robot.goto(
+                    headPose: home,
+                    bodyYaw: 0,
+                    durationS: 2.0,
+                    interpolation: .minjerk
+                )
+                return .object(["ok": .bool(true)])
             }
         )
 
@@ -2606,12 +3035,15 @@ final class AppServices {
             description: """
             Play a pre-recorded full-body emotion from the Reachy emotions \
             library (head + antennas + sound) AND have Rocky verbalise at \
-            the same time. Use when the user explicitly asks Rocky to \
-            perform / act / show / dance / play a specific emotion. The \
-            `text` Rocky speaks must follow Rocky's voice rules (telegraphic, \
-            third person, no -ing/-ed) and fit the emotion. For passive \
-            emotional reactions during normal conversation, use `express` \
-            instead.
+            the same time. Use ONLY when the user explicitly asks Rocky to \
+            perform / act / show / dance / play a specific emotion. NEVER \
+            invoke `play_emotion` reactively on news, search results, or \
+            any answer — the recorded moves are designed for a stable \
+            floor mount and can destabilise Rocky on a desk shelf. For \
+            reactive emotional underlines during normal conversation, use \
+            `express` (head-only, gentle) instead. The `text` Rocky speaks \
+            must follow Rocky's voice rules (telegraphic, third person, \
+            no -ing/-ed) and fit the emotion.
             """,
             parameters: .object([
                 "type": .string("object"),
@@ -2685,7 +3117,10 @@ final class AppServices {
             when the user asks for a feeling/reaction or when it strengthens \
             what Rocky is saying. The `text` Rocky speaks must follow \
             Rocky's voice rules (telegraphic, third person, no -ing/-ed) \
-            and fit the expression. Each gesture takes 1.5–3 s. \
+            and fit the expression. The expression MUST match the meaning \
+            of the text — agree with agreement, sad with sad news, curious \
+            with a question, etc. Mismatched expressions (e.g. happy gesture \
+            on bad news) are forbidden. Each gesture takes 1.5–3 s. \
             Available expressions: scared, agree, disagree, excited, sad, \
             curious, look_around, shy.
             """,
@@ -2806,32 +3241,17 @@ final class AppServices {
                     return .object(["ok": .bool(false),
                                     "error": .string("tts muted (or quiet mode)")])
                 }
-                // M6: prefer the streaming path when the sidecar
-                // supports it (Qwen3-TTS-12Hz). Streaming flips
-                // `ttsBusyUntil` via the StreamingTTS.isSpeakingStream
-                // bridge — no heuristic stamp needed.
-                let supportsStream = await tts.sidecarSupportsStreaming()
-                let stats: RobotTTS.SpeakStats
-                if supportsStream {
-                    stats = try await tts.speakStreaming(text)
-                } else {
-                    // Legacy non-streaming path (Chatterbox + others
-                    // without supports_streaming): keep the v0.1
-                    // pre-stamp + post-refinement heuristic. The
-                    // estimated busy window covers the synthesis ramp;
-                    // post-stats refinement uses the real WAV
-                    // duration + 1.5 s STT post-roll tail.
-                    let estimateS = max(2.0, Double(text.split(separator: " ").count) * 0.4 + 1.0)
-                    if let self {
-                        let until = Date().addingTimeInterval(estimateS)
-                        await MainActor.run { self.ttsBusyUntil = until }
-                    }
-                    stats = try await tts.speak(text)
-                    if let self {
-                        let until = Date().addingTimeInterval(stats.durationS + 1.5)
-                        await MainActor.run { self.ttsBusyUntil = until }
-                    }
-                }
+                // Single-shot synth → upload → play_sound. `speak()`
+                // returns as soon as `play_sound` is dispatched (audio
+                // is now playing on the robot); it does NOT wait for
+                // audio to finish. The brain unblocks immediately and
+                // can think about the next user turn while Rocky is
+                // still talking. The echo gate (`isSpeaking` flag
+                // mirrored into `ttsBusyUntil` via
+                // `streamingTTS.isSpeakingStream`) stays engaged for
+                // `durationS + sttPostRollS` so STT doesn't pick up
+                // Rocky's own voice.
+                let stats = try await tts.speak(text)
                 return .object([
                     "ok": .bool(true),
                     "synth_ms": .number(stats.synthMs),
@@ -3083,7 +3503,10 @@ final class AppServices {
         return STTWakeEngine()
     }
 
-    private nonisolated static func devTTSManifest(backend: String) -> SidecarManifest {
+    private nonisolated static func devTTSManifest(
+        backend: String,
+        model: String = ""
+    ) -> SidecarManifest {
         // v0.4+: Chatterbox 8-bit is the default. Outperforms every
         // other cloning model on mlx-audio 0.4.3 by a wide margin
         // (0.15× RTF on Apple Silicon vs ~1.4× for Qwen3-TTS 1.7B).
@@ -3096,6 +3519,8 @@ final class AppServices {
             resolved = "chatterbox"
         case "qwen3-tts", "qwen3", "qwen":
             resolved = "qwen3-tts"
+        case "fish", "fish-tts":
+            resolved = "fish"
         default:
             resolved = backend
         }
@@ -3103,22 +3528,39 @@ final class AppServices {
             .appendingPathComponent("bin/python")
         let sidecarDir = locateSidecarDir(named: "mlx-tts")?
             .path(percentEncoded: false) ?? "."
+        // Build the env. `ROCKY_TTS_<BACKEND>_MODEL` overrides each
+        // backend's default HF repo when the user supplies one. Empty
+        // string means "let the backend use its built-in default".
+        var env: [String: String] = [
+            "PYTHONPATH": sidecarDir,
+            "ROCKY_TTS_BACKEND": resolved,
+        ]
+        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedModel.isEmpty {
+            switch resolved {
+            case "chatterbox":
+                env["ROCKY_TTS_CHATTERBOX_MODEL"] = trimmedModel
+            case "qwen3-tts":
+                env["ROCKY_TTS_QWEN3_MODEL"] = trimmedModel
+            case "fish":
+                env["ROCKY_TTS_FISH_MODEL"] = trimmedModel
+            default:
+                // Unknown backend — set a generic ROCKY_TTS_MODEL so
+                // future backends can pick it up without code change.
+                env["ROCKY_TTS_MODEL"] = trimmedModel
+            }
+        }
         return SidecarManifest(
             name: "mlx-tts",
             version: "0.2.0-dev",
             binary: venvPython.path,
             args: ["-u", "-m", "rocky_tts.runner"],
             workingDir: sidecarDir,
-            env: [
-                "PYTHONPATH": sidecarDir,
-                "ROCKY_TTS_BACKEND": resolved,
-            ],
+            env: env,
             readyTimeoutS: 30,
             shutdownGraceS: 3,
             // First synth includes a model load (~5–10s); bump the
-            // synthesize timeout. synthesize_stream's first chunk
-            // can land in 97 ms for Qwen3-TTS once warm but include
-            // the cold-start budget too.
+            // synthesize timeout to cover the cold start.
             timeouts: [
                 "*": 5,
                 "synthesize": 60,

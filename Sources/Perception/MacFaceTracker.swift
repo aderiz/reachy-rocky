@@ -111,6 +111,20 @@ public actor MacFaceTracker {
         public var antennaLeftRestRad: Double = -0.1745
         public var antennaRightRestRad: Double =  0.1745
 
+        // **Comfort caps for live face tracking** — tighter than the
+        // global SafetyLimits.headYawMax (±180°) / bodyYawMax (±160°)
+        // which were sized for one-shot recorded moves where extreme
+        // angles are intentional. For continuous face tracking these
+        // are dangerous: if the user moves to the edge of frame, the
+        // tracker commands head + body to chase, the body's 35 %
+        // follow controller lags badly, and head ends up at ±158 °
+        // (twisted nearly backwards) before the body catches up.
+        // ±60 ° head / ±90 ° body keeps the runaway bounded — beyond
+        // these, the tracker just stops driving the joint further and
+        // lets the body-follow controller catch up.
+        public var headYawComfortMaxRad: Double = 60.0 * .pi / 180.0
+        public var bodyYawComfortMaxRad: Double = 90.0 * .pi / 180.0
+
         public init() {}
     }
 
@@ -517,13 +531,21 @@ public actor MacFaceTracker {
             }
             dampPitchX += dt * dampPitchV
 
-            let yawClamped = SafetyLimits.clamp(dampYawX, to: SafetyLimits.headYawMax)
+            // Comfort-clamp head first — must NOT exceed the live-
+            // tracking cap (default ±60°) regardless of what the
+            // damper computes. Without this the head twists nearly
+            // backwards when the user is far off-axis.
+            let yawClamped = SafetyLimits.clamp(
+                dampYawX, to: config.headYawComfortMaxRad
+            )
             let pitchClamped = SafetyLimits.clamp(dampPitchX, to: SafetyLimits.headPitchMax)
 
             // Body-yaw follow. Independent damper, slower omega + lower
-            // speed cap, target = head's commanded yaw scaled by the
-            // follow factor. Naturally decays home with the head when
-            // the face leaves view (target shrinks toward 0).
+            // speed cap. Target tracks the DAMPER's commanded yaw
+            // (not the clamped output) so when head is pinned at its
+            // comfort cap, body keeps following the "true" target
+            // and eventually rotates enough for the user to be in
+            // head's comfortable range.
             let bodyTarget = dampYawX * config.bodyFollowFactor
             let wB = config.bodyDamperOmega
             let aB = -2.0 * wB * dampBodyYawV
@@ -534,8 +556,11 @@ public actor MacFaceTracker {
                                    min(config.bodyMaxSpeedRadPerS, dampBodyYawV))
             }
             dampBodyYawX += dt * dampBodyYawV
+            // Body comfort cap (default ±90°). Tighter than the
+            // global ±160° hardware limit for the same reason as
+            // head: tabletop bot, no need to twist nearly backwards.
             let bodyClamped = SafetyLimits.clamp(
-                dampBodyYawX, to: SafetyLimits.bodyYawMax
+                dampBodyYawX, to: config.bodyYawComfortMaxRad
             )
 
             targetsContinuation.yield((yawClamped, pitchClamped, decay))

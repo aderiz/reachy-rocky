@@ -13,7 +13,7 @@ public actor TargetStreamer {
         case idle, running, paused(reason: String)
     }
 
-    private let client: RobotLinkClient
+    private let client: MotionGuard
     private let logBus: LogBus
     private let hz: Double
     private var task: Task<Void, Never>?
@@ -21,7 +21,7 @@ public actor TargetStreamer {
     private(set) public var status: Status = .idle
     private(set) public var primaryMoveActive: Bool = false
 
-    public init(client: RobotLinkClient, logBus: LogBus, hz: Double = 50) {
+    public init(client: MotionGuard, logBus: LogBus, hz: Double = 50) {
         self.client = client
         self.logBus = logBus
         self.hz = hz

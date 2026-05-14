@@ -126,23 +126,36 @@ class ChatterboxBackend(Backend):
             self._load_ref_array()
 
     def synthesize(self, text: str, voice_ref_id: str | None) -> SynthesisResult:
-        """Call `Model.generate(audio_prompt=...)` directly rather than
+        """Call `Model.generate(ref_audio=...)` directly rather than
         going through `mlx_audio.tts.generate.generate_audio`.
-        Reason: `generate_audio` defaults `voice='af_heart'` (a Kokoro
-        preset voice) and passes that *alongside* `ref_audio` to the
-        model. Chatterbox honours both, with the preset dominating —
-        the cloned voice ends up diluted toward 'af_heart' and synth
-        slows to ~1× RTF. Calling `model.generate` directly with
-        `audio_prompt=<ref_array>` and no `voice=` clones cleanly at
-        ~0.15× RTF.
+
+        Why bypass `generate_audio`: it defaults `voice='af_heart'`
+        (a Kokoro preset) and passes that *alongside* the reference
+        to the model. Chatterbox honours both, with the preset
+        dominating — the cloned voice ends up diluted toward
+        'af_heart' and synth slows to ~1× RTF. Direct call with just
+        the reference kwarg clones cleanly at ~0.15× RTF.
+
+        Why `ref_audio` + `sample_rate` instead of `audio_prompt` +
+        `audio_prompt_sr`: the **chatterbox-turbo** model (a separate
+        mlx_audio module — `chatterbox_turbo/chatterbox_turbo.py`)
+        only accepts `ref_audio` + `sample_rate`; it doesn't have an
+        `audio_prompt` kwarg. Regular `chatterbox` accepts both
+        names (`ref_audio` is documented as an alias for
+        `audio_prompt`). So `ref_audio` + `sample_rate` is the
+        cross-compatible pair — works for `chatterbox`,
+        `chatterbox-fp16`, `chatterbox-8bit`, and `chatterbox-turbo*`.
+        Without this fix, the turbo model silently ignored the
+        cloning kwargs and produced its default voice instead of
+        the user's clone.
         """
         self._ensure_loaded()
         assert self._model is not None
 
-        kwargs = {"text": text}
+        kwargs: dict = {"text": text}
         if self._audio_prompt is not None:
-            kwargs["audio_prompt"] = self._audio_prompt
-            kwargs["audio_prompt_sr"] = self._audio_prompt_sr
+            kwargs["ref_audio"] = self._audio_prompt
+            kwargs["sample_rate"] = self._audio_prompt_sr
 
         results = list(self._model.generate(**kwargs))
         if not results:

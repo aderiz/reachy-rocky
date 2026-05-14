@@ -23,7 +23,7 @@ struct InspectorView: View {
     @State private var selection: Tab = .health
 
     enum Tab: Hashable, CaseIterable, Identifiable {
-        case health, activity, memory, motion, vision, raw
+        case health, activity, memory, motion, vision, profile, raw
         var id: Self { self }
         var label: String {
             switch self {
@@ -32,16 +32,18 @@ struct InspectorView: View {
             case .memory:   "Memory"
             case .motion:   "Motion"
             case .vision:   "Vision"
+            case .profile:  "Profile"
             case .raw:      "Raw"
             }
         }
         var icon: String {
             switch self {
-            case .health:   "heart.text.square"
+            case .health:   "heart.fill"
             case .activity: "list.bullet.rectangle"
             case .memory:   "brain"
             case .motion:   "figure.stand"
             case .vision:   "eye"
+            case .profile:  "speedometer"
             case .raw:      "doc.plaintext"
             }
         }
@@ -84,6 +86,7 @@ struct InspectorView: View {
         case .memory:   MemoryTab()
         case .motion:   MotionCard()
         case .vision:   VisionCard()
+        case .profile:  ProfileTab()
         case .raw:      LogsView()
         }
     }

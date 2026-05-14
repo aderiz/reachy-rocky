@@ -76,6 +76,25 @@ Served under the app's `custom_app_url`
 | `POST` | `/control/stop_recording`  | Stop audio capture (idempotent). |
 | `WebSocket` | `/ws/audio` | Streams `audio` + `doa` JSON envelopes. |
 | `WebSocket` | `/ws/video` | Streams `frame` JSON envelopes (~15 fps, JPEG). |
+| `GET` | `/api/motion/health` | On-bot motion-guard config snapshot (thresholds, allowlist). |
+| `POST` | `/api/motion/set_target` | Slew-rate-limited set_target → forwards to daemon. |
+| `POST` | `/api/motion/goto` | Velocity + duration floor + single-in-flight + yaw-delta gate; forwards to daemon. |
+| `POST` | `/api/motion/play/{move}` | Built-in moves (wake_up, goto_sleep). Forwards to daemon. |
+| `POST` | `/api/motion/play/{dataset}/{move}` | Emotion library moves; rejected unless `force=true` or `move` is in the shelf-safe allowlist. |
+| `POST` | `/api/motion/set_motor_mode` | `{"mode": "enabled" \| "disabled" \| "gravity_compensation"}` → daemon. |
+| `POST` | `/api/motion/stop_move` | Stop in-flight move → daemon. |
+
+The `/api/motion/*` endpoints are Rocky's **on-bot motion guard** — they enforce slew, velocity, duration, single-in-flight, shelf-safe allowlist, and the Pollen-documented 65° head-body yaw delta cap before forwarding to the local daemon at `127.0.0.1:8000/api/move/*`. The Mac's `RobotLinkClient` rewrites all motion-bearing calls to these endpoints when `SettingsStore.onBotMotionGuardEnabled` is true (default). State reads still go to the daemon directly — they're read-only.
+
+For true uncircumventability, firewall the daemon to localhost-only so nothing else can hit `:8000` from outside the bot:
+
+```bash
+sudo ufw default deny incoming
+sudo ufw allow 22/tcp
+sudo ufw allow 8042/tcp
+sudo ufw allow from 127.0.0.1 to any port 8000
+sudo ufw enable
+```
 
 ### `/battery` schema
 
