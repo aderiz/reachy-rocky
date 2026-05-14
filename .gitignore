@@ -4,6 +4,9 @@
 # Per-user CLI state (Claude Code permission grants etc.)
 .claude/
 
+# Personal Claude project guidance — kept locally, not shared via git.
+CLAUDE.md
+
 # Obsidian (per-user editor config; not project state)
 docs/.obsidian/
 
