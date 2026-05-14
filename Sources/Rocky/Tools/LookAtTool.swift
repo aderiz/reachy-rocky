@@ -132,10 +132,21 @@ enum LookAtTool {
                         "error": .string("services unavailable"),
                     ])
                 }
-                let xRaw = args.asObject?["x"]?.asNumber ?? 0.5
-                let yRaw = args.asObject?["y"]?.asNumber ?? 0.5
-                let aspect = args.asObject?["aspect_ratio"]?.asNumber
-                    ?? Self.defaultAspectRatio
+                // Small LLMs (Gemma 4, some Qwen variants) emit
+                // numeric tool args as STRINGS ("0.9" not 0.9).
+                // `asNumber` only matches `.number(_)` so we'd
+                // silently default to 0.5 → zero delta → no
+                // movement. Accept either form here so a stringified
+                // 0.9 still rotates the head/body toward x=0.9.
+                func num(_ key: String, default def: Double) -> Double {
+                    guard let v = args.asObject?[key] else { return def }
+                    if let n = v.asNumber { return n }
+                    if let s = v.asString, let d = Double(s) { return d }
+                    return def
+                }
+                let xRaw = num("x", default: 0.5)
+                let yRaw = num("y", default: 0.5)
+                let aspect = num("aspect_ratio", default: Self.defaultAspectRatio)
                 let description = args.asObject?["description"]?.asString ?? ""
 
                 // Clamp inputs — the brain might overshoot 0..1
@@ -213,19 +224,27 @@ enum LookAtTool {
         let baseRoll = currentPose?.roll ?? 0
         let baseBody = currentBodyYaw ?? 0
 
-        // **Head + body 50/50 split.** The user wants visible whole-
-        // body motion, not just a head twist. Reachy Mini can rotate
-        // both head (±180°) and body (±160°); splitting the camera-
-        // yaw delta equally between them gives a natural "Rocky
-        // turns toward the target" appearance rather than the
-        // floating-head-on-a-still-body look the previous 30 % body
-        // share produced. If the head's half would exceed its
-        // comfortable range (±headYawComfortableMax), the overflow
-        // is pushed to the body.
+        // **Head + body split, body-heavy.** The user wants the
+        // whole bot to turn toward the target, not just the head
+        // twisting. Reachy Mini can rotate body (±160°) and head
+        // (±180°); we give the BODY 65 % of the yaw delta and the
+        // HEAD the remaining 35 %. That makes large rotations read
+        // as "Rocky turns to face the whiteboard" rather than "Rocky's
+        // head cranes over while the body stays still."
+        //
+        // For small deltas (< ~12 ° in total), this still feels
+        // natural — the body shifts slightly and the head does a
+        // little look. For large deltas (object near frame edge),
+        // the body does most of the work and the head fine-tunes.
+        //
+        // If the head's share would exceed its comfortable range
+        // (±headYawComfortableMax = 30 °), the overflow is pushed
+        // to the body so the neck doesn't crank past 30 °.
         let desiredCameraYaw = (baseYaw + baseBody) + yawDelta
-        let halfDelta = yawDelta * 0.5
-        let headRequested = baseYaw + halfDelta
-        let bodyRequested = baseBody + halfDelta
+        let bodyShare = 0.65
+        let headShare = 1.0 - bodyShare
+        let headRequested = baseYaw + yawDelta * headShare
+        let bodyRequested = baseBody + yawDelta * bodyShare
 
         let yawHeadTarget: Double
         let yawBodyTarget: Double
@@ -309,6 +328,14 @@ enum LookAtTool {
 
         return .object([
             "ok": .bool(true),
+            "next_step": .string(
+                "Head and body have turned. The CURRENT camera frame "
+                + "is now stale. End this round (do NOT call "
+                + "look_at_object again here). The next user turn "
+                + "OR the next assistant round will show a fresh "
+                + "frame — re-examine the target's image position "
+                + "THEN decide if another look_at_object is needed."
+            ),
             "x": .number(x),
             "y": .number(y),
             "aspect_ratio": .number(aspect),

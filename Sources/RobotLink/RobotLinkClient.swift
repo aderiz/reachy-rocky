@@ -64,6 +64,25 @@ public actor RobotLinkClient {
         "with_head_joints=true&with_body_yaw=true&with_antenna_positions=true&with_passive_joints=true"
 
     // MARK: - Motion
+    //
+    // ⚠️  CHOKEPOINT RULE — DO NOT CALL THESE DIRECTLY OUTSIDE
+    //     `Sources/RobotLink/MotionGuard.swift`.
+    //
+    // Every motion command (setTarget / goto / playRecordedMove /
+    // wakeUp / goToSleep / setMotorMode / stopMove) MUST be issued
+    // via `services.motionGuard.*`. The guard enforces slew limits,
+    // velocity clamps, duration floors, head-body yaw delta caps,
+    // single-in-flight serialisation, and the shelf-safe move
+    // allowlist. Calling these methods directly bypasses every
+    // single one of those safeties — the 2026-05-13 shelf
+    // incident happened because a tool reached the daemon without
+    // going through the guard.
+    //
+    // Verify with:
+    //   grep -rn "robotLink\.\(goto\|setTarget\|playRecordedMove\
+    //     \|wakeUp\|goToSleep\|setMotorMode\|stopMove\)" Sources \
+    //     --include="*.swift" | grep -v MotionGuard.swift
+    // → must be zero matches.
 
     /// `POST /api/move/set_target` — instant target update (wire schema:
     /// `FullBodyTarget`). Intended for streaming at ~50 Hz from `TargetStreamer`.

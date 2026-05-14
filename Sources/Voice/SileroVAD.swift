@@ -24,8 +24,8 @@ import CoreML
 /// permissive.
 ///
 /// Hysteresis (`minSpeechFrames` / `minSilenceFrames`) is in **VAD
-/// windows** (32 ms each), so 3 / 22 maps to 96 ms / 704 ms — close
-/// to the EnergyVAD defaults at 30 ms (90 ms / 660 ms). Same UX feel.
+/// windows** (32 ms each), so 3 / 10 maps to 96 ms / 320 ms — close
+/// to EnergyVAD's tuned 90 ms / 300 ms. Same UX feel.
 ///
 /// Source: [FluidInference/silero-vad-coreml](https://huggingface.co/FluidInference/silero-vad-coreml)
 /// (MIT). Fetch via `scripts/download-models.sh`. Once the model is
@@ -40,7 +40,7 @@ public final class SileroVAD: VAD, @unchecked Sendable {
         public init(
             threshold: Float = 0.5,
             minSpeechFrames: Int = 3,
-            minSilenceFrames: Int = 22
+            minSilenceFrames: Int = 10
         ) {
             self.threshold = threshold
             self.minSpeechFrames = minSpeechFrames
@@ -55,6 +55,11 @@ public final class SileroVAD: VAD, @unchecked Sendable {
 
     public var config: Config
     private(set) public var inSpeech: Bool = false
+
+    public var quietFrameCount: Int { quietFrames }
+    public var silenceMidwayCount: Int {
+        max(1, config.minSilenceFrames / 2)
+    }
 
     private let model: MLModel
     private var windowBuffer: [Float] = []

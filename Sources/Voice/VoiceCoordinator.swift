@@ -86,6 +86,19 @@ public actor VoiceCoordinator {
     /// rather than queueing (latest user audio matters more than backed-
     /// up history, and queueing turns into a multi-second stall).
     private var sttTask: Task<Void, Never>?
+    /// Speculative STT task: fired at the VAD's silence-midway point
+    /// (half-way through the silence accumulation phase) against a
+    /// snapshot of `pendingSegment`. By the time firm speech-end
+    /// arrives, the transcript is often already in. Cancelled if
+    /// the user resumes speaking (quietFrameCount drops back to 0)
+    /// — in that case the speculative result is on a clipped
+    /// segment and we fall back to a fresh STT against the full
+    /// extended segment.
+    private var speculativeSttTask: Task<Transcript?, Never>?
+    /// True after we've fired the speculative task for the current
+    /// silence phase, so we don't re-fire on every subsequent silent
+    /// frame in the same phase. Reset on speechStart and speechEnd.
+    private var speculativeFiredThisPhase: Bool = false
     /// Fires `.windowClosed` when the wake-filter conversation window
     /// hits its deadline without an extending follow-up. Cancelled and
     /// rescheduled on every dispatch so the timer always reflects the
@@ -155,6 +168,9 @@ public actor VoiceCoordinator {
         pumpTask = nil
         sttTask?.cancel()
         sttTask = nil
+        speculativeSttTask?.cancel()
+        speculativeSttTask = nil
+        speculativeFiredThisPhase = false
         windowCloseTask?.cancel()
         windowCloseTask = nil
         // Drop any half-captured segment so the next start() doesn't
@@ -261,13 +277,21 @@ public actor VoiceCoordinator {
                 }
             }
 
+            // Speculative-STT triggers, evaluated after the VAD has
+            // ingested this frame so quietFrameCount reflects the
+            // up-to-date silence accumulation.
+            await maybeFireSpeculative()
+            maybeCancelSpeculativeOnResume()
+
             switch transition {
             case .speechStart(let at):
                 segmentStart = at
+                speculativeFiredThisPhase = false
                 await logBus.publish(.vadSegment(startMs: at.timeIntervalSince1970 * 1000,
                                                  endMs: 0))
             case .speechEnd:
                 await flushSegment(forceEnd: false)
+                speculativeFiredThisPhase = false
                 // Pre-roll is consumed once a segment ends — start
                 // the next pre-roll fresh so we don't include
                 // tail audio from the previous utterance.
@@ -275,6 +299,59 @@ public actor VoiceCoordinator {
             case nil:
                 break
             }
+        }
+    }
+
+    /// Fire a speculative STT against the current segment when the
+    /// VAD's quietFrameCount hits its midway threshold. By the time
+    /// firm speech-end arrives, the transcript is often already in
+    /// — saving ~150–300 ms of wallclock per utterance on the happy
+    /// path (user stops talking and stays stopped).
+    private func maybeFireSpeculative() async {
+        guard !speculativeFiredThisPhase,
+              speculativeSttTask == nil,
+              sttTask == nil,
+              !pendingSegment.isEmpty,
+              vad.inSpeech,
+              vad.quietFrameCount >= vad.silenceMidwayCount
+        else { return }
+        let snapshot = pendingSegment
+        let rate = config.sampleRate
+        let engine = stt
+        speculativeFiredThisPhase = true
+        speculativeSttTask = Task<Transcript?, Never> { [weak self] in
+            do {
+                let t = try await engine.transcribe(samples: snapshot, at: rate)
+                if Task.isCancelled { return nil }
+                return t
+            } catch {
+                await self?.logBus.publish(.error(
+                    scope: "stt.speculative", message: "\(error)",
+                    recoverable: true
+                ))
+                return nil
+            }
+        }
+        await logBus.publish(.sidecarLog(
+            sidecar: "voice", level: .debug,
+            message: "stt: speculative fired at \(snapshot.count) samples",
+            fields: [:]
+        ))
+    }
+
+    /// If the user resumes speaking during the silence-accumulation
+    /// phase, `quietFrameCount` drops back to 0 — that's our signal
+    /// that the speculative segment is now stale (it's a prefix of
+    /// what the full utterance will turn out to be). Cancel so we
+    /// don't waste cycles producing a transcript we'll throw away.
+    private func maybeCancelSpeculativeOnResume() {
+        guard let task = speculativeSttTask else { return }
+        // quietFrameCount > 0 means we're still in (or just entered)
+        // a silence run. Only zero counts as "resumed speaking".
+        if vad.quietFrameCount == 0 {
+            task.cancel()
+            speculativeSttTask = nil
+            speculativeFiredThisPhase = false
         }
     }
 
@@ -330,10 +407,76 @@ public actor VoiceCoordinator {
             return
         }
 
+        // Speculative path: a previously-fired STT may already have
+        // (or be about to deliver) a transcript for a prefix of this
+        // segment. Use it if available, but fall back to a fresh STT
+        // if the speculative returned empty (Whisper's no-speech gate
+        // can fire mid-utterance) — the full segment may still
+        // transcribe successfully.
+        if let spec = speculativeSttTask {
+            speculativeSttTask = nil
+            sttTask = Task { [weak self] in
+                await self?.runSpeculativeOrFallback(
+                    speculative: spec,
+                    segment: segment, started: started,
+                    peakRMS: peakRMS, meanRMS: meanRMS
+                )
+            }
+            return
+        }
+
         sttTask = Task { [weak self] in
             await self?.runSTT(
                 segment: segment, started: started,
                 peakRMS: peakRMS, meanRMS: meanRMS
+            )
+        }
+    }
+
+    /// Await the speculative task. If it returned a non-empty
+    /// transcript, dispatch it with the FULL segment's RMS metrics
+    /// (so the AddressFilter still scores against the complete
+    /// audio segment, not the speculative prefix). If empty or
+    /// cancelled, fall through to a fresh full-segment STT.
+    private func runSpeculativeOrFallback(
+        speculative: Task<Transcript?, Never>,
+        segment: [Float], started: Date,
+        peakRMS: Double, meanRMS: Double
+    ) async {
+        if Task.isCancelled { sttTask = nil; drainQueueIfAny(); return }
+        let started_local = Date()
+        let result = await speculative.value
+        let totalMs = Date().timeIntervalSince(started_local) * 1000
+        if let r = result, !r.text.isEmpty {
+            await logBus.publish(.sttFinal(text: r.text, totalMs: totalMs))
+            await dispatchFinal(
+                r.text,
+                confidence: r.confidence,
+                peakRMS: peakRMS, meanRMS: meanRMS
+            )
+            sttTask = nil
+            drainQueueIfAny()
+            return
+        }
+        // Fall back: speculative produced nothing usable (cancelled,
+        // empty, or no-speech-gated by the sidecar). Run fresh STT
+        // on the full segment.
+        await runSTT(
+            segment: segment, started: started,
+            peakRMS: peakRMS, meanRMS: meanRMS
+        )
+    }
+
+    /// Extracted from `runSTT` so both the speculative and direct
+    /// paths can kick the queued segment forward after they finish.
+    private func drainQueueIfAny() {
+        guard let next = queuedSegment else { return }
+        queuedSegment = nil
+        let (np, nm) = Self.computeRMS(next.samples)
+        sttTask = Task { [weak self] in
+            await self?.runSTT(
+                segment: next.samples, started: next.started,
+                peakRMS: np, meanRMS: nm
             )
         }
     }
@@ -400,21 +543,8 @@ public actor VoiceCoordinator {
         }
         sttTask = nil
 
-        // Drain any segment that arrived while we were busy. Single
-        // slot — if a third arrived during the second's STT, the
-        // queue holds the most recent only. This is the path that
-        // turns the previous "drop new" behaviour into "process
-        // both back-to-back".
-        if let next = queuedSegment {
-            queuedSegment = nil
-            let (np, nm) = Self.computeRMS(next.samples)
-            sttTask = Task { [weak self] in
-                await self?.runSTT(
-                    segment: next.samples, started: next.started,
-                    peakRMS: np, meanRMS: nm
-                )
-            }
-        }
+        // Drain any segment that arrived while we were busy.
+        drainQueueIfAny()
     }
 
     private func dispatchFinal(

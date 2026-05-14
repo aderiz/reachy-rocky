@@ -18,6 +18,19 @@ public protocol VAD: Sendable {
     /// pending segment.
     var inSpeech: Bool { get }
 
+    /// Consecutive non-speech frames since the last speech frame.
+    /// Resets to 0 on every loud frame. Reaches `silenceMidwayCount`
+    /// halfway through the silence accumulation phase, then
+    /// `silenceEndCount` at firm speech-end. `VoiceCoordinator` uses
+    /// the midway crossing to fire speculative STT — by the time
+    /// the firm speech-end arrives the transcript is often ready.
+    var quietFrameCount: Int { get }
+
+    /// Half the count required for firm speech-end. Surfaces the
+    /// VAD's internal threshold so the coordinator can detect
+    /// "about-to-end" without needing to peek at config.
+    var silenceMidwayCount: Int { get }
+
     /// Feed a frame. Returns the resulting transition (if any).
     mutating func ingest(samples: [Float], at timestamp: Date) -> VADTransition?
 
@@ -41,15 +54,17 @@ public struct EnergyVAD: VAD {
         ///   still crosses it. The previous 0.015 was too strict and made
         ///   listen mode appear "stalled" (it never entered speech state
         ///   for someone not speaking close to the mic).
-        /// - minSilenceFrames 16 (~480 ms at 30 ms frames): the previous
-        ///   660 ms was the safest default but added perceptible lag to
-        ///   every turn. 480 ms still spans natural mid-sentence breaths
-        ///   on most users; longer pauses now split into two utterances
-        ///   (a worse failure than slower response, but rare in practice).
+        /// - minSilenceFrames 10 (~300 ms at 30 ms frames): natural
+        ///   mid-sentence pauses are typically 150–250 ms, so 300 ms
+        ///   still covers them comfortably. The previous 480 ms over-
+        ///   paid for the long-pause edge case and added perceptible
+        ///   dead air after every utterance. Users with deliberate
+        ///   long pauses will split into two utterances; that failure
+        ///   mode is rare and the bot handles it cleanly.
         public init(
             rmsThreshold: Float = 0.008,
             minSpeechFrames: Int = 3,
-            minSilenceFrames: Int = 16
+            minSilenceFrames: Int = 10
         ) {
             self.rmsThreshold = rmsThreshold
             self.minSpeechFrames = minSpeechFrames
@@ -66,6 +81,11 @@ public struct EnergyVAD: VAD {
     private(set) public var inSpeech: Bool = false
     private var loudFrames: Int = 0
     private var quietFrames: Int = 0
+
+    public var quietFrameCount: Int { quietFrames }
+    public var silenceMidwayCount: Int {
+        max(1, config.minSilenceFrames / 2)
+    }
 
     public init(config: Config = Config()) {
         self.config = config

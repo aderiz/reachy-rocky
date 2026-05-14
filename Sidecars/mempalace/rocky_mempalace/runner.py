@@ -85,8 +85,32 @@ PALACE_PATH = os.path.abspath(
     os.path.expanduser(os.environ.get("MEMPALACE_PALACE_PATH",
                                        "~/Library/Application Support/Rocky/Memory"))
 )
-WING = os.environ.get("ROCKY_MEMORY_WING", "rocky")
-ROOM = os.environ.get("ROCKY_MEMORY_ROOM", "conversation")
+WING = os.environ.get("ROCKY_MEMORY_WING", "office")
+# Default room is derived per-call (one room per UTC day so each
+# conversation has a natural chronological bucket). The env var can
+# still pin a fixed room for tests, but the in-flight code paths
+# call `_current_room()` to honour the day-by-day model.
+ROOM = os.environ.get("ROCKY_MEMORY_ROOM", "").strip() or None
+
+
+def _current_room() -> str:
+    """UTC date → room name. One room per day under the office wing.
+    The Memory tab can later group + navigate by date, and `recall`
+    can be scoped to today / this week / etc. via the wing+room args
+    on `tool_search`."""
+    if ROOM:
+        return ROOM
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def _normalise_role(role: str) -> str:
+    """mempalace's `added_by` field is free-form; we use it as a
+    structured speaker tag (one of user / assistant / system / tool).
+    Unknown values pass through but are coerced to lowercase."""
+    r = (role or "").strip().lower()
+    if r in {"user", "assistant", "system", "tool"}:
+        return r
+    return r or "user"
 
 # Ensure mempalace's MempalaceConfig sees the right path. The env var
 # is the source of truth so we just normalise it back into the env in
@@ -140,22 +164,32 @@ os.environ["MEMPALACE_PALACE_PATH"] = PALACE_PATH
 
 def handle_init_palace(_params: dict) -> dict:
     ensure_palace_initialised()
-    return {"ok": True, "path": PALACE_PATH, "wing": WING, "room": ROOM}
+    return {
+        "ok": True,
+        "path": PALACE_PATH,
+        "wing": WING,
+        "room": _current_room(),
+    }
 
 
 def handle_add(params: dict) -> dict:
-    role = str(params.get("role", "user"))
+    role = _normalise_role(str(params.get("role", "user")))
     text = str(params.get("text", "")).strip()
     if not text:
         return {"stored": False, "error": "empty text"}
-    # Tag the role + ISO timestamp inline so search hits include the
-    # speaker without a separate metadata round-trip.
+    # Store the body verbatim — no more `[role @ ts]` prefix. The role
+    # rides on `added_by` so list_drawers / search results carry it as
+    # a structured field instead of forcing the Mac to parse text. The
+    # full ISO timestamp goes on `source_file` (mempalace exposes that
+    # back through list_drawers as the drawer's `source_file` field,
+    # and the Mac uses it to render relative timestamps).
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    content = f"[{role} @ {ts}] {text}"
+    room = _current_room()
     try:
         result = _mcp.tool_add_drawer(
-            wing=WING, room=ROOM, content=content,
-            source_file=f"rocky/{role}/{ts}", added_by="rocky"
+            wing=WING, room=room, content=text,
+            source_file=f"rocky/{role}/{ts}",
+            added_by=role,
         )
     except Exception as exc:  # noqa: BLE001
         return {"stored": False, "error": f"add_drawer failed: {exc}"}
@@ -166,6 +200,8 @@ def handle_add(params: dict) -> dict:
         "id": (result or {}).get("drawer_id") if isinstance(result, dict) else None,
         "role": role,
         "ts": ts,
+        "wing": WING,
+        "room": room,
     }
 
 
@@ -174,9 +210,13 @@ def handle_recall(params: dict) -> dict:
     k = int(params.get("k", 5))
     if not query:
         return {"hits": []}
+    # Search across ALL rooms in the office wing (rooms are per-day,
+    # so a single-room search would miss yesterday's drawers). Pass
+    # room=None to mempalace; it interprets that as "every room
+    # under this wing."
     try:
         result = _mcp.tool_search(query=query, limit=max(1, min(k, 20)),
-                                   wing=WING, room=ROOM)
+                                   wing=WING, room=None)
     except Exception as exc:  # noqa: BLE001
         return {"hits": [], "error": f"search failed: {exc}"}
     if isinstance(result, dict) and "error" in result and not result.get("results"):
@@ -211,11 +251,12 @@ def handle_health(_params: dict) -> dict:
 
 
 def handle_count(_params: dict) -> dict:
-    """Return the drawer count for our wing/room. Surfaces in the
-    Status view so the user can see how much history Rocky has.
-    """
+    """Return the drawer count across the office wing (all rooms).
+    Surfaces in the Status view so the user can see how much history
+    Rocky has."""
     try:
-        result = _mcp.tool_list_drawers(wing=WING, room=ROOM, limit=1, offset=0)
+        result = _mcp.tool_list_drawers(wing=WING, room=None,
+                                         limit=1, offset=0)
     except Exception as exc:  # noqa: BLE001
         return {"count": 0, "error": f"list_drawers failed: {exc}"}
     if not isinstance(result, dict):
@@ -242,7 +283,7 @@ def handle_list(params: dict) -> dict:
     offset = max(0, int(params.get("offset") or 0))
     try:
         result = _mcp.tool_list_drawers(
-            wing=WING, room=ROOM, limit=limit, offset=offset
+            wing=WING, room=None, limit=limit, offset=offset
         )
     except Exception as exc:  # noqa: BLE001
         return {"drawers": [], "total": 0,
@@ -255,11 +296,24 @@ def handle_list(params: dict) -> dict:
     for d in raw:
         if not isinstance(d, dict):
             continue
+        # `added_by` is where role lives in the new write path; fall
+        # back to legacy `role`/`speaker` if present (older drawers).
+        role = (d.get("added_by") or d.get("role")
+                or d.get("speaker") or "")
+        # `source_file` is "rocky/<role>/<ts>" — pull the ts out if
+        # explicit `ts`/`timestamp` fields aren't present.
+        ts = d.get("ts") or d.get("timestamp") or ""
+        if not ts:
+            sf = d.get("source_file") or ""
+            parts = sf.split("/")
+            if len(parts) >= 3:
+                ts = parts[-1]
         drawers.append({
             "id": d.get("id") or d.get("drawer_id") or "",
-            "text": d.get("text") or d.get("body") or "",
-            "role": d.get("role") or d.get("speaker") or "",
-            "ts": d.get("ts") or d.get("timestamp") or "",
+            "text": d.get("content") or d.get("text") or d.get("body") or "",
+            "role": role,
+            "ts": ts,
+            "room": d.get("room") or "",
         })
     return {"drawers": drawers, "total": int(total)}
 
@@ -280,31 +334,243 @@ def handle_delete(params: dict) -> dict:
 
 
 def handle_forget_all(_params: dict) -> dict:
-    """Delete every drawer in the wing/room. Wired to the destructive
-    'Forget everything' button in Settings. Idempotent — safe to call
-    on an already-empty palace.
+    """Delete every drawer in the office wing AND every legacy wing,
+    AND invalidate every fact in the knowledge graph. Wired to the
+    destructive 'Forget everything' button. Idempotent — safe to
+    call on an already-empty palace.
+
+    Three steps:
+      1. Walk all rooms in office wing → tool_delete_drawer each
+      2. Same for legacy wings (default/default, rocky/conversation)
+         in case they survived the one-time wipe_legacy
+      3. tool_kg_timeline → tool_kg_invalidate each triple
+         (mempalace doesn't expose a "wipe KG" — invalidate stamps
+         every triple with an `ended` date so kg_query returns empty
+         for live facts; the underlying SQLite rows remain but the
+         active state is empty)
     """
-    try:
-        listing = _mcp.tool_list_drawers(wing=WING, room=ROOM,
-                                          limit=10_000, offset=0)
-    except Exception as exc:  # noqa: BLE001
-        return {"deleted": 0, "error": f"list_drawers failed: {exc}"}
-    drawers = []
-    if isinstance(listing, dict):
-        drawers = listing.get("drawers") or listing.get("results") or []
+    all_wings = [(WING, None),
+                 ("default", "default"),
+                 ("rocky", "conversation")]
     deleted = 0
-    for d in drawers:
-        if not isinstance(d, dict):
-            continue
-        drawer_id = d.get("id") or d.get("drawer_id")
-        if not drawer_id:
-            continue
+    for w, r in all_wings:
         try:
-            _mcp.tool_delete_drawer(drawer_id=drawer_id)
-            deleted += 1
+            listing = _mcp.tool_list_drawers(
+                wing=w, room=r, limit=10_000, offset=0
+            )
         except Exception:  # noqa: BLE001
             continue
-    return {"deleted": deleted, "wing": WING, "room": ROOM}
+        if not isinstance(listing, dict):
+            continue
+        for d in (listing.get("drawers")
+                  or listing.get("results") or []):
+            if not isinstance(d, dict):
+                continue
+            did = d.get("id") or d.get("drawer_id")
+            if not did:
+                continue
+            try:
+                _mcp.tool_delete_drawer(drawer_id=did)
+                deleted += 1
+            except Exception:  # noqa: BLE001
+                continue
+
+    # KG wipe: iterate every triple in the timeline and invalidate
+    # it. mempalace stamps `valid_to` with today's date, so kg_query
+    # without an `as_of` returns nothing live. Best-effort — failures
+    # silently skip rather than rolling back the drawer deletion.
+    kg_invalidated = 0
+    try:
+        kg = _mcp.tool_kg_timeline(entity=None)
+    except Exception:  # noqa: BLE001
+        kg = None
+    triples_raw: list = []
+    if isinstance(kg, dict):
+        triples_raw = (kg.get("results") or kg.get("triples")
+                       or kg.get("facts") or [])
+    elif isinstance(kg, list):
+        triples_raw = kg
+    for t in triples_raw:
+        if not isinstance(t, dict):
+            continue
+        s = t.get("subject") or t.get("s")
+        p = t.get("predicate") or t.get("p")
+        o = t.get("object") or t.get("o")
+        if not (s and p and o):
+            continue
+        try:
+            _mcp.tool_kg_invalidate(subject=s, predicate=p, object=o)
+            kg_invalidated += 1
+        except Exception:  # noqa: BLE001
+            continue
+    log("info", "forget_all complete",
+        drawers_deleted=deleted, kg_invalidated=kg_invalidated)
+    return {
+        "deleted": deleted,
+        "kg_invalidated": kg_invalidated,
+        "wing": WING,
+    }
+
+
+# --- knowledge graph -----------------------------------------------------
+
+def handle_kg_add(params: dict) -> dict:
+    """Assert a triple (subject, predicate, object) in the temporal
+    knowledge graph. mempalace stores it in a local SQLite store
+    alongside the drawer chroma.
+
+    Params:
+      subject, predicate, object — required, all strings
+      valid_from — optional ISO date / datetime
+      valid_to   — optional ISO date / datetime
+      source_drawer_id — optional id of the drawer that asserted this
+    """
+    subject = str(params.get("subject", "")).strip()
+    predicate = str(params.get("predicate", "")).strip()
+    obj = str(params.get("object", "")).strip()
+    if not subject or not predicate or not obj:
+        return {"ok": False, "error": "subject, predicate, object required"}
+    kwargs = {
+        "subject": subject,
+        "predicate": predicate,
+        "object": obj,
+    }
+    vf = params.get("valid_from")
+    vt = params.get("valid_to")
+    src = params.get("source_drawer_id") or params.get("source_file")
+    if isinstance(vf, str) and vf.strip(): kwargs["valid_from"] = vf.strip()
+    if isinstance(vt, str) and vt.strip(): kwargs["valid_to"] = vt.strip()
+    if isinstance(src, str) and src.strip(): kwargs["source_file"] = src.strip()
+    try:
+        result = _mcp.tool_kg_add(**kwargs)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"kg_add failed: {exc}"}
+    if isinstance(result, dict) and result.get("error"):
+        return {"ok": False, "error": str(result["error"])}
+    return {"ok": True, "result": result if isinstance(result, dict) else {}}
+
+
+def handle_kg_query(params: dict) -> dict:
+    """Return all triples touching `entity`. Optional `as_of` (ISO
+    date/datetime) restricts to facts valid at that time.
+    `direction` is one of `both` / `subject` / `object`."""
+    entity = str(params.get("entity", "")).strip()
+    if not entity:
+        return {"triples": [], "error": "entity required"}
+    as_of = params.get("as_of")
+    direction = params.get("direction") or "both"
+    kwargs: dict[str, Any] = {"entity": entity, "direction": str(direction)}
+    if isinstance(as_of, str) and as_of.strip():
+        kwargs["as_of"] = as_of.strip()
+    try:
+        result = _mcp.tool_kg_query(**kwargs)
+    except Exception as exc:  # noqa: BLE001
+        return {"triples": [], "error": f"kg_query failed: {exc}"}
+    return _coerce_kg_result(result)
+
+
+def handle_kg_timeline(params: dict) -> dict:
+    """Chronological list of triples. Optional `entity` filter."""
+    entity = params.get("entity")
+    if isinstance(entity, str) and not entity.strip():
+        entity = None
+    try:
+        result = _mcp.tool_kg_timeline(
+            entity=entity if isinstance(entity, str) else None
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"triples": [], "error": f"kg_timeline failed: {exc}"}
+    return _coerce_kg_result(result)
+
+
+def handle_kg_stats(_params: dict) -> dict:
+    """Entity / triple / predicate counts. Used to render the graph
+    overview header in the Memory tab."""
+    try:
+        result = _mcp.tool_kg_stats()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"kg_stats failed: {exc}"}
+    if not isinstance(result, dict):
+        return {"entities": 0, "triples": 0, "predicates": 0}
+    return {
+        "entities": int(result.get("entities") or result.get("entity_count") or 0),
+        "triples": int(result.get("triples") or result.get("triple_count") or 0),
+        "predicates": int(result.get("predicates")
+                          or result.get("predicate_count") or 0),
+    }
+
+
+def _coerce_kg_result(result: Any) -> dict:
+    """Normalise mempalace's KG responses to {"triples": [...]}.
+
+    mempalace's MCP tools return different keys depending on which
+    one you called:
+      - tool_kg_timeline → {"timeline": [...], "count": N}
+      - tool_kg_query    → {"facts":    [...], "count": N}
+    plus older / alternate shapes that historically used `results`
+    or `triples`. Accept all of them so we don't have to special-
+    case per RPC handler.
+    """
+    raw: list = []
+    if isinstance(result, dict):
+        raw = (result.get("timeline")
+               or result.get("facts")
+               or result.get("results")
+               or result.get("triples")
+               or [])
+        if "error" in result and not raw:
+            return {"triples": [], "error": str(result["error"])}
+    elif isinstance(result, list):
+        raw = result
+    out = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        out.append({
+            "subject": item.get("subject") or item.get("s") or "",
+            "predicate": item.get("predicate") or item.get("p") or "",
+            "object": item.get("object") or item.get("o") or "",
+            "valid_from": item.get("valid_from") or item.get("from"),
+            "valid_to": item.get("valid_to") or item.get("to"),
+            "source_file": item.get("source_file"),
+        })
+    return {"triples": out, "count": len(out)}
+
+
+# --- legacy wipe (one-shot migration) ------------------------------------
+
+def handle_wipe_legacy(_params: dict) -> dict:
+    """Delete every drawer in pre-v2 wings/rooms (`default/default`,
+    `rocky/conversation`). Called once by AppServices on first launch
+    of the v2 layout so the office wing starts clean. Safe to call
+    multiple times — no-ops once the legacy wings are empty."""
+    legacy = [
+        ("default", "default"),
+        ("rocky", "conversation"),
+    ]
+    deleted = 0
+    for w, r in legacy:
+        try:
+            listing = _mcp.tool_list_drawers(
+                wing=w, room=r, limit=10_000, offset=0
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(listing, dict):
+            continue
+        for d in (listing.get("drawers")
+                  or listing.get("results") or []):
+            if not isinstance(d, dict):
+                continue
+            did = d.get("id") or d.get("drawer_id")
+            if not did:
+                continue
+            try:
+                _mcp.tool_delete_drawer(drawer_id=did)
+                deleted += 1
+            except Exception:  # noqa: BLE001
+                continue
+    return {"deleted": deleted}
 
 
 HANDLERS = {
@@ -316,6 +582,11 @@ HANDLERS = {
     "list": handle_list,
     "delete": handle_delete,
     "forget_all": handle_forget_all,
+    "wipe_legacy": handle_wipe_legacy,
+    "kg_add": handle_kg_add,
+    "kg_query": handle_kg_query,
+    "kg_timeline": handle_kg_timeline,
+    "kg_stats": handle_kg_stats,
 }
 
 
@@ -340,7 +611,8 @@ def handle(req: dict) -> None:
 
 def main() -> None:
     log("info", "rocky-mempalace starting",
-        pid=os.getpid(), palace=PALACE_PATH, wing=WING, room=ROOM)
+        pid=os.getpid(), palace=PALACE_PATH, wing=WING,
+        room=(ROOM or "per-day"))
     emit({"event": "ready"})
     for line in sys.stdin:
         line = line.strip()

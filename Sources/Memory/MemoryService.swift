@@ -27,12 +27,28 @@ public actor MemoryService {
         public let score: Double?
         public let distance: Double?
         public let id: String?
+        /// "user" / "assistant" / "system" / "tool" — set for
+        /// `listDrawers` results, nil for `recall` (semantic search
+        /// doesn't surface role metadata yet).
+        public let role: String?
+        /// ISO-8601 timestamp string from the sidecar, nil for
+        /// recall hits.
+        public let ts: String?
 
-        public init(text: String, score: Double?, distance: Double?, id: String?) {
+        public init(
+            text: String,
+            score: Double?,
+            distance: Double?,
+            id: String?,
+            role: String? = nil,
+            ts: String? = nil
+        ) {
             self.text = text
             self.score = score
             self.distance = distance
             self.id = id
+            self.role = role
+            self.ts = ts
         }
     }
 
@@ -85,12 +101,19 @@ public actor MemoryService {
             method: "list",
             params: P(limit: limit, offset: offset)
         )
-        return resp.drawers.map {
-            Hit(
-                text: $0.text,
+        return resp.drawers.compactMap { d -> Hit? in
+            // Filter out empty/whitespace-only drawers — the Memory
+            // tab renders one row per Hit, and empty rows are not
+            // user-meaningful.
+            let trimmed = d.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            return Hit(
+                text: d.text,
                 score: nil,
                 distance: nil,
-                id: $0.id.isEmpty ? nil : $0.id
+                id: d.id.isEmpty ? nil : d.id,
+                role: d.role.isEmpty ? nil : d.role,
+                ts: d.ts.isEmpty ? nil : d.ts
             )
         }
     }
@@ -139,6 +162,109 @@ public actor MemoryService {
             method: "forget_all", params: P()
         )
         return resp.deleted
+    }
+
+    // MARK: - Legacy wipe (one-shot migration)
+
+    /// Delete drawers from pre-v2 wings (`default/default`,
+    /// `rocky/conversation`). Called once at boot when AppServices
+    /// detects we haven't migrated yet (UserDefaults flag). Safe to
+    /// call multiple times — no-ops after first run.
+    @discardableResult
+    public func wipeLegacy() async throws -> Int {
+        struct P: Encodable, Sendable {}
+        struct R: Decodable, Sendable { let deleted: Int? }
+        let resp: R = try await sidecar.send(method: "wipe_legacy", params: P())
+        return resp.deleted ?? 0
+    }
+
+    // MARK: - Knowledge graph
+
+    public struct Triple: Sendable, Hashable, Codable {
+        public let subject: String
+        public let predicate: String
+        public let object: String
+        public let validFrom: String?
+        public let validTo: String?
+        public let sourceFile: String?
+
+        enum CodingKeys: String, CodingKey {
+            case subject, predicate, object
+            case validFrom = "valid_from"
+            case validTo   = "valid_to"
+            case sourceFile = "source_file"
+        }
+    }
+
+    public struct GraphStats: Sendable, Equatable, Codable {
+        public let entities: Int
+        public let triples: Int
+        public let predicates: Int
+    }
+
+    /// Assert a triple in the temporal knowledge graph. Returns true
+    /// on success. Used by `CognitionEngine`'s post-turn extraction.
+    @discardableResult
+    public func kgAdd(
+        subject: String, predicate: String, object: String,
+        validFrom: String? = nil, validTo: String? = nil,
+        sourceDrawerID: String? = nil
+    ) async throws -> Bool {
+        struct P: Encodable, Sendable {
+            let subject: String
+            let predicate: String
+            let object: String
+            let valid_from: String?
+            let valid_to: String?
+            let source_drawer_id: String?
+        }
+        struct R: Decodable, Sendable {
+            let ok: Bool?
+            let error: String?
+        }
+        let resp: R = try await sidecar.send(method: "kg_add", params: P(
+            subject: subject, predicate: predicate, object: object,
+            valid_from: validFrom, valid_to: validTo,
+            source_drawer_id: sourceDrawerID
+        ))
+        return resp.ok ?? false
+    }
+
+    /// All triples that touch `entity`. `asOf` restricts to facts
+    /// valid at that time; `direction` is "both" / "subject" / "object".
+    public func kgQuery(
+        entity: String, asOf: String? = nil, direction: String = "both"
+    ) async throws -> [Triple] {
+        struct P: Encodable, Sendable {
+            let entity: String
+            let as_of: String?
+            let direction: String
+        }
+        struct R: Decodable, Sendable { let triples: [Triple]? }
+        let resp: R = try await sidecar.send(method: "kg_query", params: P(
+            entity: entity, as_of: asOf, direction: direction
+        ))
+        return resp.triples ?? []
+    }
+
+    /// Chronological timeline of triples; optionally filtered to one
+    /// entity. Used to drive the Facts tab.
+    public func kgTimeline(entity: String? = nil) async throws -> [Triple] {
+        struct P: Encodable, Sendable { let entity: String? }
+        struct R: Decodable, Sendable { let triples: [Triple]? }
+        let resp: R = try await sidecar.send(method: "kg_timeline", params: P(
+            entity: entity
+        ))
+        return resp.triples ?? []
+    }
+
+    /// Counts for the graph header.
+    public func kgStats() async throws -> GraphStats {
+        struct P: Encodable, Sendable {}
+        let resp: GraphStats = try await sidecar.send(
+            method: "kg_stats", params: P()
+        )
+        return resp
     }
 
     /// Fire-and-forget variants for callsites that shouldn't block on
@@ -215,7 +341,7 @@ public actor MemoryService {
 
 extension MemoryService.Hit: Decodable {
     enum CodingKeys: String, CodingKey {
-        case text, score, distance, id
+        case text, score, distance, id, role, ts
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -223,5 +349,7 @@ extension MemoryService.Hit: Decodable {
         self.score = try c.decodeIfPresent(Double.self, forKey: .score)
         self.distance = try c.decodeIfPresent(Double.self, forKey: .distance)
         self.id = try c.decodeIfPresent(String.self, forKey: .id)
+        self.role = try c.decodeIfPresent(String.self, forKey: .role)
+        self.ts = try c.decodeIfPresent(String.self, forKey: .ts)
     }
 }

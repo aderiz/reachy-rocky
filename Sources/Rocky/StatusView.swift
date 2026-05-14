@@ -679,7 +679,7 @@ struct StatusView: View {
     /// into one user-facing row. SidecarState alone only swings
     /// `.starting` → `.ready`; the warmup phase exposes the in-between
     /// "weights loading" vs "first JIT pass" steps so heavy MLX
-    /// sidecars (brain on Gemma 4 26B-A4B, STT on whisper-large-v3)
+    /// sidecars (brain on Gemma 4 26B-A4B, STT on whisper-small-mlx)
     /// don't sit silently at "starting…" for 20+ s. Phase wins for
     /// .warn states (it has more detail); SidecarState wins for
     /// failure modes (it knows why a sidecar crashed).

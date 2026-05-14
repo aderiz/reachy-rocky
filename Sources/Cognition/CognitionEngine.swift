@@ -261,6 +261,34 @@ public actor CognitionEngine {
         // but silent — round 2's auto-say had no input. Carry the
         // latest text forward and let every exit path consult it.
         var latestText = ""
+        // Track whether round 1 attached an image so rounds 2+
+        // inherit the same decision (consistent vision context
+        // across the whole turn).
+        var latestImageAttached: BrainImage? = nil
+        // Same idea for tool schemas — round 1 decides, subsequent
+        // rounds inherit. Avoids the brain suddenly seeing tools
+        // appear or disappear mid-turn.
+        var previousRoundHadTools: Bool = false
+        // Per-turn cap on `look_at_object` invocations. Each call
+        // requires a fresh brain round (~15 s) because the next
+        // iteration needs to examine the post-motion camera frame.
+        // Three iterations is a minute of latency for a "look at
+        // the whiteboard" request, often producing only marginal
+        // centring improvements. After the cap is hit, additional
+        // calls return a synthetic "already-iterated" result so the
+        // brain stops iterating and describes what it has.
+        var lookAtObjectCount: Int = 0
+        let lookAtObjectCap: Int = 2
+        // One-shot flag set by the escalation path: forces tools
+        // ON for the next round even if the heuristic said no.
+        // Used when a no-tools round emits "need to search" text —
+        // we retry the same user message with tools so the brain
+        // can actually escalate. Cleared at the top of each round.
+        var forceToolsThisRound: Bool = false
+        // Rounds we've burned on escalation retries. Capped so a
+        // model stuck in "need check web" loops can't burn the
+        // entire round budget retrying.
+        var escalationRetries: Int = 0
 
         while rounds < config.maxToolRounds {
             rounds += 1
@@ -272,13 +300,67 @@ public actor CognitionEngine {
             var toolIdsByIndex: [Int: String] = [:]
             var sawToolCalls = false
 
-            let tools = await registry.schemas
+            // Tool-schema gating. Each tool schema costs ~150-200
+            // prefill tokens (~0.75-1 s per round on Qwen-VL 9B).
+            // For 5 registered tools that's ~1000 tokens / ~5 s of
+            // prefill per turn. For pure-knowledge queries the
+            // brain doesn't need tools at all — it just emits text,
+            // which `maybeAutoSay` routes to the say tool on its
+            // behalf.
+            //
+            // Safety net: if the no-tools round emits an
+            // "I-need-to-escalate" signal in its text (e.g. "need
+            // check web", "Rocky not know"), the round is re-run
+            // with full tools so the brain CAN call search_web /
+            // recall_memory / etc. Without this fall-back, a query
+            // like "who's the richest man in the world?" would
+            // strand the brain — it correctly recognises it needs
+            // real-time data but had no tools to fetch it.
+            //
+            // `forceToolsThisRound` is set by the re-run path when
+            // escalation fires. Round 2+ inherits the round 1
+            // decision so tool context stays consistent within a
+            // turn (and once we've escalated, we never un-escalate).
+            let toolsGate: Bool = {
+                if forceToolsThisRound { return true }
+                if rounds > 1 { return previousRoundHadTools }
+                return Self.queryNeedsTools(userText)
+            }()
+            let tools = toolsGate ? await registry.schemas : []
+            previousRoundHadTools = toolsGate
+            // Clear the one-shot escalation flag so a future
+            // tools-on round doesn't keep forcing tools without
+            // reason.
+            forceToolsThisRound = false
             let messagesForLLM = Self.injectRecall(
                 envelope: recallEnvelope, into: transcript
             )
-            // Vision-aware brains take a camera frame at turn start;
-            // text-only brains ignore it.
-            let image: BrainImage? = await imageProvider?()
+            // Smart image gating. Vision-aware brains accept a
+            // camera frame, but every attached image adds ~500-700
+            // vision tokens to prefill (~2.5-3.5 s at typical prefill
+            // throughput) AND prevents prefix-cache reuse across
+            // turns (because dynamic-resolution vision tokens hash
+            // differently per frame). For queries that aren't
+            // actually about what's in front of the camera ("who's
+            // Tim Cook?", "what time is it?") sending the frame is
+            // pure overhead — the model never references the visual
+            // content but still pays the prefill cost.
+            //
+            // Heuristic: only attach the camera frame when the
+            // user's message contains a vision-relevant cue
+            // (deictic "this/that", visual verbs, identity-of-what-
+            // I-see phrases). Round 2+ within a turn inherit the
+            // round 1 decision so we don't toggle vision mid-turn.
+            let needsVision = (rounds == 1)
+                ? Self.queryNeedsVision(userText)
+                : (latestImageAttached != nil)
+            let image: BrainImage?
+            if needsVision, let provider = imageProvider {
+                image = await provider()
+                latestImageAttached = image
+            } else {
+                image = nil
+            }
             let stream = brain.chatStream(
                 messages: messagesForLLM,
                 tools: tools.isEmpty ? nil : tools,
@@ -421,6 +503,39 @@ public actor CognitionEngine {
                     scrubbed = Self.stripThoughtMarkers(scrubbed)
                     scrubbed = Self.stripNonLatinNoise(scrubbed)
                     let cleanedText = Self.cleanupForTTS(scrubbed)
+
+                    // Escalation detection. When this round ran in
+                    // no-tools mode AND the brain's text indicates
+                    // it lacks the answer ("need check web", "Rocky
+                    // not know", "let me search"), retry the same
+                    // user message WITH tools so the brain can
+                    // actually call `search_web` / `recall_memory`.
+                    // Capped at one retry per turn so a model that
+                    // never finds a satisfying answer doesn't loop.
+                    let canRetryWithTools = !toolsGate
+                        && escalationRetries < 1
+                        && Self.queryWantsToolEscalation(cleanedText)
+                    if canRetryWithTools {
+                        escalationRetries += 1
+                        forceToolsThisRound = true
+                        // Roll back this round's accounting — we're
+                        // about to redo it. The user's message is
+                        // still in `transcript` (it was appended in
+                        // runTurn before runStream), so the re-run
+                        // sees the same input. assistantText doesn't
+                        // need rolling back; we just don't emit it.
+                        rounds -= 1   // re-counts as the same round
+                        await logBus.publish(.sidecarLog(
+                            sidecar: "cognition",
+                            level: .info,
+                            message: "escalating to tools: brain signalled it needs to search",
+                            fields: [
+                                "preview": String(cleanedText.prefix(80)),
+                            ]
+                        ))
+                        continue       // skip auto-say + return — redo with tools
+                    }
+
                     let totalMs = Date().timeIntervalSince(started) * 1000
                     continuation.yield(.assistantFinal(
                         cleanedText, latencyMs: totalMs, firstChunkMs: firstChunkMs
@@ -444,21 +559,16 @@ public actor CognitionEngine {
                             spokeThisTurn: &spokeThisTurn
                         )
                     }
-                    // Post-turn write — fire-and-forget. Same helper
-                    // every other turn-exit path uses, so the write
-                    // discipline is consistent. The auto-say above
-                    // routes through registry.invoke("say", ...)
-                    // which would also be captured by the say-tool
-                    // path in writeTurnToMemory; here `calls` is
-                    // empty (we're in the no-LLM-tool-calls branch)
-                    // so the spoken text comes from `cleanedText`.
-                    if let memory {
-                        memory.recordDetached(role: .user, text: userText)
-                        if !cleanedText.isEmpty {
-                            memory.recordDetached(role: .assistant,
-                                                   text: cleanedText)
-                        }
-                    }
+                    // The no-LLM-tool-calls branch has no real say
+                    // call. Synthesize one so `commitTurn` records
+                    // the assistant drawer AND threads the user
+                    // drawer ID into KG-extraction. Keeps the
+                    // recording / extraction discipline identical
+                    // across all turn-exit paths.
+                    let synthetic = cleanedText.isEmpty
+                        ? []
+                        : [Self.syntheticSayCall(text: cleanedText)]
+                    commitTurn(userText: userText, calls: synthetic)
                     return
                 }
             }
@@ -487,11 +597,22 @@ public actor CognitionEngine {
             // intended turn structure (data tools + one speech in
             // the same response) keeps working.
             let speechToolNames: Set<String> = ["say", "express", "play_emotion"]
+            // Tools where multiple calls in one round are nonsense
+            // because the second call would use the same camera
+            // frame as the first — it can't see the result of its
+            // own motion. Keep only the first; the brain re-examines
+            // on the next round with a fresh frame.
+            let frameDependentTools: Set<String> = ["look_at_object"]
             var seenSpeech = false
+            var seenFrameDep: Set<String> = []
             let calls: [ToolCall] = rawCalls.filter { call in
                 if speechToolNames.contains(call.function.name) {
                     if seenSpeech { return false }
                     seenSpeech = true
+                }
+                if frameDependentTools.contains(call.function.name) {
+                    if seenFrameDep.contains(call.function.name) { return false }
+                    seenFrameDep.insert(call.function.name)
                 }
                 return true
             }
@@ -499,7 +620,7 @@ public actor CognitionEngine {
                 await logBus.publish(.sidecarLog(
                     sidecar: "cognition",
                     level: .warn,
-                    message: "dropped duplicate speech tool(s) in single round",
+                    message: "dropped duplicate tool calls in single round",
                     fields: [
                         "raw_count": "\(rawCalls.count)",
                         "kept_count": "\(calls.count)",
@@ -534,11 +655,26 @@ public actor CognitionEngine {
             sanitizedText = Self.stripThoughtMarkers(sanitizedText)
             sanitizedText = Self.stripNonLatinNoise(sanitizedText)
             sanitizedText = Self.cleanupForTTS(sanitizedText)
+            // Duplicate-bubble suppression. When the round emits a
+            // speech tool (say / express / play_emotion), AppServices
+            // appends an assistant bubble from the tool's `text` arg
+            // on tool-success (see toolCallResult handler). If we
+            // ALSO emit the brain's content text as a bubble via
+            // assistantFinal, the chat shows the same answer twice —
+            // first from streamed deltas, then from the say result.
+            // Clear sanitizedText in that case so the speech tool's
+            // bubble is the single canonical render.
+            let containsSpeechTool = calls.contains {
+                speechToolNames.contains($0.function.name)
+            }
+            if containsSpeechTool {
+                sanitizedText = ""
+            }
             // Yield a final-replacement event so the chat bubble
-            // updates from the raw delta stream to the clean text.
-            // AppServices' consumer treats `assistantFinal`'s first
-            // argument as the authoritative bubble content (see the
-            // updated handler).
+            // updates from the raw delta stream to the clean text
+            // (or empties when a speech tool will produce its own
+            // bubble). AppServices' consumer treats `assistantFinal`'s
+            // first argument as the authoritative bubble content.
             if sanitizedText != assistantText {
                 let totalMs = Date().timeIntervalSince(started) * 1000
                 continuation.yield(.assistantFinal(
@@ -566,11 +702,46 @@ public actor CognitionEngine {
                     argumentsJSON: call.function.arguments,
                     id: call.id
                 ))
-                let result = await registry.invoke(
-                    name: call.function.name,
-                    argumentsJSON: call.function.arguments,
-                    llmMessageId: call.id
-                )
+                let result: ToolResult
+                if call.function.name == "look_at_object",
+                   lookAtObjectCount >= lookAtObjectCap
+                {
+                    // Hard cap reached — synthesise a result that
+                    // tells the brain "stop iterating, describe what
+                    // you see". Avoids burning another ~15 s round
+                    // for a third+ fine-tune. The brain's persona
+                    // already says to describe after 2 looks; this
+                    // is the safety net for when it ignores that.
+                    let synthetic = "{\"ok\":false,\"max_iterations_reached\":true,"
+                        + "\"next_step\":\"You have already issued the maximum "
+                        + "\(lookAtObjectCap) look_at_object calls for this user "
+                        + "request. The target is acceptably in view by now — "
+                        + "describe what you actually see with `say` or `express`. "
+                        + "Do NOT call look_at_object again.\"}"
+                    result = ToolResult(
+                        name: call.function.name,
+                        argumentsJSON: call.function.arguments,
+                        resultJSON: synthetic,
+                        latencyMs: 0,
+                        ok: false,
+                        llmMessageId: call.id
+                    )
+                    await logBus.publish(.sidecarLog(
+                        sidecar: "cognition",
+                        level: .warn,
+                        message: "look_at_object cap reached, returning synthetic 'describe now' result",
+                        fields: ["count": "\(lookAtObjectCount)"]
+                    ))
+                } else {
+                    result = await registry.invoke(
+                        name: call.function.name,
+                        argumentsJSON: call.function.arguments,
+                        llmMessageId: call.id
+                    )
+                    if call.function.name == "look_at_object" {
+                        lookAtObjectCount += 1
+                    }
+                }
                 continuation.yield(.toolCallResult(result))
                 transcript.append(.init(
                     role: .tool,
@@ -596,9 +767,7 @@ public actor CognitionEngine {
                 continuation.yield(.error(
                     "model repeated identical tool calls; ending turn"
                 ))
-                Self.writeTurnToMemory(
-                    memory: memory, userText: userText, calls: calls
-                )
+                commitTurn(userText: userText, calls: calls)
                 return
             }
             // End the turn the moment `say` fires. The preamble +
@@ -622,9 +791,7 @@ public actor CognitionEngine {
                 // `remember(...)` tool was landing data, leaving
                 // user statements like "my age is 44" unwritten.
                 // Persist the exchange before bailing.
-                Self.writeTurnToMemory(
-                    memory: memory, userText: userText, calls: calls
-                )
+                commitTurn(userText: userText, calls: calls)
                 return
             }
             // Loop: feed tool outputs back to the model for another turn.
@@ -641,8 +808,310 @@ public actor CognitionEngine {
                 spokeThisTurn: &spokeThisTurn
             )
         }
-        Self.writeTurnToMemory(memory: memory, userText: userText, calls: [])
+        commitTurn(userText: userText, calls: [])
         continuation.yield(.error("hit max tool rounds (\(config.maxToolRounds))"))
+    }
+
+    // MARK: - Post-turn commit (verbatim drawers + KG extraction)
+
+    /// Persists the turn's verbatim drawers AND fires a fire-and-forget
+    /// KG-extraction pass. Replaces the bare `Self.writeTurnToMemory(...)`
+    /// calls at every exit path so both stores stay in sync.
+    ///
+    /// Sequenced inside a single detached task so the user drawer's
+    /// ID is captured BEFORE extraction runs — kgAdd needs it for
+    /// provenance (the `source_drawer_id` field on every triple
+    /// answers "why does Rocky think this?").
+    private func commitTurn(userText: String, calls: [ToolCall]) {
+        guard let memory else { return }
+        let brain = self.brain
+        let bus = self.logBus
+        let rockyText = Self.extractRockyTextFromCalls(calls)
+        let sayTexts: [String] = calls.compactMap { call -> String? in
+            guard call.function.name == "say",
+                  let data = call.function.arguments.data(using: .utf8),
+                  let parsed = try? JSONSerialization.jsonObject(with: data)
+                    as? [String: Any],
+                  let said = parsed["text"] as? String
+            else { return nil }
+            let trimmed = said.trimmingCharacters(in: .whitespaces)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        Task.detached(priority: .background) {
+            // 1. Record user drawer, capture the ID for KG provenance.
+            var userDrawerID: String? = nil
+            do {
+                let result = try await memory.record(role: .user, text: userText)
+                userDrawerID = result.id
+            } catch {
+                await bus.publish(.error(
+                    scope: "memory.record",
+                    message: "user: \(error)",
+                    recoverable: true
+                ))
+            }
+            // 2. Record assistant drawers (don't need IDs).
+            for text in sayTexts {
+                _ = try? await memory.record(role: .assistant, text: text)
+            }
+            // 3. KG extraction. Only worth running when Rocky actually
+            //    said something — otherwise there's no exchange to
+            //    extract from.
+            guard !rockyText.isEmpty else { return }
+            await Self.extractTriples(
+                userText: userText, rockyText: rockyText,
+                userDrawerID: userDrawerID,
+                memory: memory, brain: brain, bus: bus
+            )
+        }
+    }
+
+    /// Pull the spoken text out of this turn's speech-tool calls so
+    /// we have Rocky's side of the exchange for KG extraction.
+    /// Returns the first non-empty `text` argument across say /
+    /// express / play_emotion calls.
+    private static func extractRockyTextFromCalls(_ calls: [ToolCall]) -> String {
+        let speech: Set<String> = ["say", "express", "play_emotion"]
+        for call in calls where speech.contains(call.function.name) {
+            guard let data = call.function.arguments.data(using: .utf8),
+                  let parsed = try? JSONSerialization.jsonObject(with: data)
+                    as? [String: Any],
+                  let said = parsed["text"] as? String
+            else { continue }
+            let trimmed = said.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        return ""
+    }
+
+    /// Controlled predicate vocabulary. Triples whose predicate
+    /// isn't in this set are dropped at extraction time. Without
+    /// this, the brain emits a long tail of one-off predicates
+    /// (`likes` / `prefers` / `enjoys` / `is_fan_of`) that fragment
+    /// the graph and make edge colour-coding meaningless.
+    ///
+    /// Curated to cover the categories that matter for a personal
+    /// assistant: identity, preferences, possessions, relationships,
+    /// location, state, and worldly facts.
+    static let predicateVocabulary: [String] = [
+        // Identity & properties
+        "is", "name", "role", "occupation", "age",
+        // Preferences & opinions
+        "likes", "dislikes", "prefers", "uses",
+        // Possessions
+        "owns", "has_pet", "has_object",
+        // Relationships
+        "has_sibling", "has_parent", "has_child",
+        "married_to", "friend_of", "works_with", "knows",
+        // Location & origin
+        "lives_in", "born_in", "located_in", "from",
+        // Action & state
+        "feels", "wants", "plans_to", "did", "said",
+        // Affiliation
+        "works_at", "studies_at", "member_of",
+        // Worldly facts (entity↔entity)
+        "founded_by", "made_by", "contains", "part_of", "produces",
+    ]
+    private static let predicateVocabularySet = Set(predicateVocabulary)
+
+    /// Variants the brain reaches for when it means "the user". All
+    /// get rewritten to the canonical `self` anchor at extract time
+    /// so every user-property triple lands on the same node, not
+    /// scattered across `user` / `the_user` / `you` / `i` / `me`.
+    private static let selfVariants: Set<String> = [
+        "user", "the_user", "the user",
+        "you", "your",
+        "i", "me", "my", "myself",
+        "user_self", "self",
+    ]
+
+    /// Rewrite a user-as-subject string to `self`. Object position
+    /// gets the same treatment so `"alice loves you"` becomes
+    /// `alice loves self`.
+    static func normalizeSelf(_ token: String) -> String {
+        let lower = token.lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return selfVariants.contains(lower) ? "self" : token
+    }
+
+    /// Best-effort post-turn KG extraction. Called from inside
+    /// `commitTurn`'s detached task so it can be `await`ed in
+    /// sequence after the user drawer is recorded (so the resulting
+    /// triples carry that drawer's ID as provenance).
+    ///
+    /// Three changes from the original prompt:
+    ///   1. Fetches the top-K most-connected existing entity IDs
+    ///      and injects them into the prompt so the brain REUSES
+    ///      them instead of inventing variant spellings.
+    ///   2. Restricts predicates to a controlled vocabulary; any
+    ///      off-vocab predicate is dropped post-parse.
+    ///   3. Rewrites every `user` / `you` / `i` / `me` reference
+    ///      to the canonical `self` anchor in Swift, regardless of
+    ///      what the model emitted — belt and braces.
+    private static func extractTriples(
+        userText: String,
+        rockyText: String,
+        userDrawerID: String?,
+        memory: MemoryService,
+        brain: BrainBackend,
+        bus: LogBus
+    ) async {
+        // Build canonical entity list from the existing graph.
+        // Top 40 by degree gives the brain a working vocabulary
+        // without overwhelming the prompt.
+        let canonicalEntities = await Self.topEntities(memory: memory, limit: 40)
+        let entityHint = canonicalEntities.isEmpty
+            ? "(graph is empty — invent new lowercase_snake_case IDs as needed)"
+            : canonicalEntities.joined(separator: ", ")
+        let predicateList = predicateVocabulary.joined(separator: ", ")
+
+        let prompt = """
+        You extract factual triples from a short exchange between the user and a robot named Rocky.
+
+        Return ONLY a JSON object with this exact shape:
+          {"triples": [{"subject": "...", "predicate": "...", "object": "..."}]}
+
+        SUBJECT/OBJECT rules:
+        - For ANY property of the user (name, preference, identity, possession, location, opinion, plan), the subject is the literal string "self".
+        - For other entities, REUSE one of these existing IDs verbatim when it fits:
+          \(entityHint)
+        - Only invent a new lowercase_snake_case ID when the entity is genuinely not in the list.
+
+        PREDICATE rules:
+        - Choose EXACTLY ONE predicate from this controlled vocabulary. Do not invent new predicates:
+          \(predicateList)
+        - If no predicate in the list fits, OMIT the triple.
+
+        CONTENT rules:
+        - Include durable facts and durable user state.
+        - Exclude greetings, acknowledgements, the user's questions, and Rocky's opinions about itself.
+        - If nothing is worth recording, return {"triples": []}.
+
+        Output ONLY the JSON object. No prose, no markdown, no commentary.
+        """
+
+        let messages: [ChatMessage] = [
+            .init(role: .system, content: prompt),
+            .init(role: .user, content: "User: \(userText)\nRocky: \(rockyText)"),
+        ]
+
+        var raw = ""
+        do {
+            let stream = brain.chatStream(messages: messages, tools: nil, image: nil)
+            for try await chunk in stream {
+                if let delta = chunk.contentDelta, !delta.isEmpty {
+                    raw += delta
+                }
+            }
+        } catch {
+            await bus.publish(.sidecarLog(
+                sidecar: "cognition", level: .warn,
+                message: "kg-extract failed: \(error)",
+                fields: [:]
+            ))
+            return
+        }
+
+        let parsed = parseExtractedTriples(raw)
+        var filed = 0
+        var droppedOffVocab = 0
+        for t in parsed {
+            // Off-vocabulary predicate: drop. The prompt already
+            // asks for vocab compliance; this is the enforcement.
+            guard predicateVocabularySet.contains(t.predicate) else {
+                droppedOffVocab += 1
+                continue
+            }
+            let subject = normalizeSelf(t.subject)
+            let object = normalizeSelf(t.object)
+            _ = try? await memory.kgAdd(
+                subject: subject,
+                predicate: t.predicate,
+                object: object,
+                validFrom: nil, validTo: nil,
+                sourceDrawerID: userDrawerID
+            )
+            filed += 1
+        }
+
+        if filed > 0 || droppedOffVocab > 0 {
+            var msg = "kg-extract: filed \(filed) triple(s)"
+            if droppedOffVocab > 0 {
+                msg += ", dropped \(droppedOffVocab) off-vocab"
+            }
+            await bus.publish(.sidecarLog(
+                sidecar: "cognition", level: .info,
+                message: msg, fields: [:]
+            ))
+        }
+    }
+
+    /// Fetch the top-N most-connected entities from the current
+    /// graph (degree = subject + object appearances). Used to seed
+    /// the extraction prompt so the brain reuses existing IDs
+    /// instead of spawning variant spellings.
+    private static func topEntities(
+        memory: MemoryService, limit: Int
+    ) async -> [String] {
+        let timeline = (try? await memory.kgTimeline()) ?? []
+        guard !timeline.isEmpty else { return [] }
+        var degree: [String: Int] = [:]
+        for t in timeline {
+            degree[t.subject, default: 0] += 1
+            degree[t.object, default: 0] += 1
+        }
+        return degree
+            .sorted {
+                if $0.value != $1.value { return $0.value > $1.value }
+                return $0.key < $1.key  // stable tiebreak
+            }
+            .prefix(limit)
+            .map { $0.key }
+    }
+
+    /// Parse the brain's JSON-only response into a list of triples.
+    /// Tolerant of:
+    /// - Leading/trailing whitespace
+    /// - Markdown fences (```json ... ```) — strip before parsing
+    /// - Missing keys (filtered out)
+    static func parseExtractedTriples(
+        _ raw: String
+    ) -> [(subject: String, predicate: String, object: String)] {
+        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Strip ```json or ``` fences if present.
+        if text.hasPrefix("```") {
+            if let firstNewline = text.firstIndex(of: "\n") {
+                text = String(text[text.index(after: firstNewline)...])
+            }
+            if let tail = text.range(of: "```", options: .backwards) {
+                text = String(text[..<tail.lowerBound])
+            }
+            text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        // Find the first `{` — extraction prompts sometimes leak a
+        // word like "Here:" before the JSON despite the instruction.
+        guard let start = text.firstIndex(of: "{") else { return [] }
+        // Find matching last `}`.
+        guard let end = text.lastIndex(of: "}") else { return [] }
+        let candidate = String(text[start...end])
+        guard let data = candidate.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let arr = obj["triples"] as? [[String: Any]]
+        else { return [] }
+        return arr.compactMap { t -> (String, String, String)? in
+            guard
+                let s = (t["subject"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                !s.isEmpty,
+                let p = (t["predicate"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                !p.isEmpty,
+                let o = (t["object"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                !o.isEmpty
+            else { return nil }
+            return (s, p, o)
+        }
     }
 
     /// Auto-dispatch text content to `say` when the model emitted
@@ -716,27 +1185,21 @@ public actor CognitionEngine {
     }
 
     /// Append the user's turn + Rocky's spoken text (extracted from
-    /// the round's `say` tool calls, if any) to the memory palace.
-    /// Fire-and-forget; failures surface on the LogBus, never block
-    /// the user-facing reply path. Used by every turn-exit branch
-    /// in `runStream` so post-turn writes always happen regardless
-    /// of which path the brain took to end the turn.
-    private static func writeTurnToMemory(
-        memory: MemoryService?,
-        userText: String,
-        calls: [ToolCall]
-    ) {
-        guard let memory else { return }
-        memory.recordDetached(role: .user, text: userText)
-        for call in calls where call.function.name == "say" {
-            guard let data = call.function.arguments.data(using: .utf8),
-                  let parsed = try? JSONSerialization.jsonObject(with: data)
-                    as? [String: Any],
-                  let said = parsed["text"] as? String,
-                  !said.trimmingCharacters(in: .whitespaces).isEmpty
-            else { continue }
-            memory.recordDetached(role: .assistant, text: said)
-        }
+    /// Synthesise a `say` ToolCall carrying `text`. Lets the
+    /// no-LLM-tool-calls branch of the runner reuse `commitTurn`'s
+    /// recording + KG-extraction pipeline without a parallel
+    /// implementation. The id is arbitrary; ToolRegistry never sees
+    /// these synthetics — only `commitTurn` inspects them.
+    private static func syntheticSayCall(text: String) -> ToolCall {
+        let payload: [String: Any] = ["text": text]
+        let json = (try? JSONSerialization.data(withJSONObject: payload))
+            .flatMap { String(data: $0, encoding: .utf8) }
+            ?? #"{"text":""}"#
+        return ToolCall(
+            id: "synthetic-say-\(UUID().uuidString)",
+            type: "function",
+            function: ToolCall.Function(name: "say", arguments: json)
+        )
     }
 
     // MARK: - Memory injection
@@ -1513,6 +1976,180 @@ public actor CognitionEngine {
             end -= 40
         }
         return String(chars[0..<end]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Heuristic: does the user's question actually need the
+    /// camera frame to answer?
+    ///
+    /// Why this matters: attaching the frame adds 500–700 vision
+    /// tokens to brain prefill (~2.5–3.5 s per round) AND
+    /// invalidates the persistent prompt cache (vision tokens hash
+    /// per image). For pure-fact queries like "who's Tim Cook?" the
+    /// camera contributes nothing to the answer — sending it is
+    /// pure overhead.
+    ///
+    /// Rule: attach the frame when the query contains an explicit
+    /// visual cue (deictic "this/that/these", visual verbs like
+    /// "see/look/show/describe/read", identity-of-thing-in-view
+    /// phrases). Otherwise skip. Round-2 of a tool-using turn
+    /// inherits round-1's decision.
+    ///
+    /// Tuned conservatively — false negatives (vision-relevant
+    /// queries that don't match) just degrade to text-only
+    /// answers; false positives (text-only queries that match)
+    /// attach the frame and pay the prefill tax. The catalogue
+    /// errs toward false negatives so the common factual-lookup
+    /// path stays fast.
+    public static func queryNeedsVision(_ text: String) -> Bool {
+        let lc = text.lowercased()
+        // Strong phrasal triggers — high precision.
+        let phrases: [String] = [
+            "what's this", "what is this",
+            "what's that", "what is that",
+            "what are these", "what are those",
+            "look at", "look here", "look there",
+            "see this", "see that", "what do you see",
+            "what can you see", "can you see",
+            "show me", "show this", "show that",
+            "describe what", "describe this", "describe that",
+            "what's in front", "what is in front",
+            "what color", "what colour",
+            "how do i look", "how does it look", "how does this look",
+            "what am i holding", "what am i wearing",
+            "what's on the", "what is on the",
+            "read this", "read that", "read the",
+            "where am i",
+            "who's this", "who is this", "who's that",
+            "what room", "what's behind",
+        ]
+        for p in phrases where lc.contains(p) {
+            return true
+        }
+        // Single-word triggers — only when the message is short
+        // AND those words appear (catches "look", "see", etc. as
+        // imperatives). For longer messages, the phrasal triggers
+        // above carry the day.
+        if lc.split(whereSeparator: { !$0.isLetter }).count <= 5 {
+            let imperatives: Set<String> = ["look", "see", "watch", "show", "describe"]
+            let words = lc.split { !$0.isLetter }.map(String.init)
+            if words.contains(where: { imperatives.contains($0) }) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Does this query plausibly need any tool to answer?
+    ///
+    /// Default: TRUE. Returning false strips tool schemas from the
+    /// brain prefill — a ~1000-token / ~5-second saving per round.
+    /// We only return false when the query is clearly a knowledge
+    /// lookup AND mentions none of the tool-trigger keywords.
+    ///
+    /// The risk of a false-false (knowledge query that *should*
+    /// have used a tool) is the brain hallucinates a date / weather
+    /// answer it doesn't actually know. To minimise that, the
+    /// "no tools" branch only fires when:
+    ///   1. The query matches a knowledge prefix (who is, what is,
+    ///      explain, tell me about, etc.)
+    ///   2. AND there's no tool-trigger keyword in the body
+    ///      (weather, time, today, now, remember, search, look,
+    ///      etc.)
+    public static func queryNeedsTools(_ text: String) -> Bool {
+        let lc = text.lowercased()
+
+        // Tool-trigger keywords. ANY of these → keep tools so the
+        // brain can call them.
+        let toolWords: [String] = [
+            "weather", "rain", "snow", "temperature", "forecast",
+            "time", "date", "today", "tomorrow", "yesterday", "now",
+            "schedule", "calendar", "meeting", "appointment",
+            "search", "look up", "google", "find online",
+            "remember", "note", "memori", "forget",
+            "look at", "look here", "see this", "what's this",
+            "describe", "show me",
+            "play", "dance", "express", "emotion",
+            "wake", "sleep", "home",
+        ]
+        for w in toolWords where lc.contains(w) {
+            return true
+        }
+
+        // Knowledge-prefix patterns. If the query opens with one of
+        // these AND no tool-trigger fired above, treat as
+        // tools-not-needed.
+        let knowledgePrefixes: [String] = [
+            "who's ", "who is ", "who was ", "who were ", "who are ",
+            "what is ", "what was ", "what are ", "what were ",
+            "what does ", "what did ",
+            "when was ", "when is ", "when did ",
+            "where is ", "where was ",
+            "why is ", "why was ", "why did ",
+            "how does ", "how is ", "how was ", "how did ",
+            "tell me about ", "explain ",
+            "do you know ", "have you heard ",
+        ]
+        // Strip a leading "rocky," / "rocky " wake-name prefix so
+        // "rocky, who's X?" matches "who's ".
+        var stripped = lc
+        for wake in ["rocky, ", "rocky ", "rocky:"] {
+            if stripped.hasPrefix(wake) {
+                stripped = String(stripped.dropFirst(wake.count))
+                break
+            }
+        }
+        for p in knowledgePrefixes where stripped.hasPrefix(p) {
+            return false
+        }
+
+        // Default: keep tools.
+        return true
+    }
+
+    /// Detect "I lack the answer, let me search" signals in the
+    /// brain's natural-language response. When the no-tools fast
+    /// path produces one of these, the runtime retries the round
+    /// with tools so the brain can actually escalate (typically
+    /// to `search_web` or `recall_memory`).
+    ///
+    /// Tuned against Gemma 4 + Qwen3-VL outputs:
+    ///   "Rocky not know."  → escalate
+    ///   "Rocky see data. Need check web for latest news."  → escalate
+    ///   "Let me search."  → escalate
+    ///   "Wait moment."  (followed by no further action) → escalate
+    ///
+    /// Stays conservative — confident answers ("Tim Cook. Apple CEO…")
+    /// must NOT match, otherwise we'd needlessly retry every turn.
+    public static func queryWantsToolEscalation(_ text: String) -> Bool {
+        let lc = text.lowercased()
+        let signals: [String] = [
+            "rocky not know",
+            "i not know",
+            "do not know",
+            "don't know",
+            "need check web",
+            "need search",
+            "let me search",
+            "let me check",
+            "let me look",
+            "look this up",
+            "search for",
+            "check the web",
+            "wait moment",
+            "wait a moment",
+            "one moment",
+            "one second",
+            "hold on",
+            "not have",
+            "no current",
+            "no real-time",
+            "no internet",
+            "not sure",
+        ]
+        for s in signals where lc.contains(s) {
+            return true
+        }
+        return false
     }
 
     public static func cleanupForTTS(_ text: String) -> String {

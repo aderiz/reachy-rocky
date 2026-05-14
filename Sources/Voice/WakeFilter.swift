@@ -121,9 +121,27 @@ public actor WakeFilter {
     /// decision's `engaged` flag; `AppServices.handleVoice` calls
     /// this from there. Idempotent and safe to call when the
     /// window is currently sleeping (no-op).
-    public func extendOnEngaged() {
-        guard state.isOpen else { return }
+    @discardableResult
+    public func extendOnEngaged() -> Date? {
+        guard state.isOpen else { return nil }
         extendWindow()
+        if case .open(let until) = state { return until }
+        return nil
+    }
+
+    /// Open (or re-open) the conversation window because Rocky just
+    /// finished speaking. The user almost always responds within a
+    /// few seconds of Rocky's reply, so this gives them a fresh
+    /// `conversationWindowS` from NOW even if the original window
+    /// expired while Rocky was responding (a 30 s answer inside a
+    /// 20 s window would otherwise force the user to say "Rocky"
+    /// again). Differs from `extendOnEngaged` in that it always
+    /// reopens, never no-ops.
+    @discardableResult
+    public func keepAliveAfterSpeaking() -> Date {
+        let deadline = now().addingTimeInterval(config.conversationWindowS)
+        state = .open(until: deadline)
+        return deadline
     }
 
     private func extendWindow() {

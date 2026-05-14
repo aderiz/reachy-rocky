@@ -557,15 +557,15 @@ private struct VoiceSettingsTab: View {
 
             Section {
                 Picker("STT engine", selection: sttEngineBinding) {
-                    Text("Auto — MLX-Whisper → WhisperKit → Apple Speech").tag("auto")
-                    Text("MLX-Whisper (whisper-large-v3-mlx, via sidecar)").tag("mlx-whisper")
+                    Text("Auto — Race Apple Speech + MLX-Whisper").tag("auto")
+                    Text("MLX-Whisper (whisper-small-mlx, via sidecar)").tag("mlx-whisper")
                     Text("WhisperKit (whisper-large-v3-turbo, CoreML)").tag("whisperkit")
                     Text("Apple Speech (SFSpeechRecognizer)").tag("apple")
                 }
             } header: {
                 Text("Speech-to-text")
             } footer: {
-                Text("MLX-Whisper runs whisper-large-v3-mlx via the mlx-stt sidecar — same MLX runtime as the brain and TTS. Run `./Sidecars/mlx-stt/setup.sh` to install (~3 GB on first transcribe). WhisperKit uses CoreML weights at ~700 MB. Apple Speech is the system fallback. Auto tries them in order; the first one that loads wins. Engine change applies on next launch.")
+                Text("Auto races Apple Speech (typically ~100 ms on clean speech, on-device on macOS 13+) against MLX-Whisper (~250–500 ms, more accurate on noisy / distant speech); the first non-empty transcript wins. MLX-Whisper alone runs whisper-small-mlx via the mlx-stt sidecar (~470 MB on first transcribe; set ROCKY_STT_MODEL for a bigger model). WhisperKit uses CoreML weights at ~700 MB. Apple Speech is the system fallback. Engine change applies on next launch.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }

@@ -435,11 +435,21 @@ class Brain:
                 )
 
         def _run(prompt: str, image_list: list[str] | None) -> None:
+            # Warmup uses LOCAL caches per pass — never share state
+            # with `self.vision_cache` / `self.prompt_cache_state`
+            # because the warmup prefix (filler system, fake tools,
+            # synthetic 384×384 image) doesn't match real user
+            # prompts. Polluting `self.*` with warmup state used to
+            # produce `broadcast_shapes` crashes on the first real
+            # query. Local caches here mean warmup is purely a
+            # kernel-JIT pass; user-facing caches stay clean.
+            local_vc = VisionFeatureCache()
+            local_pc = PromptCacheState()
             for _ in stream_generate(
                 self.model, self.processor, prompt,
                 image=image_list, max_tokens=1, temperature=0.0,
-                vision_cache=self.vision_cache,
-                prompt_cache_state=self.prompt_cache_state,
+                vision_cache=local_vc,
+                prompt_cache_state=local_pc,
             ):
                 break
 
@@ -472,15 +482,13 @@ class Brain:
             )
             text_ms = int((time.monotonic() - started) * 1000)
 
-            self.vision_cache = VisionFeatureCache()
-            self.prompt_cache_state = PromptCacheState()
-
             # Pass 2: long-prompt + 384×384 image. Warms the vision
             # encoder + cross-attention kernels at realistic shapes.
             # Wrapped in try so a text-only model (no vision tower)
             # falls through cleanly instead of failing the whole
             # warmup — the caller decides whether to send images
-            # later anyway.
+            # later anyway. No cache-reset here: `_run` uses local
+            # caches, so this pass can't pollute self.* state.
             t_vision_start = time.monotonic()
             try:
                 _run(
@@ -490,8 +498,6 @@ class Brain:
                     [image_uri],
                 )
                 vision_ms = int((time.monotonic() - t_vision_start) * 1000)
-                self.vision_cache = VisionFeatureCache()
-                self.prompt_cache_state = PromptCacheState()
             except Exception as exc:  # noqa: BLE001
                 trace(f"image warmup pass skipped: {exc!s}")
                 vision_ms = 0
@@ -761,14 +767,32 @@ class Brain:
             `broadcast_shapes` errors on Qwen3-VL: the warmup
             prefix (filler system + fake tools) doesn't match the
             user's real prefix (persona + real tools), and
-            mlx-vlm's prefix-reuse path tried to broadcast cached
-            K/V tensors of one shape against new K/V tensors of
-            another shape. Fresh state per call sacrifices a small
-            prefix-reuse perf win for correctness.
+            mlx-vlm's prefix-reuse path (PromptCacheState +
+            find_prefix_length) is **token-based**, not shape-aware.
+            For dynamic-resolution VLMs like Qwen-VL, every camera
+            frame produces a different image hash → different vision
+            token IDs → the cache's K/V shape is bound to the
+            previous image's vision-token count, not the current
+            one. Reusing across image-bearing calls trips
+            `broadcast_shapes` when the new image's vision-token
+            count differs.
+
+            Rule: persistent cache reuse ONLY when there's no image
+            in this call. Text-only calls (vision off, or recall +
+            say chains that don't re-attach the frame) benefit from
+            the full system-prompt + persona + tool-schema prefix
+            reuse — typically a 200-400 token cached prefix, saving
+            ~1-3 s of prefill. Image-bearing calls get fresh caches
+            for safety. The warmup itself uses local caches in
+            `_run` so it can never pollute self.* either way.
             """
             nonlocal chunks_seen
             from mlx_vlm.vision_cache import VisionFeatureCache as _VC
             from mlx_vlm.generate import PromptCacheState as _PC
+            # Image-bearing calls → fresh caches (safe).
+            # Text-only calls → persistent self.* caches (fast).
+            use_vc = self.vision_cache if not use_image else _VC()
+            use_pc = self.prompt_cache_state if not use_image else _PC()
             try:
                 for chunk in stream_generate(
                     self.model,
@@ -777,8 +801,8 @@ class Brain:
                     image=image_list if use_image else None,
                     max_tokens=max_tokens,
                     temperature=temperature,
-                    vision_cache=_VC(),
-                    prompt_cache_state=_PC(),
+                    vision_cache=use_vc,
+                    prompt_cache_state=use_pc,
                 ):
                     chunks_seen += 1
                     if chunks_seen == 1:

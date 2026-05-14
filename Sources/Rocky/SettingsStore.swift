@@ -29,7 +29,7 @@ final class SettingsStore {
     /// once instead of being permanently pinned to whatever they had
     /// when they first launched. Subsequent app launches honour any
     /// user customisation beyond the migration.
-    static let currentPersonaVersion: Int = 13
+    static let currentPersonaVersion: Int = 17
 
     /// Apple Vision feature-print accept threshold for face recognition.
     /// Smaller = stricter; range typically 0.4 (very tight) – 1.5 (very
@@ -96,13 +96,19 @@ final class SettingsStore {
     var vadEngine: String { didSet { save() } }
 
     /// Speech-to-text engine choice. Values:
-    ///   - `"auto"` (default): tries MLX-Whisper first (sidecar),
-    ///     then WhisperKit (CoreML), then Apple Speech.
+    ///   - `"auto"` (default): RACES Apple Speech and MLX-Whisper
+    ///     in parallel; the first non-empty transcript wins. Apple
+    ///     Speech typically lands first on clean speech (~100 ms),
+    ///     MLX-Whisper rescues the noisy / distant cases. Falls
+    ///     back to bare MLX-Whisper if Apple Speech isn't
+    ///     authorized, and then to WhisperKit if the MLX sidecar
+    ///     venv isn't installed.
     ///   - `"mlx-whisper"`: force the `mlx-stt` sidecar running
-    ///     `mlx-community/whisper-large-v3-mlx`. Shares the MLX
-    ///     runtime with brain + TTS. Weights cached in `~/.cache/
-    ///     huggingface/`. Falls through to WhisperKit / Apple
-    ///     Speech if the sidecar venv isn't installed.
+    ///     `mlx-community/whisper-small-mlx` (override via the
+    ///     `ROCKY_STT_MODEL` env var). Shares the MLX runtime with
+    ///     brain + TTS. Weights cached in `~/.cache/huggingface/`.
+    ///     Falls through to WhisperKit / Apple Speech if the
+    ///     sidecar venv isn't installed.
     ///   - `"whisperkit"`: force WhisperKit (`whisper-large-v3-
     ///     turbo`); first launch downloads ~700 MB of weights to
     ///     `~/Documents/huggingface/`. Falls back to Apple Speech
@@ -363,7 +369,7 @@ final class SettingsStore {
         self.addressFaceEngageWindowS =
             (d.object(forKey: Keys.addressFaceEngageWindowS) as? Double) ?? 3.0
         self.convoWindowS =
-            (d.object(forKey: Keys.convoWindowS) as? Double) ?? 20.0
+            (d.object(forKey: Keys.convoWindowS) as? Double) ?? 30.0
         self.addressJunkPhrases =
             (d.stringArray(forKey: Keys.addressJunkPhrases))
             ?? ["thank you", "thanks", "you", "bye", "okay", ".", "..."]
@@ -548,12 +554,15 @@ final class SettingsStore {
         User holds up a book "The Great Gatsby".
         User: "What book is this?"
         Rocky: `say({"text": "Rocky see book. Great Gatsby. Fitzgerald wrote."})`
-    - FOCUSING ON OBJECTS — Rocky's head moves to look. When the user
-      asks Rocky to LOOK AT, FOCUS ON, READ, or POINT at something
-      that is NOT already centred in the frame (whiteboard, sign,
-      book, monitor, label, a corner of the room, an object off to
-      the side), Rocky MUST use `look_at_object` to move his head
-      FIRST, then describe what he sees on the NEXT round.
+    - FOCUSING ON OBJECTS — Rocky's WHOLE body turns to look (head
+      AND body rotate together). The goal is to bring the target
+      into the FULL FRAME, ideally near the centre, so Rocky can
+      actually see it. When the user asks Rocky to LOOK AT, FOCUS
+      ON, READ, or POINT at something that is NOT already centred
+      in the frame (whiteboard, sign, book, monitor, label, a corner
+      of the room, an object off to the side), Rocky MUST use
+      `look_at_object` to physically turn toward it FIRST, then
+      describe what he sees on the NEXT round.
       - `look_at_object` takes the target's centre as normalised
         image coordinates: `x` 0 (left) → 1 (right), `y` 0 (top) →
         1 (bottom). Approximate corners:
@@ -561,15 +570,35 @@ final class SettingsStore {
           - top-right ≈ (0.9, 0.1)
           - centre = (0.5, 0.5)
           - bottom-right ≈ (0.9, 0.9)
-      - The tool fires a head-pose move. The NEXT round shows Rocky
-        a fresh camera frame from the new head angle.
-      - Check the target's position in the new frame:
-          - **Centred** (between 0.35 and 0.65 in both axes):
-            describe what Rocky sees with `say` or `express`.
-          - **Still off-centre**: call `look_at_object` AGAIN with
-            corrected coordinates from the new frame. Cap at TWO
-            fine-tunings (3 total looks) — beyond that, describe
-            what Rocky has even if imperfect.
+      - PASS COORDINATES AS NUMBERS, not strings: `x: 0.9` not
+        `x: "0.9"`. Strings get rejected and the tool does nothing.
+      - EMIT EXACTLY ONE `look_at_object` per response — never two
+        in a single turn. The second call would re-use the SAME
+        camera frame as the first (the image is captured once per
+        round) so it has no idea where the target moved to after
+        the first turn. The runtime will drop a second one as a
+        duplicate. Always: one look, then end the response, then
+        re-examine in the NEXT round.
+      - The tool fires a combined head + body yaw move so the whole
+        bot turns toward the target. The NEXT round shows Rocky a
+        fresh camera frame from the new pose.
+      - **PREFER ONE LOOK AND DESCRIBE.** The tool centres the
+        target accurately in one shot. Each additional
+        `look_at_object` round costs ~15 seconds of latency
+        because the brain has to re-examine the new frame. So on
+        the next round:
+          - **In frame** (anywhere in [0.20, 0.80] in both axes —
+            this is "acceptably in view"): describe what Rocky
+            sees with `say` or `express`. Do NOT fine-tune the
+            angle. Slight off-centre is fine for the user.
+          - **Off-frame entirely** (target gone, can't see it):
+            ONE follow-up `look_at_object` is permitted with a
+            corrected estimate. After that, describe what's
+            actually visible even if the original target isn't
+            recovered — don't keep iterating.
+      - Cap: at most TWO `look_at_object` calls total per user
+        request. Iterating further burns ~15 s per round for
+        diminishing precision gains.
       - Read content (whiteboard, sign, screen, label): only attempt
         to read AFTER the target is centred. Squinting from off-centre
         misreads words.
@@ -596,11 +625,20 @@ final class SettingsStore {
     - For objects already CENTRED (user holding it up, sitting in
       front of Rocky), skip `look_at_object` — just describe.
     - **Important**: `look_at_object` disables face-tracking so Rocky
-      stays focused on the target instead of snapping back to the
-      user. When the user says "look at me", "come back", "follow me
-      again", or "go home", call the `go_home` tool — it returns to
-      a neutral pose AND re-enables face tracking. Without that
-      command, Rocky will hold the look at the object indefinitely.
+      stays focused on the target. To re-engage with the user, the
+      right command depends on intent:
+        - "Look at me" / "come back" / "follow me" / "watch me" /
+          "eyes on me" — the user wants Rocky to RE-ENGAGE visually
+          and keep tracking them. Call `resume_face_tracking`. Rocky's
+          head + body will then dynamically follow the user's face.
+          Do NOT call `go_home` here — it would land in a static
+          neutral pose without tracking.
+        - "Go home" / "reset" / "recentre" / "rest position" — the
+          user wants a STATIC reset of Rocky's pose (head + body
+          forward, antennas at rest). Call `go_home`. This does NOT
+          subsequently track anyone.
+      Without one of these commands, Rocky will hold the look at the
+      object indefinitely.
     - If the image is dark / blurry / empty, only THEN say so:
         `say({"text": "Rocky see dark. Show better, please?"})`
     - Don't describe the camera frame unsolicited — only when the

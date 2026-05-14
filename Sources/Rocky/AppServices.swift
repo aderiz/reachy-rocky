@@ -720,7 +720,12 @@ final class AppServices {
                 workingDir: sttDir.path(percentEncoded: false),
                 env: [
                     "PYTHONPATH": sttDir.path(percentEncoded: false),
-                    "ROCKY_STT_MODEL": "mlx-community/whisper-large-v3-mlx",
+                    // Sidecar default falls back to whisper-small-mlx
+                    // if this is unset; leave unset here so the
+                    // sidecar's own default (kept in one place,
+                    // runner.py) is the source of truth. Users who
+                    // want a bigger model set ROCKY_STT_MODEL in
+                    // their shell env before launching the app.
                     "ROCKY_STT_LANGUAGE": "en",
                 ],
                 readyTimeoutS: 300,
@@ -846,6 +851,31 @@ final class AppServices {
                     fields: [:]
                 ))
             }
+            // One-shot v2 migration: bin any drawers stored under the
+            // pre-v2 wings (`default/default`, `rocky/conversation`).
+            // The user explicitly asked for "bin them" — we don't try
+            // to remap legacy entries into the new office/dated-room
+            // layout, just delete and let the new flow build fresh.
+            // Persistent flag in UserDefaults so the wipe runs exactly
+            // once across all future launches.
+            let migrationKey = "rocky.memory.v2-migration"
+            if !UserDefaults.standard.bool(forKey: migrationKey) {
+                do {
+                    let deleted = try await memory.wipeLegacy()
+                    UserDefaults.standard.set(true, forKey: migrationKey)
+                    await logBus.publish(.sidecarLog(
+                        sidecar: "mempalace", level: .info,
+                        message: "v2 migration: wiped \(deleted) legacy drawer(s)",
+                        fields: [:]
+                    ))
+                } catch {
+                    await logBus.publish(.sidecarLog(
+                        sidecar: "mempalace", level: .warn,
+                        message: "v2 migration failed: \(error)",
+                        fields: [:]
+                    ))
+                }
+            }
         } catch {
             await logBus.publish(.error(scope: "app/memory",
                                         message: "\(error) — run Sidecars/mempalace/setup.sh",
@@ -879,28 +909,43 @@ final class AppServices {
         let warmBus = logBus
         let warmPersona = settings.persona
         let warmTools = await toolRegistry.schemas
-        let warmImage: BrainImage? = await MainActor.run {
-            guard self.visionEnabled, let frame = self.lastCameraFrame
-            else { return nil }
-            return BrainImage(jpegData: frame.jpeg)
-        }
         Task.detached(priority: .userInitiated) {
             let started = Date()
-            // Mirror the shape `CognitionEngine.runStream` builds:
-            // system persona, then a short user message. We don't
-            // hand-roll the recall envelope or tool-result messages —
-            // those only appear on subsequent rounds, and the
-            // dominant cost is prefill of the system + tools tokens
-            // plus encoding the image, both of which are present
-            // here.
+            // Critically: NO image attached. The brain's chat_stream
+            // uses fresh per-call caches whenever an image is present
+            // (vision tokens hash per-frame, so cache reuse risks a
+            // shape mismatch). With no image, it uses the persistent
+            // `self.prompt_cache_state` and POPULATES it with the
+            // persona + tool-schema prefix as a side-effect of this
+            // warmup call. The user's first real text-only query
+            // then finds the matching prefix in the cache and skips
+            // the ~8 s of persona + tools prefill that would
+            // otherwise dominate turn 1.
+            //
+            // Image-bearing first queries don't benefit from this
+            // (they take the fresh-cache path) — they pay full
+            // prefill on turn 1. That's an inherent trade-off of
+            // dynamic-resolution VLM cache invalidation; we
+            // optimise for the common case (knowledge queries,
+            // tool-using queries without vision) where cache reuse
+            // pays for itself many times over.
+            //
+            // Mirror the message shape `CognitionEngine.runStream`
+            // produces: system persona, then a single user message.
+            // The user message text doesn't matter — only its
+            // presence does, since the cache is keyed on tokens.
+            // We pick something very short ("hi") so the token
+            // sequence after the persona+tools prefix is minimal,
+            // and the cache holds the persona+tools portion that's
+            // actually reusable.
             let messages: [ChatMessage] = [
                 .init(role: .system, content: warmPersona),
-                .init(role: .user, content: "Rocky, status check."),
+                .init(role: .user, content: "hi"),
             ]
             let stream = warmBrain.chatStream(
                 messages: messages,
                 tools: warmTools.isEmpty ? nil : warmTools,
-                image: warmImage
+                image: nil
             )
             do {
                 for try await _ in stream {
@@ -912,10 +957,8 @@ final class AppServices {
                 await warmBus.publish(.sidecarLog(
                     sidecar: "brain", level: .info,
                     message: String(
-                        format: "shape-matched warm in %.0f ms (image=%@ tools=%d)",
-                        ms,
-                        warmImage == nil ? "no" : "yes",
-                        warmTools.count
+                        format: "prompt-cache primed in %.0f ms (persona + %d tools)",
+                        ms, warmTools.count
                     ),
                     fields: [
                         "phase": "warm_done_swift",
@@ -1146,6 +1189,7 @@ final class AppServices {
         // AddressFilter's own 1.5 s grace = 3 s of post-Rocky echo
         // suppression, matching the v0.1 explicit-stamp behaviour.
         let speakingStream = streamingTTS.isSpeakingStream
+        let wakeFilterForSpeaking = wakeFilter
         Task { [weak self] in
             for await speaking in speakingStream {
                 await MainActor.run {
@@ -1154,6 +1198,25 @@ final class AppServices {
                     } else {
                         self?.ttsBusyUntil = Date().addingTimeInterval(1.5)
                     }
+                }
+                // When Rocky finishes speaking, RESET the conversation
+                // window so the user gets the full `convoWindowS` from
+                // *now* to reply — not whatever's left from when they
+                // first said "Rocky". Without this, a 30 s response
+                // from Rocky inside a 20 s window means the user has
+                // to say the wake name again to follow up.
+                //
+                // Uses `keepAliveAfterSpeaking` (not `extendOnEngaged`)
+                // so the reset works even when the original window
+                // already expired during Rocky's long response.
+                if !speaking, let self {
+                    let until = await wakeFilterForSpeaking.keepAliveAfterSpeaking()
+                    await MainActor.run {
+                        self.conversationOpenUntil = until
+                    }
+                    await self.logBus.publish(.conversationWindow(
+                        transition: .opened, reason: "rocky finished speaking"
+                    ))
                 }
             }
         }
@@ -1522,16 +1585,17 @@ final class AppServices {
             }
         }
 
-        // STT engine selection ladder. `auto` tries MLX-Whisper first
-        // (single MLX runtime alongside brain + TTS), then WhisperKit
-        // (CoreML, ANE-accelerated, self-contained but separate weight
-        // cache under ~/Documents/huggingface/), and finally leaves
-        // Apple Speech in place. Explicit engine choices skip the
-        // ladder and try only the requested engine.
+        // STT engine selection ladder. `auto` races Apple Speech +
+        // MLX-Whisper so the first non-empty transcript wins (Apple
+        // typically lands in ~100 ms on clean speech, MLX rescues the
+        // noisy / distant cases that Apple misses). Falls through to
+        // WhisperKit, then leaves Apple Speech in place. Explicit
+        // engine choices skip the ladder and try only the requested
+        // engine.
         let pref = await MainActor.run { self.settings.sttEngine }
         guard pref != "apple" else { return }
 
-        // ---- MLX-Whisper (mlx-stt sidecar) ----
+        // ---- MLX-Whisper (mlx-stt sidecar), optionally raced with Apple ----
         let tryMLX = (pref == "auto" || pref == "mlx-whisper")
         if tryMLX, let mlxSTTSidecar {
             do {
@@ -1549,16 +1613,34 @@ final class AppServices {
                         fields: [:]
                     ))
                 }
-                await voice.setSTT(mlx)
+                // Auto mode + Apple Speech authorized → race them so
+                // the user gets Apple's ~100 ms latency on clean
+                // speech, with MLX as a fallback for noisy segments.
+                // Explicit "mlx-whisper" gets bare MLX.
+                let appleReady = await self.appleSTT.status == .ready
+                let engine: any STTEngine
+                let label: String
+                if pref == "auto", appleReady {
+                    engine = RacingSTT(
+                        fast: self.appleSTT,
+                        accurate: mlx,
+                        logBus: self.logBus
+                    )
+                    label = "Race (Apple Speech + MLX-Whisper)"
+                } else {
+                    engine = mlx
+                    label = "MLX-Whisper (small-mlx)"
+                }
+                await voice.setSTT(engine)
                 await MainActor.run {
-                    self.sttBackendName = "MLX-Whisper (large-v3-mlx)"
+                    self.sttBackendName = label
                 }
                 await logBus.publish(.sidecarLog(
                     sidecar: "voice", level: .info,
-                    message: "STT engine: MLX-Whisper (mlx-community/whisper-large-v3-mlx)",
+                    message: "STT engine: \(label)",
                     fields: [:]
                 ))
-                fputs("[stt] engine = MLX-Whisper (mlx-stt sidecar)\n", stderr)
+                fputs("[stt] engine = \(label)\n", stderr)
                 return
             } catch {
                 fputs("[stt] MLX-Whisper start failed: \(error) — falling through\n", stderr)
@@ -1960,33 +2042,49 @@ final class AppServices {
                             assistantTurnId = newId
                         case .assistantFinal(let finalText, let totalMs, let firstMs):
                             // The engine's final text is authoritative
-                            // — it's already been through tool-call
-                            // recovery, thought-marker stripping, and
-                            // TTS cleanup. If it differs from the
-                            // raw delta buffer (e.g. the model emitted
-                            // `express({...})` as content and we
-                            // stripped it), REPLACE the bubble's
-                            // content with the clean version rather
-                            // than preserving the raw deltas. The
-                            // buffer is also reset so subsequent rounds
-                            // don't re-append the cleaned text on top
-                            // of a stale delta tail.
+                            // — already through tool-call recovery,
+                            // thought-marker stripping, and TTS
+                            // cleanup. If it differs from the raw
+                            // delta buffer, REPLACE the bubble's
+                            // content with the clean version.
+                            //
+                            // Empty `finalText` is a deliberate signal
+                            // that the engine wants the bubble REMOVED
+                            // (e.g. duplicate-bubble suppression: a
+                            // round with a `say` tool call will
+                            // produce its canonical bubble on tool
+                            // success, so the streamed brain content
+                            // bubble must go away). Drop the entry
+                            // entirely rather than leaving an empty
+                            // container in the chat.
                             let id = assistantTurnId
                             let displayText = finalText
                             assistantBuffer = displayText
                             await MainActor.run { [weak self] in
                                 guard let self else { return }
+                                if displayText.isEmpty {
+                                    if let id,
+                                       let idx = self.brainTurns.firstIndex(where: { $0.id == id })
+                                    {
+                                        self.brainTurns.remove(at: idx)
+                                    }
+                                    return
+                                }
                                 if let id, let idx = self.brainTurns.firstIndex(where: { $0.id == id }) {
                                     self.brainTurns[idx].content = displayText
                                     self.brainTurns[idx].totalMs = totalMs
                                     self.brainTurns[idx].firstChunkMs = firstMs
-                                } else if !displayText.isEmpty {
+                                } else {
                                     var t = BrainTurn(role: "assistant", content: displayText)
                                     t.totalMs = totalMs
                                     t.firstChunkMs = firstMs
                                     self.brainTurns.append(t)
                                 }
                             }
+                            // Reset the turn id so the next round starts
+                            // a fresh bubble instead of trying to
+                            // update the one we just removed.
+                            if displayText.isEmpty { assistantTurnId = nil }
                             // Mirror brain timings onto LogBus so the
                             // TurnProfiler (and anything else subscribing)
                             // can attribute brain TFT + total without
@@ -2030,6 +2128,7 @@ final class AppServices {
                                 pendingSayText = nil
                                 return t
                             }()
+                            let sayMirrored = (sayText != nil && !(sayText ?? "").isEmpty)
                             await MainActor.run { [weak self] in
                                 guard let self else { return }
                                 self.brainTurns.append(.init(
@@ -2038,10 +2137,46 @@ final class AppServices {
                                     detail: detail
                                 ))
                                 if let sayText, !sayText.isEmpty {
+                                    // Preamble-bubble suppression. The
+                                    // model often emits the same answer
+                                    // text as `content` in an EARLIER
+                                    // round (e.g. round 1 with a data
+                                    // tool like recall_memory) AND as
+                                    // the `say` text in a later round —
+                                    // producing two identical chat
+                                    // bubbles. The same-round
+                                    // speech-detection in
+                                    // CognitionEngine catches the
+                                    // within-round case; this handles
+                                    // the across-round case by walking
+                                    // back to the most recent user
+                                    // message and stripping every
+                                    // assistant-role entry between it
+                                    // and the say. Tool rows survive
+                                    // (the user wants to see what tools
+                                    // ran).
+                                    if let lastUserIdx = self.brainTurns.lastIndex(
+                                        where: { $0.role == "user" }
+                                    ) {
+                                        var i = self.brainTurns.count - 1
+                                        while i > lastUserIdx {
+                                            if self.brainTurns[i].role == "assistant" {
+                                                self.brainTurns.remove(at: i)
+                                            }
+                                            i -= 1
+                                        }
+                                    }
                                     self.brainTurns.append(.init(
                                         role: "assistant", content: sayText
                                     ))
                                 }
+                            }
+                            // Reset the streamed-bubble cursor in the
+                            // outer scope since the bubble it pointed
+                            // at may have just been removed.
+                            if sayMirrored {
+                                assistantTurnId = nil
+                                assistantBuffer = ""
                             }
                         case .error(let msg):
                             await MainActor.run { [weak self] in
@@ -2281,8 +2416,16 @@ final class AppServices {
         //   - return early when the daemon reports no move running
         //   - force-stop on excessive instantaneous joint velocity
         //   - force-stop on cap timeout
+        // All motion-affecting calls in the watchdog route through
+        // MotionGuard. The previous version used `self.robotLink`
+        // directly which bypassed the chokepoint — per the rule:
+        // EVERY motion command MUST go through `motionGuard`. The
+        // only direct-robotLink calls allowed here are READ-ONLY
+        // queries (e.g. `isMoveRunning()`), which MotionGuard
+        // doesn't bother wrapping.
         let logBus = self.logBus
-        let robot = self.robotLink
+        let guardian = self.motionGuard
+        let raw = self.robotLink  // read-only queries only
         let deadline = Date().addingTimeInterval(safetyCap)
         var prevPose: RPYPose? = nil
         var prevTime = Date()
@@ -2297,7 +2440,7 @@ final class AppServices {
                 let dYaw   = abs(cur.yaw   - prev.yaw)
                 let v = max(dRoll, dPitch, dYaw) / dt
                 if v > SafetyLimits.maxJointVelocityRadPerS {
-                    try? await robot.stopMove()
+                    try? await guardian.stopMove()
                     await logBus.publish(.error(
                         scope: "play_emotion.watchdog",
                         message: "aborted \(name): joint velocity \(String(format: "%.2f", v)) rad/s exceeded ceiling \(SafetyLimits.maxJointVelocityRadPerS)",
@@ -2307,11 +2450,11 @@ final class AppServices {
             }
             prevPose = pose
             prevTime = now
-            if let running = try? await robot.isMoveRunning(), !running {
+            if let running = try? await raw.isMoveRunning(), !running {
                 return
             }
         }
-        try? await robot.stopMove()
+        try? await guardian.stopMove()
     }
 
     /// Stop face tracking from pushing target events into the streamer.
@@ -2914,44 +3057,82 @@ final class AppServices {
             }
         )
 
-        // `go_home` — return Rocky to the wake-up pose. EXACTLY mirrors
-        // `RobotLinkClient.wakeUp`'s terminal goto: head identity
-        // (roll/pitch/yaw = 0), 2 s minjerk, no antenna or body-yaw
-        // command (the wake move doesn't touch them, so neither does
-        // this — preserves whatever state antennas/body are in).
-        // Face tracking is paused for the duration so the 50 Hz
-        // streamer can't fight the smooth interpolated goto. The
-        // built-in velocity guard rail in robot.goto will stretch
-        // duration further if any joint delta would exceed the cap.
+        // `go_home` — full reset to neutral. Distinct from `wakeUp`,
+        // which only handles the motor-enable + head-identity goto
+        // and leaves body / antennas wherever they were. `go_home`
+        // commands EVERY joint:
+        //
+        //   head pose  → (roll: 0, pitch: 0, yaw: 0)
+        //   body yaw   → 0
+        //   antennas   → (right: -0.1745, left: +0.1745) rad — the
+        //                Pollen-documented rest offset (10° off
+        //                vertical) so antennas don't shake.
+        //
+        // Everything else (motor enable, streamer reset, face-tracker
+        // pause/resume, motion-guard routing) applies as before. 2 s
+        // minjerk goto, all four joint groups arriving together.
         let faceTrackerForHome = macFaceTracker
         let streamerForHome = targetStreamer
         await toolRegistry.register(
             name: "go_home",
-            description: "Return Rocky to home position — the same pose Rocky lands in when waking up (head looking straight forward: roll, pitch, and yaw all zero). Slow, calm 2-second move. Antennas and body are NOT moved. Use whenever the user says 'go home', 'home position', 'rest position', 'reset', 'centre', 'recentre', 'reset pose', 'look at me', 'come back', or 'follow me again' (also re-enables face tracking).",
-            handler: { _ in
+            description: "Reset Rocky to the home pose — head looking straight forward (roll, pitch, yaw = 0), body yaw recentred to 0, antennas at their rest position. Slow, calm 2-second move. This is a STATIC reset to neutral; it does NOT make Rocky look at anyone or anything afterwards. Use ONLY when the user explicitly asks to reset/recentre/go home: 'go home', 'home position', 'rest position', 'reset', 'centre', 'recentre', 'reset pose', 'neutral pose'. For 'look at me' / 'come back' / 'follow me' use `resume_face_tracking` instead (that's the live-tracking command, not a static reset).",
+            handler: { [weak self] _ in
+                guard let self else {
+                    return .object(["ok": .bool(false),
+                                    "error": .string("services unavailable")])
+                }
                 let home = RPYPose(roll: 0, pitch: 0, yaw: 0)
+                // Antenna rest position — ±10° off vertical. At
+                // exactly 0 rad the antennas mechanically shake
+                // (Pollen's INIT_ANTENNAS_JOINT_POSITIONS comment).
+                let restAntennas = Antennas(
+                    rightRad: -0.1745, leftRad: 0.1745
+                )
                 let homeTarget = MotionTarget(
                     headPose: home,
-                    antennas: nil,
+                    antennas: restAntennas,
                     bodyYaw: 0
                 )
-                // Stop the face tracker pushing new targets, AND
-                // overwrite the streamer's latest with the home pose.
-                // Without the second step, the streamer keeps re-
-                // sending whatever was last commanded (e.g. the
-                // whiteboard pose from a previous `look_at_object`),
-                // and the head twitches back to that pose the
-                // moment the goto finishes.
+                // Pause face tracker + overwrite streamer.latest BEFORE
+                // the goto. Without the second step, the streamer would
+                // immediately re-send the previous target (e.g. a
+                // look_at_object pose) after the goto completed, and
+                // the head would twitch back.
                 await faceTrackerForHome.setEnabled(false)
                 await streamerForHome.update(homeTarget, source: .tool)
                 defer { Task { await faceTrackerForHome.setEnabled(true) } }
+                // Defensive: if motors are disabled / compliant
+                // (after a goToSleep, or after a hardware fault),
+                // commanding goto has no physical effect and the
+                // head sags forward under gravity. Read the current
+                // mode through the state mirror and enable motors
+                // first if needed. Always through motionGuard.
+                let currentMode = await MainActor.run { () -> MotorMode? in
+                    return self.lastRobotState?.controlMode
+                }
+                if let mode = currentMode, mode != .enabled {
+                    try? await robot.setMotorMode(.enabled)
+                    // Tiny settle so the motor-enable physical
+                    // transition lands before we issue the goto.
+                    try? await Task.sleep(nanoseconds: 200_000_000)
+                }
                 try await robot.goto(
                     headPose: home,
+                    antennas: restAntennas,
                     bodyYaw: 0,
                     durationS: 2.0,
                     interpolation: .minjerk
                 )
-                return .object(["ok": .bool(true)])
+                return .object([
+                    "ok": .bool(true),
+                    "head_pose": .object([
+                        "roll": .number(0), "pitch": .number(0), "yaw": .number(0),
+                    ]),
+                    "body_yaw": .number(0),
+                    "antennas": .object([
+                        "right": .number(-0.1745), "left": .number(0.1745),
+                    ]),
+                ])
             }
         )
 
@@ -3205,12 +3386,55 @@ final class AppServices {
                 return .object(["ok": .bool(true)])
             }
         )
+        // Capture refs the resume handler needs.
+        let resumeMotionGuard = motionGuard
+        let resumeStreamer = targetStreamer
         await toolRegistry.register(
             name: "resume_face_tracking",
-            description: "Resume face-tracking — the head follows detected faces again.",
+            description: "Resume live face-tracking — Rocky's head + body actively follow the user's face. This is the LIVE-TRACKING command (continuous, dynamic): Rocky FIRST recentres so the camera can see you, then locks onto your face and smoothly turns to keep you in view as you move. Use whenever the user asks Rocky to re-engage with them visually: 'look at me', 'come back', 'follow me', 'watch me', 'look this way', 'engage', 'eyes on me'.",
             handler: { _ in
+                // Step 1: recentre. After a look_at_object the
+                // streamer's `latest` holds the off-axis target
+                // (e.g. the whiteboard on the right wall) and the
+                // physical pose points there. If we just toggled
+                // the face tracker on, the tracker's first frame
+                // wouldn't contain the user's face — so it would
+                // never find anyone to track and the bot would stay
+                // stuck off-axis. We must physically reset to
+                // neutral FIRST so the camera is pointing toward
+                // where the user is likely to be, THEN enable
+                // tracking and let it lock on.
+                let home = RPYPose(roll: 0, pitch: 0, yaw: 0)
+                let restAntennas = Antennas(rightRad: -0.1745, leftRad: 0.1745)
+                let homeTarget = MotionTarget(
+                    headPose: home, antennas: restAntennas, bodyYaw: 0
+                )
+                // Stamp the streamer's latest with neutral so it
+                // doesn't keep re-pushing the stale look_at target
+                // the moment the goto finishes.
+                await resumeStreamer.update(homeTarget, source: .tool)
+                // Routed through MotionGuard. Faster than go_home's
+                // 2.0 s because "look at me" should feel responsive
+                // — 1.0 s minjerk reads as a deliberate
+                // turn-toward-the-user without feeling abrupt.
+                try await resumeMotionGuard.goto(
+                    headPose: home,
+                    antennas: restAntennas,
+                    bodyYaw: 0,
+                    durationS: 1.0,
+                    interpolation: .minjerk
+                )
+                // Now enable tracking. The first camera frame after
+                // this should contain the user (since Rocky is now
+                // forward-facing), the tracker finds the face, and
+                // streamer's `latest` immediately picks up the new
+                // face-tracking target.
                 await visionService.setEnabled(true)
-                return .object(["ok": .bool(true)])
+                return .object([
+                    "ok": .bool(true),
+                    "recentred": .bool(true),
+                    "next_step": .string("Face tracker is live. Describe what you see of the user."),
+                ])
             }
         )
 

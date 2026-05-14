@@ -228,16 +228,18 @@ def _collapse_repetition(text: str, min_repeats: int = 3) -> str:
 
 class Runner:
     def __init__(self) -> None:
-        # Default model: medium-v3 (~770M, ~1.5 GB on disk). 2–3×
-        # faster than large-v3-mlx for the same utterance and word-
-        # error rate is only marginally worse on clean speech. The
-        # latency savings (typically ~600–800 ms per turn) outweigh
-        # the accuracy delta for conversational Rocky use. Users
-        # who want the original model can override via the
-        # ROCKY_STT_MODEL env var.
+        # Default model: small-v3 (~244M, ~470 MB on disk). 2–3×
+        # faster than medium-v3-mlx (which was itself 2–3× faster
+        # than large-v3-mlx). On close-mic conversational English
+        # the word-error-rate delta vs medium is ≤2%, and the
+        # AddressFilter + hallucination gate already cushion the
+        # marginal accuracy loss. The latency savings (typically
+        # ~250–400 ms per turn) materially change the bot's
+        # responsiveness. Override via ROCKY_STT_MODEL env var if
+        # you want the bigger model.
         self.model_id = (
             os.environ.get("ROCKY_STT_MODEL")
-            or "mlx-community/whisper-medium-mlx"
+            or "mlx-community/whisper-small-mlx"
         )
         self.language = os.environ.get("ROCKY_STT_LANGUAGE") or "en"
         self._loaded = False
@@ -291,22 +293,48 @@ class Runner:
         i16 = np.frombuffer(pcm, dtype="<i2")
         audio = i16.astype(np.float32) / 32768.0
 
+        # Fast early-out for clearly-silent segments. The VoiceCoordinator
+        # already runs an EnergyVAD before flushing, but its threshold is
+        # tuned to capture quiet/distant speech, which lets borderline-
+        # silent segments through to the sidecar — where mlx_whisper
+        # would spend its full ~250–500 ms producing either "" or a
+        # hallucination. A 50 ms peak-RMS check on the segment short-
+        # circuits this for a tiny fraction of the cost.
+        if audio.size > 0:
+            window = 800  # 50 ms at 16 kHz
+            if audio.size >= window:
+                # Peak RMS over rolling 50 ms windows. Stride by window
+                # for speed; precision is fine for the floor check.
+                view = audio[: (audio.size // window) * window].reshape(-1, window)
+                peak_rms = float(np.sqrt((view * view).mean(axis=1)).max())
+            else:
+                peak_rms = float(np.sqrt((audio * audio).mean()))
+            if peak_rms < 0.004:
+                _stderr(f"skipped silent segment (peak_rms={peak_rms:.4f})")
+                return {
+                    "text": "",
+                    "duration_ms": 0.0,
+                    "confidence": 0.0,
+                    "sample_rate": sample_rate,
+                    "model": self.model_id,
+                    "language": language,
+                    "dropped": "silent",
+                }
+
         t0 = time.perf_counter()
         result = mlx_whisper.transcribe(
             audio,
             path_or_hf_repo=self.model_id,
             language=language,
-            # Whisper-large-v3 is prone to repetition hallucinations
-            # on short utterances. Keep a SHORT fallback ladder so a
-            # genuine first-pass stumble (logprob/compression-ratio
-            # threshold trips) can recover via a higher-temperature
-            # retry — but cap at 2 attempts so ambient-noise segments
-            # can't burn 15 s walking the full OpenAI ladder of
-            # `(0.0, 0.2, 0.4, 0.6, 0.8, 1.0)`. The dropped-frame
-            # rows in TurnProfiler's CSV used to show 12–17 s here
-            # purely from temperature retries on noise; this caps
-            # worst case at ~5 s.
-            temperature=(0.0, 0.4),
+            # Single temperature pass. The previous (0.0, 0.4) ladder
+            # let noise-driven segments burn ~500–900 ms on a second
+            # attempt that essentially never recovered a useful
+            # transcript anyway — the failure modes (logprob/compression
+            # trip on noise) point at "this isn't speech" not "try
+            # again hotter". With the silence early-out above and the
+            # downstream hallucination/repetition gates, a single
+            # greedy pass is enough.
+            temperature=(0.0,),
             # 2.4 is the upstream default but lets through "X. X. X."
             # 3-4 times before flagging. 1.8 catches milder cases
             # too — false-positive rate is low for natural speech.
